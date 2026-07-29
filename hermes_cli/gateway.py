@@ -3023,9 +3023,44 @@ def _refuse_temp_home_service_write(definition: str, kind: str) -> bool:
     return True
 
 
+def _systemd_unit_refresh_disabled(unit_path: Path) -> bool:
+    """Honor an operator-ownership marker embedded in an installed unit."""
+    disabled_values = {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    try:
+        lines = unit_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")) or not stripped.startswith("Environment="):
+            continue
+        environment = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+        for assignment in environment.split():
+            key, separator, value = assignment.strip("\"'").partition("=")
+            if (
+                separator
+                and key == "HERMES_GATEWAY_UNIT_REFRESH"
+                and value.strip("\"'").lower() in disabled_values
+            ):
+                return True
+    return False
+
+
 def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     """Rewrite the installed systemd unit when the generated definition has changed."""
     unit_path = get_systemd_unit_path(system=system)
+    ambient_refresh = os.environ.get("HERMES_GATEWAY_UNIT_REFRESH", "").strip().lower()
+    if ambient_refresh in {"0", "false", "no", "off"} or _systemd_unit_refresh_disabled(unit_path):
+        # Operators may own a hardened unit with controls intentionally absent
+        # from Hermes's portable template. Respect that explicit ownership
+        # boundary from both the service process and ordinary CLI invocations.
+        return False
+
     if not unit_path.exists():
         return False
 

@@ -298,6 +298,30 @@ class TestSystemdServiceRefresh:
             "daemon-reload" in str(c) for c in ran
         ), "daemon-reload must not run when write was refused"
 
+    def test_refresh_respects_operator_managed_unit_opt_out(
+        self, tmp_path, monkeypatch
+    ):
+        unit_path = tmp_path / "hermes-gateway.service"
+        operator_unit = (
+            "[Service]\n"
+            'Environment="HERMES_GATEWAY_UNIT_REFRESH=0"\n'
+            "NoNewPrivileges=true\n"
+            "MemoryMax=3G\n"
+        )
+        unit_path.write_text(operator_unit, encoding="utf-8")
+        monkeypatch.delenv("HERMES_GATEWAY_UNIT_REFRESH", raising=False)
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+
+        def unexpected_generate(*args, **kwargs):
+            raise AssertionError("operator-managed unit must not be regenerated")
+
+        monkeypatch.setattr(gateway_cli, "generate_systemd_unit", unexpected_generate)
+
+        assert gateway_cli.refresh_systemd_unit_if_needed(system=False) is False
+        assert unit_path.read_text(encoding="utf-8") == operator_unit
+
     def test_refresh_refuses_to_bake_any_tempdir_home_into_real_user_unit(
         self, tmp_path, monkeypatch
     ):

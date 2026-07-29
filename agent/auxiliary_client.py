@@ -4415,6 +4415,23 @@ def _try_configured_fallback_for_unavailable_client(
     )
 
 
+def _missing_provider_credentials_error(provider: str) -> RuntimeError:
+    """Return an authentication-specific error for an unavailable provider."""
+    explicit = (provider or "").strip().lower()
+    if explicit in {"vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai"}:
+        return RuntimeError(
+            "Google Vertex AI OAuth credentials could not be resolved. "
+            "Run `gcloud auth application-default login` for ADC, or set "
+            "VERTEX_CREDENTIALS_PATH / GOOGLE_APPLICATION_CREDENTIALS to a "
+            "service-account JSON. Vertex does not use a static API key."
+        )
+    return RuntimeError(
+        f"Provider '{explicit}' is set in config.yaml but no API key "
+        f"was found. Set the {explicit.upper()}_API_KEY environment "
+        f"variable, or switch to a different provider with `hermes model`."
+    )
+
+
 def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
     """Resolve inline or env-backed API key from a fallback-chain entry."""
     explicit = str(entry.get("api_key") or "").strip()
@@ -7636,11 +7653,7 @@ def call_llm(
                     client, final_model = fb_client, fb_model
                     resolved_provider = fb_label or resolved_provider
                 else:
-                    raise RuntimeError(
-                        f"Provider '{_explicit}' is set in config.yaml but no API key "
-                        f"was found. Set the {_explicit.upper()}_API_KEY environment "
-                        f"variable, or switch to a different provider with `hermes model`."
-                    )
+                    raise _missing_provider_credentials_error(_explicit)
             # For auto/custom with no credentials, try the full auto chain
             # rather than hardcoding OpenRouter (which may be depleted).
             # Pass model=None so each provider uses its own default —
@@ -8279,11 +8292,7 @@ async def async_call_llm(
                     )
                     resolved_provider = fb_label or resolved_provider
                 else:
-                    raise RuntimeError(
-                        f"Provider '{_explicit}' is set in config.yaml but no API key "
-                        f"was found. Set the {_explicit.upper()}_API_KEY environment "
-                        f"variable, or switch to a different provider with `hermes model`."
-                    )
+                    raise _missing_provider_credentials_error(_explicit)
             if client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
