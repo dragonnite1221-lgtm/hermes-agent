@@ -144,6 +144,39 @@ def test_managed_dashboard_restart_matches_inventory_record():
     assert outcomes[0]["outcome"] == "restarted"
 
 
+def test_desktop_owned_backend_is_accounted_for_without_kill():
+    desktop_serve = RuntimeRecord(
+        kind="serve",
+        profile="work",
+        pid=406,
+        supervisor="desktop",
+        restart_via="desktop",
+    )
+    outcomes = match_runtime_outcomes(
+        _plan(desktop_serve),
+        restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "externally-supervised"
+    assert report_unaccounted_runtimes(outcomes) is False
+
+
+def test_manual_backend_without_bookkeeping_remains_unaccounted():
+    manual_serve = RuntimeRecord(
+        kind="serve",
+        profile="work",
+        pid=407,
+        supervisor="manual",
+        restart_via="manual",
+    )
+    outcomes = match_runtime_outcomes(
+        _plan(manual_serve),
+        restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "unaccounted"
+
+
 def test_service_restart_does_not_claim_same_profile_manual_process():
     outcomes = match_runtime_outcomes(
         _plan(_rt("work", 404, supervisor="manual")),

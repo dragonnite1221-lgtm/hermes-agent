@@ -496,12 +496,13 @@ def match_runtime_outcomes(
 
         {"kind", "profile", "pid", "mechanism", "outcome"}
 
-    outcome: ``restarted`` (service restarted / profile relaunched /
-    handed to external supervisor), ``stopped`` (pid killed, watcher or
-    operator relaunches), ``failed`` (in the phase's failed/stale list) or
-    ``unaccounted`` — the plan saw it and NO bookkeeping mentions it: the
-    blind-spot tripwire (same philosophy as the fleet matrix's DOWN row).
-    Never raises; on any probe error returns what it has.
+    outcome: ``restarted`` (service restarted / profile relaunched / handed to
+    an external gateway supervisor), ``externally-supervised`` (a Desktop-owned
+    serve/dashboard backend intentionally preserved by the update), ``stopped``
+    (pid killed, watcher or operator relaunches), ``failed`` (in the phase's
+    failed/stale list) or ``unaccounted`` — the plan saw it and NO bookkeeping
+    mentions it: the blind-spot tripwire (same philosophy as the fleet matrix's
+    DOWN row). Never raises; on any probe error returns what it has.
     """
     outcomes: list[dict[str, Any]] = []
     try:
@@ -516,7 +517,13 @@ def match_runtime_outcomes(
             if r is None:
                 continue
             outcome = "unaccounted"
-            if r.kind == "gateway" and (
+            if r.kind in {"serve", "dashboard"} and r.supervisor == "desktop":
+                # HERMES_DESKTOP_CHILD_PID marks backends owned by the Electron
+                # lifecycle. The cleanup phase deliberately excludes their PIDs
+                # instead of stopping/relaunching a child out from under its
+                # owner, so their unchanged PID is an accounted-for outcome.
+                outcome = "externally-supervised"
+            elif r.kind == "gateway" and (
                 r.profile in relaunched or r.profile in external
             ):
                 outcome = "restarted"
