@@ -1,3 +1,4 @@
+from functools import wraps
 from types import SimpleNamespace
 
 import pytest
@@ -115,6 +116,7 @@ def test_auxiliary_provider_fallback_closes_one_real_logical_call(
     logical_outputs = []
     original_pop = relay.scope.pop
 
+    @wraps(original_pop)
     def record_pop(*args, **kwargs):
         logical_outputs.append(kwargs.get("output") or {})
         return original_pop(*args, **kwargs)
@@ -339,6 +341,7 @@ def test_partial_auxiliary_stream_failure_closes_before_recovery(
     logical_outputs = []
     original_pop = turn.lease.host.relay.scope.pop
 
+    @wraps(original_pop)
     def record_pop(*args, **kwargs):
         logical_outputs.append(kwargs.get("output") or {})
         return original_pop(*args, **kwargs)
