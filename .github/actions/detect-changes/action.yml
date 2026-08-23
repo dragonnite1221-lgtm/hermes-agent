@@ -106,6 +106,17 @@ runs:
               --paginate \
               "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
               --jq '.files[]?.filename')"; then
+              # GitHub's compare endpoint returns at most 300 changed files,
+              # even when commit pagination is enabled.  At that boundary we
+              # cannot prove the list is complete, so discard it and invoke
+              # the classifier's existing empty-input fail-open contract.
+              # Exactly 300 real files may therefore run extra lanes, which
+              # is deliberately safer than skipping a required check.
+              changed_count="$(printf '%s\n' "$CHANGED" | sed '/^$/d' | wc -l)"
+              if [ "$changed_count" -ge 300 ]; then
+                echo "::warning::compare API reached its 300-file cap — failing open (all lanes run)"
+                CHANGED=""
+              fi
               break
             fi
             if [ "$i" = 3 ]; then

@@ -30,7 +30,9 @@ jobs:
     # cargo builds codegen units and test binaries in parallel across the
     # cores. This lane also builds the crate from the start when Cargo.toml
     # changes.
-    runs-on: ubuntu-latest-32-core
+    # Larger runners are configured only in the upstream organization. Forks
+    # use a standard hosted runner so checks can actually start.
+    runs-on: ${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
     timeout-minutes: 30
     defaults:
       run:

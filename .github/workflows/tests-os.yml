@@ -38,17 +38,21 @@ concurrency:
 jobs:
   os-tests:
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    # The upstream Windows larger runner is not provisioned in forks. Keep it
+    # upstream while selecting each matrix entry's standard fallback elsewhere.
+    runs-on: ${{ github.repository_owner == 'NousResearch' && matrix.upstream_runner || matrix.fork_runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: macOS-only tests
-            runner: macos-latest
+            upstream_runner: macos-latest
+            fork_runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            upstream_runner: windows-latest-32-core
+            fork_runner: windows-latest
             marker: windows_only
     steps:
       - name: Checkout code
