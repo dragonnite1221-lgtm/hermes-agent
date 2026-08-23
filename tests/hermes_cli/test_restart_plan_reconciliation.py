@@ -126,6 +126,24 @@ def test_service_kind_must_match_planned_runtime():
     assert exact[0]["outcome"] == "restarted"
 
 
+def test_managed_dashboard_restart_matches_inventory_record():
+    dashboard = RuntimeRecord(
+        kind="dashboard",
+        profile="default",
+        pid=405,
+        supervisor="systemd",
+        restart_via="systemd",
+        detail={"service": "hermes-dashboard.service"},
+    )
+    outcomes = match_runtime_outcomes(
+        _plan(dashboard),
+        restarted_services=["hermes-dashboard"],
+        relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "restarted"
+
+
 def test_service_restart_does_not_claim_same_profile_manual_process():
     outcomes = match_runtime_outcomes(
         _plan(_rt("work", 404, supervisor="manual")),

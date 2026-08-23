@@ -329,8 +329,25 @@ def _kill_stale_dashboard_processes(
     no benefit (review on #83595). PIDs owned by one of these units are
     left untouched.
     """
-    if restart_managed and _m()._restart_managed_dashboard_service(reason):
-        return {"matched": [], "killed": [], "failed": []}
+    if restart_managed:
+        managed_restart = _m()._restart_managed_dashboard_service(reason)
+        if managed_restart:
+            # A managed unit is never raw-killed, even when its own restart
+            # failed. Only propagate units whose restart was actually verified
+            # so runtime reconciliation cannot report success for a failed
+            # systemctl call or failure for a successful one.
+            restarted_services = (
+                managed_restart.get("restarted_services", [])
+                if isinstance(managed_restart, dict)
+                else []
+            )
+            return {
+                "matched": [],
+                "killed": [],
+                "failed": [],
+                "unrecovered": [],
+                "restarted_services": list(restarted_services),
+            }
 
     # When the Hermes Desktop Electron app spawns this dashboard as a
     # backend child, it sets HERMES_DESKTOP_CHILD_PID so that the update

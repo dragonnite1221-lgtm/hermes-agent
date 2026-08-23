@@ -179,7 +179,7 @@ class TestKillStaleDashboardPosix:
         with patch("subprocess.run", side_effect=fake_run), \
              patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[12345]) as find_pids, \
              patch("os.kill") as kill:
-            _kill_stale_dashboard_processes(restart_managed=True)
+            result = _kill_stale_dashboard_processes(restart_managed=True)
 
         assert calls == [
             ["systemctl", "--user", "list-unit-files", "hermes-dashboard.service", "--no-legend", "--no-pager"],
@@ -190,7 +190,47 @@ class TestKillStaleDashboardPosix:
         assert all(call[:1] != ["sudo"] and call[:2] != ["systemctl"] for call in calls)
         find_pids.assert_not_called()
         kill.assert_not_called()
+        assert result["restarted_services"] == ["hermes-dashboard.service"]
         assert "✓ restarted hermes-dashboard.service" in capsys.readouterr().out
+
+    def test_managed_restart_failure_is_handled_but_not_counted(self, capsys):
+        """A failed managed restart suppresses raw killing but is not success."""
+        calls: list[list[str]] = []
+
+        def fake_run(args, *a, **kw):
+            calls.append(list(args))
+            if args == [
+                "systemctl", "--user", "list-unit-files",
+                "hermes-dashboard.service", "--no-legend", "--no-pager",
+            ]:
+                return MagicMock(
+                    returncode=0,
+                    stdout="hermes-dashboard.service enabled enabled\n",
+                    stderr="",
+                )
+            if args == [
+                "systemctl", "--user", "is-active", "hermes-dashboard.service",
+            ]:
+                return MagicMock(returncode=0, stdout="active\n", stderr="")
+            if args == [
+                "systemctl", "--user", "is-enabled", "hermes-dashboard.service",
+            ]:
+                return MagicMock(returncode=0, stdout="enabled\n", stderr="")
+            if args == [
+                "systemctl", "--user", "restart", "hermes-dashboard.service",
+            ]:
+                return MagicMock(returncode=1, stdout="", stderr="restart failed")
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[12345]) as find_pids, \
+             patch("os.kill") as kill:
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        find_pids.assert_not_called()
+        kill.assert_not_called()
+        assert result["restarted_services"] == []
+        assert "failed to restart hermes-dashboard.service" in capsys.readouterr().out
 
 
 

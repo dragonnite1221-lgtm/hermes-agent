@@ -8172,17 +8172,19 @@ _DASHBOARD_SYSTEMD_UNIT = "hermes-dashboard.service"
 def _restart_managed_dashboard_service(
     reason: str,
     unit: str = _DASHBOARD_SYSTEMD_UNIT,
-) -> bool:
+) -> dict[str, list[str]] | None:
     """Restart a systemd-managed dashboard instead of raw-killing its PID.
 
-    Returns True when a dashboard unit was found and handled (successfully or
-    with a printed actionable failure).  Returning True deliberately prevents
-    the caller from falling back to ``os.kill``: systemd treats a direct
-    SIGTERM of the service's main PID as a clean stop, so ``Restart=on-failure``
-    will not bring the dashboard back.
+    Returns ``None`` when no managed unit was found. Once a unit is found,
+    returns a truthy result even when its restart fails so the caller never
+    falls back to ``os.kill``: systemd treats a direct SIGTERM of the service's
+    main PID as a clean stop, so ``Restart=on-failure`` will not bring the
+    dashboard back. ``restarted_services`` records only a verified successful
+    restart, allowing post-update reconciliation to distinguish a handled
+    failure from a service that actually came back.
     """
     if sys.platform == "win32":
-        return False
+        return None
 
     def _systemctl(*args: str, timeout: int = 10) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -8215,13 +8217,13 @@ def _restart_managed_dashboard_service(
             break
 
     if scope is None or listed is None:
-        return False
+        return None
 
     try:
         active = _systemctl(*scope, "is-active", unit)
         enabled = _systemctl(*scope, "is-enabled", unit)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return False
+        return None
 
     active_state = (active.stdout or "").strip()
     enabled_state = (enabled.stdout or "").strip()
@@ -8233,7 +8235,7 @@ def _restart_managed_dashboard_service(
         "static",
         "generated",
     }:
-        return False
+        return None
 
     print()
     print(f"⟲ Restarting managed dashboard service ({reason})")
@@ -8260,7 +8262,7 @@ def _restart_managed_dashboard_service(
             continue
         if result.returncode == 0:
             print(f"    ✓ restarted {unit}")
-            return True
+            return {"restarted_services": [unit]}
         errors.append(
             f"{' '.join(command)}: {(result.stderr or result.stdout or '').strip()}"
         )
@@ -8274,7 +8276,7 @@ def _restart_managed_dashboard_service(
         "systemd would treat that as a clean stop."
     )
     print(f"  Restart manually: {scope_label} restart {unit}")
-    return True
+    return {"restarted_services": []}
 
 
 def _get_systemd_service_for_pid(pid: int) -> str | None:
