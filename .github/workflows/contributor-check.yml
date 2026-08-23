@@ -20,15 +20,59 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0  # Full history needed for git log
+          persist-credentials: false
+
+      - name: Fetch parent history for fork attribution
+        id: parent-history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # A fork catch-up PR can contain thousands of commits that were
+          # already accepted by the parent repository. They are not new fork
+          # contributions and must not be re-audited against the fork's stale
+          # base. Exclude only commits reachable from the verified parent
+          # default branch; cherry-picks and fork-local commits remain in scope.
+          PARENT_FULL_NAME=$(gh api "repos/${REPO}" --jq '.parent.full_name // empty')
+          if [ -z "$PARENT_FULL_NAME" ]; then
+            echo "parent_ref=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ ! "$PARENT_FULL_NAME" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::invalid parent repository name: ${PARENT_FULL_NAME}"
+            exit 1
+          fi
+
+          PARENT_BRANCH=$(gh api "repos/${PARENT_FULL_NAME}" --jq '.default_branch')
+          git check-ref-format --branch "$PARENT_BRANCH" >/dev/null
+          PARENT_REF="refs/remotes/attribution-parent/${PARENT_BRANCH}"
+          git remote add attribution-parent "https://github.com/${PARENT_FULL_NAME}.git"
+          git fetch --no-tags --filter=blob:none attribution-parent \
+            "+refs/heads/${PARENT_BRANCH}:${PARENT_REF}"
+          echo "parent_ref=${PARENT_REF}" >> "$GITHUB_OUTPUT"
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          PARENT_REF: ${{ steps.parent-history.outputs.parent_ref }}
         run: |
+          set -euo pipefail
+
           # Get the merge base between this PR and main
           MERGE_BASE=$(git merge-base origin/main HEAD)
 
-          # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          # Find author emails introduced by the PR itself. On a fork, commits
+          # already reachable from the parent's default branch are imported
+          # history, not new contributors to the fork.
+          LOG_EXCLUSIONS=()
+          if [ -n "$PARENT_REF" ]; then
+            git rev-parse --verify "${PARENT_REF}^{commit}" >/dev/null
+            LOG_EXCLUSIONS=(--not "$PARENT_REF")
+          fi
+          NEW_EMAILS=$(git log "${MERGE_BASE}..HEAD" "${LOG_EXCLUSIONS[@]}" \
+            --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."
