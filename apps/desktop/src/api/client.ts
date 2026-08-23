@@ -133,6 +133,18 @@ export function capabilityScoped(scope?: ProfileScope): { connectionId?: string;
   return { ...profileScoped(scope), ...connectionScoped() }
 }
 
+/** Send a profile-scoped REST request, optionally pinned to an explicit
+ *  (connection, profile) owner. Explicit object scopes bypass hermesApi's
+ *  ambient connection spread so `{connectionId:'local'}` can deliberately
+ *  select this device while another gateway is active. */
+export function hermesApiForProfile<T>(request: HermesApiRequest, scope?: ProfileScope): Promise<T> {
+  const scoped = capabilityScoped(scope)
+
+  return scope && typeof scope === 'object'
+    ? window.hermesDesktop.api<T>({ ...request, ...scoped })
+    : hermesApi<T>({ ...request, ...scoped })
+}
+
 /** Stable cache-key for a capability scope: `profile` for the local/legacy
  *  path, `connectionId::profile` for an explicit remote pin. Mirrors
  *  normalizeProfileKey for plain strings so existing keys stay byte-identical. */

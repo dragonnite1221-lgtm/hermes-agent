@@ -23,6 +23,11 @@ export interface ProfileRemoteOverride {
 /** profile key → its remote override, refreshed from Electron on demand. */
 export const $profileRemoteOverrides = atom<Record<string, ProfileRemoteOverride>>({})
 
+// Refreshes can overlap (profile list hydration, dialog save, gateway swaps).
+// Only the newest requested snapshot may publish; a slower earlier bridge read
+// describes history and must not replace newer intent.
+let refreshGeneration = 0
+
 // The profile whose "Connect to a remote host" dialog is open, or null. An
 // atom (not component state) so the rail's context menu AND the re-enter-token
 // toast action can both open the same dialog.
@@ -59,6 +64,7 @@ export function remoteHostLabel(url: string): string {
  * single failed read keeps that profile unbadged rather than failing the lot.
  */
 export async function refreshProfileRemoteOverrides(names: string[]): Promise<void> {
+  const generation = ++refreshGeneration
   const getConnectionConfig = window.hermesDesktop?.getConnectionConfig
 
   if (!getConnectionConfig) {
@@ -87,7 +93,9 @@ export async function refreshProfileRemoteOverrides(names: string[]): Promise<vo
     })
   )
 
-  $profileRemoteOverrides.set(next)
+  if (generation === refreshGeneration) {
+    $profileRemoteOverrides.set(next)
+  }
 }
 
 // The token-rotation failure shape: the remote host answered but refused the

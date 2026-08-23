@@ -1,5 +1,5 @@
-import { profileScoped } from '@/api/client'
-import { getApiRequestConnection, getApiRequestProfile, hermesApi } from '@/hermes'
+import { hermesApiForProfile, type ProfileScope } from '@/api/client'
+import { getApiRequestConnection, getApiRequestProfile } from '@/hermes'
 
 /**
  * Client-direct voice: call the active profile's STT/TTS providers straight
@@ -61,8 +61,17 @@ const CONFIG_TTL_MS = 60_000
 let cached: { key: string; at: number; config: VoiceClientConfig } | null = null
 let inflight: { key: string; promise: Promise<null | VoiceClientConfig> } | null = null
 
-function scopeKey(): string {
-  return `${getApiRequestConnection() ?? 'local'}::${getApiRequestProfile() ?? 'default'}`
+function scopeKey(scope?: ProfileScope): string {
+  if (scope && typeof scope === 'object') {
+    const connectionId = String(scope.connectionId ?? '').trim()
+    const profile = String(scope.profile ?? '').trim()
+
+    return `${connectionId && connectionId !== 'local' ? connectionId : 'local'}::${profile || 'default'}`
+  }
+
+  const profile = typeof scope === 'string' ? scope.trim() : scope === null ? '' : getApiRequestProfile()
+
+  return `${getApiRequestConnection() ?? 'local'}::${profile || 'default'}`
 }
 
 /** Drop cached credentials (used by tests; scope changes rotate the key). */
@@ -71,8 +80,8 @@ export function clearVoiceClientConfigCache(): void {
   inflight = null
 }
 
-export async function fetchVoiceClientConfig(): Promise<null | VoiceClientConfig> {
-  const key = scopeKey()
+export async function fetchVoiceClientConfig(scope?: ProfileScope): Promise<null | VoiceClientConfig> {
+  const key = scopeKey(scope)
 
   if (cached && cached.key === key && Date.now() - cached.at < CONFIG_TTL_MS) {
     return cached.config
@@ -84,13 +93,15 @@ export async function fetchVoiceClientConfig(): Promise<null | VoiceClientConfig
 
   const promise = (async () => {
     try {
-      // hermesApi carries connectionScoped(); profileScoped() adds the
-      // profile — the same routing every relay audio call uses, so the
-      // config comes from the backend the user is actually talking to.
-      const response = await hermesApi<{ ok: boolean } & VoiceClientConfig>({
-        ...profileScoped(),
-        path: '/api/audio/voice-config'
-      })
+      // Explicit scopes come from resources (such as session tiles) whose
+      // owner can differ from the foreground profile. Ambient callers retain
+      // the active connection/profile route.
+      const response = await hermesApiForProfile<{ ok: boolean } & VoiceClientConfig>(
+        {
+          path: '/api/audio/voice-config'
+        },
+        scope
+      )
 
       if (!response?.ok || !response.stt || !response.tts) {
         return null
@@ -147,8 +158,8 @@ async function providerErrorText(response: Response): Promise<string> {
  * re-running the same request through the gateway would just fail again
  * slower and hide the real error.
  */
-export async function transcribeAudioClientDirect(audio: Blob): Promise<null | string> {
-  const config = await fetchVoiceClientConfig()
+export async function transcribeAudioClientDirect(audio: Blob, scope?: ProfileScope): Promise<null | string> {
+  const config = await fetchVoiceClientConfig(scope)
   const stt = config?.stt
 
   if (!stt || stt.mode !== 'direct') {

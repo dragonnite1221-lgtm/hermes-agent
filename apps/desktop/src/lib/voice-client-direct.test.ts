@@ -76,6 +76,20 @@ describe('fetchVoiceClientConfig', () => {
     expect(api).toHaveBeenCalledTimes(2)
   })
 
+  it('routes an explicit owner scope without borrowing the ambient profile', async () => {
+    const api = mockDesktopApi({ ok: true, stt: directStt, tts: relay })
+    setApiRequestConnection('ambient-gateway')
+    setApiRequestProfile('ambient-profile')
+
+    await fetchVoiceClientConfig({ connectionId: 'owner-gateway', profile: 'backend-owner' })
+
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'owner-gateway',
+      path: '/api/audio/voice-config',
+      profile: 'backend-owner'
+    })
+  })
+
   it('resolves null on an older backend without the endpoint', async () => {
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,

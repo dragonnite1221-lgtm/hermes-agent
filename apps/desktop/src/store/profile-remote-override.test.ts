@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { deferred } from '../test/deferred'
+
 import { $notifications } from './notifications'
 import {
   $profileRemoteOverrides,
@@ -83,6 +85,35 @@ describe('refreshProfileRemoteOverrides', () => {
     await refreshProfileRemoteOverrides(['broken', 'work'])
 
     expect(Object.keys($profileRemoteOverrides.get())).toEqual(['work'])
+  })
+
+  it('discards an older refresh that resolves after a newer refresh published', async () => {
+    const older = deferred<{ mode: 'remote'; remoteUrl: string }>()
+    const newer = deferred<{ mode: 'remote'; remoteUrl: string }>()
+
+    getConnectionConfig.mockImplementation((profile: string) => {
+      if (profile === 'older') {
+        return older.promise
+      }
+
+      return newer.promise
+    })
+
+    const olderRefresh = refreshProfileRemoteOverrides(['older'])
+    const newerRefresh = refreshProfileRemoteOverrides(['newer'])
+
+    newer.resolve({ mode: 'remote', remoteUrl: 'https://newer.example.com' })
+    await newerRefresh
+    expect($profileRemoteOverrides.get()).toEqual({
+      newer: { host: 'newer.example.com', url: 'https://newer.example.com' }
+    })
+
+    older.resolve({ mode: 'remote', remoteUrl: 'https://older.example.com' })
+    await olderRefresh
+
+    expect($profileRemoteOverrides.get()).toEqual({
+      newer: { host: 'newer.example.com', url: 'https://newer.example.com' }
+    })
   })
 })
 

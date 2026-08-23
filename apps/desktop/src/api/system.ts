@@ -12,7 +12,7 @@ import type {
   MemoryStatusResponse
 } from '@/types/hermes'
 
-import { capabilityScoped, hermesApi, type ProfileScope, profileScoped } from './client'
+import { capabilityScoped, hermesApi, hermesApiForProfile, type ProfileScope, profileScoped } from './client'
 
 export const AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS = 180_000
 export const AUDIO_SPEAK_MAX_REQUEST_TIMEOUT_MS = 600_000
@@ -167,20 +167,26 @@ export function getActionStatus(name: string, lines = 200, profile?: ProfileScop
   })
 }
 
-export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<AudioTranscriptionResponse> {
-  return hermesApi<AudioTranscriptionResponse>({
-    path: '/api/audio/transcribe',
-    method: 'POST',
-    ...profileScoped(),
-    body: {
-      data_url: dataUrl,
-      mime_type: mimeType
+export function transcribeAudio(
+  dataUrl: string,
+  mimeType?: string,
+  profile?: ProfileScope
+): Promise<AudioTranscriptionResponse> {
+  return hermesApiForProfile<AudioTranscriptionResponse>(
+    {
+      path: '/api/audio/transcribe',
+      method: 'POST',
+      body: {
+        data_url: dataUrl,
+        mime_type: mimeType
+      },
+      // Transcription blocks until provider STT, file handling, and response
+      // encoding finish. Remote providers and long clips regularly exceed the
+      // default 15s Electron backend timeout.
+      timeoutMs: audioTranscribeRequestTimeoutMs(dataUrl)
     },
-    // Transcription blocks until provider STT, file handling, and response
-    // encoding finish. Remote providers and long clips regularly exceed the
-    // default 15s Electron backend timeout.
-    timeoutMs: audioTranscribeRequestTimeoutMs(dataUrl)
-  })
+    profile
+  )
 }
 
 export function speakText(text: string): Promise<AudioSpeakResponse> {

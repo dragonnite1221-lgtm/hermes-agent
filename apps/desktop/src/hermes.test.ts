@@ -609,6 +609,26 @@ describe('Hermes REST helpers', () => {
     })
   })
 
+  it("routes transcription through an explicit session owner's backend scope", async () => {
+    setApiRequestConnection('ambient-gateway')
+    setApiRequestProfile('ambient-profile')
+    api.mockResolvedValueOnce({ ok: true, provider: 'openai', transcript: 'owner transcript' })
+
+    await transcribeAudio('data:audio/webm;base64,AA==', 'audio/webm', {
+      connectionId: 'owner-gateway',
+      profile: 'backend-owner'
+    })
+
+    expect(api).toHaveBeenCalledWith({
+      body: { data_url: 'data:audio/webm;base64,AA==', mime_type: 'audio/webm' },
+      connectionId: 'owner-gateway',
+      method: 'POST',
+      path: '/api/audio/transcribe',
+      profile: 'backend-owner',
+      timeoutMs: AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS
+    })
+  })
+
   it('defaults model options to configured providers only', async () => {
     await getGlobalModelOptions()
 

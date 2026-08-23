@@ -21,7 +21,6 @@ import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'r
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { useModelControls } from '@/app/session/hooks/use-model-controls'
-import { blobToDataUrl } from '@/app/session/hooks/use-prompt-actions/utils'
 import { resolveStoredSession } from '@/app/session/hooks/use-session-actions/utils'
 import { ModelMenuPanel } from '@/app/shell/model-menu-panel'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
@@ -30,11 +29,9 @@ import { findGroupOfPane } from '@/components/pane-shell/tree/model'
 import { $layoutTree, closeTreePane, moveTreePane, setTreeGroupTabStrip } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
-import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { NEW_SESSION_TITLE, sessionTitle } from '@/lib/chat-runtime'
-import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
 import { createComposerAttachmentScope, draftTitleFor } from '@/store/composer'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -47,7 +44,7 @@ import {
   sessionMatchesStoredId,
   sessionPinId
 } from '@/store/session'
-import { requestForSessionProfile } from '@/store/session-request-router'
+import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
 import {
   $sessionStates,
   $sessionTileDelegateRevision,
@@ -56,8 +53,7 @@ import {
   discardSessionTile,
   patchSessionTile,
   type SessionTile,
-  sessionTileDelegate,
-  sessionTileOwnerRoute
+  sessionTileDelegate
 } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -69,6 +65,7 @@ import { SessionDraftTitle } from './session-draft-title'
 import { startSessionDrag } from './session-drag'
 import { SessionStatusDot } from './session-status-dot'
 import { useSessionTileActions } from './session-tile-actions'
+import { transcribeSessionTileAudio } from './session-tile-transcription'
 import { type SessionView, SessionViewProvider } from './session-view'
 import { SessionContextMenu } from './sidebar/session-actions-menu'
 import { lastVisibleMessageIsUser } from './thread-loading'
@@ -110,35 +107,23 @@ function buildTileView(storedSessionId: string): SessionView {
   }
 }
 
-// Module-level constants so these ChatView props are referentially stable —
-// tiles have no pin/delete affordance, and transcription needs no per-tile state.
+// Module-level constant so these ChatView props are referentially stable —
+// tiles have no pin/delete affordance.
 const noop = () => undefined
 
-const tileTranscribeAudio = async (audio: Blob) => {
-  // Client-direct first (profile's own STT provider, no gateway audio hop);
-  // relay when the provider is not client-callable. Same ladder as the main
-  // composer's transcribeVoiceAudio.
-  const direct = await transcribeAudioClientDirect(audio)
-
-  if (direct !== null) {
-    return direct
-  }
-
-  return (await transcribeAudio(await blobToDataUrl(audio), audio.type)).transcript
-}
-
 function TileChat({
+  ownerRoute,
   runtimeId,
   storedSessionId,
   view
 }: {
+  ownerRoute?: SessionProfileRoute
   runtimeId: string
   storedSessionId: string
   view: SessionView
 }) {
   const { gateway, requestGateway } = useGatewayRequest()
   const queryClient = useQueryClient()
-  const ownerRoute = sessionTileOwnerRoute(storedSessionId)
 
   const requestTileGateway = useCallback(
     <T,>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<T> =>
@@ -203,6 +188,7 @@ function TileChat({
   const onPickImages = useCallback(() => void pickImages(), [pickImages])
   const onRemoveAttachment = useCallback((id: string) => void removeAttachment(id), [removeAttachment])
   const onRetryResume = useCallback(() => patchSessionTile(storedSessionId, { error: undefined }), [storedSessionId])
+  const onTranscribeAudio = useCallback((audio: Blob) => transcribeSessionTileAudio(audio, ownerRoute), [ownerRoute])
 
   // Per-tile model menu — rendered under this tile's SessionView so the pill
   // + switch target THIS runtime, not the primary (which may be mid-turn).
@@ -246,7 +232,7 @@ function TileChat({
           onSubmit={actions.submitText}
           onThreadMessagesChange={actions.handleThreadMessagesChange}
           onToggleSelectedPin={noop}
-          onTranscribeAudio={tileTranscribeAudio}
+          onTranscribeAudio={onTranscribeAudio}
         />
       </ComposerScopeProvider>
     </SessionViewProvider>
@@ -383,7 +369,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
     )
   }
 
-  return <TileChat runtimeId={runtimeId} storedSessionId={storedSessionId} view={view} />
+  return <TileChat ownerRoute={ownerRoute} runtimeId={runtimeId} storedSessionId={storedSessionId} view={view} />
 }
 
 // ---------------------------------------------------------------------------

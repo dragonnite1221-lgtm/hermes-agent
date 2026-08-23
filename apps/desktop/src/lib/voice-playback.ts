@@ -243,22 +243,46 @@ function openClientDirectSpeechSession(tts: DirectTtsConfig, options: VoicePlayb
           return
         }
 
-        if (!started) {
-          started = true
-          setVoicePlaybackState(currentState('speaking', options))
-        }
-
         const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }))
 
         try {
           await new Promise<void>((resolve, reject) => {
             const audio = new Audio(url)
             playing = audio
-            audio.addEventListener('ended', () => resolve(), { once: true })
-            audio.addEventListener('error', () => reject(new Error('Playback failed')), { once: true })
-            void audio.play().catch(reject)
+
+            const cleanup = () => {
+              audio.removeEventListener('ended', onEnded)
+              audio.removeEventListener('error', onError)
+              audio.removeEventListener('playing', onPlaying)
+            }
+
+            const onEnded = () => {
+              cleanup()
+              resolve()
+            }
+
+            const onError = () => {
+              cleanup()
+              reject(new Error('Playback failed'))
+            }
+
+            const onPlaying = () => {
+              if (!started && !settled) {
+                started = true
+                setVoicePlaybackState(currentState('speaking', options, audio))
+              }
+            }
+
+            audio.addEventListener('ended', onEnded, { once: true })
+            audio.addEventListener('error', onError, { once: true })
+            audio.addEventListener('playing', onPlaying, { once: true })
+            void audio.play().catch(onError)
           })
         } catch {
+          // Synthesized bytes are not playback. A decode/error/play rejection
+          // before `playing` means the user heard nothing, so descend to the
+          // relay ladder. Once `playing` fired, replaying the full response
+          // would duplicate speech; keep the partial playback as done.
           settle(started ? 'done' : 'fallback')
 
           return
