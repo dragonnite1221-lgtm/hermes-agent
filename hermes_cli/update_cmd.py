@@ -858,7 +858,7 @@ def _reload_process_scan_modules() -> None:
 
 def _finish_dashboard_update_cleanup(
     node_failures: list[str], already_restarted_units: "set[str] | None" = None
-) -> None:
+) -> dict:
     """Refresh managed dashboards or stop stale manual ones after an update.
 
     *already_restarted_units* forwards the systemd unit names (no
@@ -870,7 +870,7 @@ def _finish_dashboard_update_cleanup(
         print()
         print("  ℹ Leaving running dashboard process(es) untouched because the")
         print("    Node.js dependency refresh did not complete.")
-        return
+        return {"matched": [], "killed": [], "failed": [], "unrecovered": []}
 
     # The scan path lazy-imports symbols from _subprocess_compat; make sure
     # both modules reflect the freshly-updated source before touching them.
@@ -880,7 +880,7 @@ def _finish_dashboard_update_cleanup(
         restart_managed=True, already_restarted_units=already_restarted_units
     )
     if not stop_result.get("unrecovered"):
-        return
+        return stop_result
 
     print()
     print(
@@ -889,6 +889,7 @@ def _finish_dashboard_update_cleanup(
     )
     print("  Re-launch it when you want the web UI back:")
     print("    hermes dashboard --port <port>")
+    return stop_result
 
 def _atomic_replace_dir(src: str, dst: str) -> None:
     """Replace directory *dst* with *src* without leaving *dst* half-deleted.
@@ -8284,9 +8285,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Forward the systemd units restarted above (includes hermes-serve*,
         # #83438) so a Serve-only install's freshly restarted process isn't
         # found and restarted again below (review on #83595).
-        _finish_dashboard_update_cleanup(
+        _dashboard_cleanup = _finish_dashboard_update_cleanup(
             node_failures, already_restarted_units=set(restarted_services)
         )
+        # The plan includes serve/dashboard processes as well as gateways.
+        # Fold this later cleanup phase into the same exact bookkeeping so a
+        # backend we actually stopped/restarted is not reported as untouched.
+        try:
+            killed_pids.update(int(pid) for pid in _dashboard_cleanup.get("killed", []))
+            for service in _dashboard_cleanup.get("restarted_services", []):
+                normalized = str(service).removesuffix(".service")
+                if normalized not in restarted_services:
+                    restarted_services.append(normalized)
+        except Exception as _cleanup_bookkeeping_exc:
+            logger.debug(
+                "Could not fold dashboard cleanup into runtime bookkeeping: %s",
+                _cleanup_bookkeeping_exc,
+            )
 
         print()
         print("Tip: You can now select a provider and model:")

@@ -518,6 +518,11 @@ def _kill_stale_dashboard_processes(
         "killed": list(killed),
         "failed": list(failed),
         "unrecovered": list(unrecovered),
+        # Feed the update plan's reconciliation with the exact owning units
+        # this cleanup restarted.  Without this, an inventoried custom
+        # serve/dashboard service is reported as untouched even after its
+        # verified systemd restart.
+        "restarted_services": list(restarted_services),
     }
 
 def _detect_concurrent_hermes_instances(
@@ -1018,4 +1023,3 @@ def _reap_orphaned_desktop_local_serves(
             pass
 
     return {"matched": matched, "killed": killed, "failed": failed}
-

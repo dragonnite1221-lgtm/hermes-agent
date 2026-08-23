@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -123,6 +124,96 @@ def describe_restart_mechanism(mechanism: str, profile: str) -> str:
     if profile != "default":
         return f"hermes -p {profile} gateway restart"
     return "hermes gateway restart"
+
+
+def _systemd_service_for_pid(pid: int) -> Optional[str]:
+    """Return the owning systemd unit for ``pid`` when one is provable."""
+    try:
+        from hermes_cli.main import _get_systemd_service_for_pid
+
+        return _get_systemd_service_for_pid(pid)
+    except Exception:
+        return None
+
+
+def _backend_command_identity(command: str) -> tuple[str, Optional[str]] | None:
+    """Parse a dashboard/serve argv into ``(kind, explicit_profile)``.
+
+    The process scanner returns a display command line, so parsing is
+    best-effort.  Only exact argv tokens count: a path or option containing
+    ``serve`` must never invent a runtime row.
+    """
+    try:
+        argv = shlex.split(command, posix=os.name != "nt")
+    except ValueError:
+        argv = command.split()
+    kind = next((token for token in argv if token in ("serve", "dashboard")), None)
+    if kind is None:
+        return None
+    profile: Optional[str] = None
+    for index, token in enumerate(argv):
+        if token in ("--profile", "-p") and index + 1 < len(argv):
+            profile = str(argv[index + 1]).strip() or None
+            break
+        if token.startswith("--profile="):
+            profile = token.split("=", 1)[1].strip() or None
+            break
+    return kind, profile
+
+
+def _profile_for_home(
+    raw_home: Optional[str], profile_homes: list[tuple[str, Path]]
+) -> Optional[str]:
+    """Map a process ``HERMES_HOME`` to the exact enumerated profile."""
+    if not raw_home:
+        return None
+    try:
+        candidate = os.path.normcase(str(Path(raw_home).expanduser().resolve()))
+    except (OSError, RuntimeError, ValueError):
+        candidate = os.path.normcase(str(Path(raw_home).expanduser()))
+    for profile, home in profile_homes:
+        try:
+            known = os.path.normcase(str(home.resolve()))
+        except (OSError, RuntimeError, ValueError):
+            known = os.path.normcase(str(home))
+        if candidate == known:
+            return profile
+    return None
+
+
+def _service_runtime_identity(service: str) -> tuple[str, str] | None:
+    """Parse only canonical Hermes service/launchd names.
+
+    Returning a structured identity avoids substring attribution such as
+    profile ``work`` matching ``hermes-gateway-mywork`` and prevents a serve
+    restart from satisfying a gateway row for the same profile.
+    """
+    name = str(service or "").removesuffix(".service")
+    families = (
+        ("hermes-gateway", "gateway"),
+        ("ai.hermes.gateway", "gateway"),
+        ("hermes-serve", "serve"),
+        ("hermes-dashboard", "dashboard"),
+    )
+    for prefix, kind in families:
+        if name == prefix:
+            return kind, "default"
+        marker = prefix + "-"
+        if name.startswith(marker) and name[len(marker) :]:
+            return kind, name[len(marker) :]
+    return None
+
+
+def _service_matches_runtime(service: str, runtime: RuntimeRecord) -> bool:
+    """Whether one restart bookkeeping name exactly owns ``runtime``."""
+    planned_service = runtime.detail.get("service") if runtime.detail else None
+    if planned_service and str(planned_service).removesuffix(".service") == str(
+        service
+    ).removesuffix(".service"):
+        return True
+    if runtime.supervisor not in {"systemd", "launchd", "service"}:
+        return False
+    return _service_runtime_identity(service) == (runtime.kind, runtime.profile)
 
 
 def collect_runtime_inventory() -> UpdatePlan:
@@ -292,6 +383,66 @@ def collect_runtime_inventory() -> UpdatePlan:
     except Exception as exc:
         logger.debug("PID-file gateway inventory failed: %s", exc)
 
+    # --- serve / dashboard control-plane processes ------------------------
+    # These do not own gateway_state.json, so a gateway-only inventory can
+    # claim the host is idle while the update is about to restart or stop a
+    # long-lived backend.  Reuse the same bounded cross-platform scanner as
+    # the update cleanup and record one row per live process.
+    try:
+        from hermes_cli.dashboard_procs import (
+            _hermes_home_for_pid,
+            _scan_dashboard_processes,
+        )
+
+        desktop_pids: set[int] = set()
+        for raw_pid in os.environ.get("HERMES_DESKTOP_CHILD_PID", "").split(","):
+            try:
+                pid = int(raw_pid.strip())
+            except (TypeError, ValueError):
+                continue
+            if pid > 0:
+                desktop_pids.add(pid)
+
+        for pid, command in _scan_dashboard_processes():
+            pid = int(pid)
+            if pid in seen_pids:
+                continue
+            identity = _backend_command_identity(command)
+            if identity is None:
+                continue
+            kind, explicit_profile = identity
+            service = _systemd_service_for_pid(pid)
+            service_identity = _service_runtime_identity(service or "")
+            home_profile = _profile_for_home(
+                _hermes_home_for_pid(pid), profile_homes
+            )
+            profile = explicit_profile or home_profile or "default"
+            if service_identity is not None and service_identity[0] == kind:
+                profile = service_identity[1]
+            supervisor = (
+                "systemd"
+                if service
+                else "desktop"
+                if pid in desktop_pids
+                else "manual"
+            )
+            detail = {"command": command}
+            if service:
+                detail["service"] = service
+            seen_pids.add(pid)
+            plan.runtimes.append(
+                RuntimeRecord(
+                    kind=kind,
+                    profile=profile,
+                    pid=pid,
+                    supervisor=supervisor,
+                    restart_via=_restart_mechanism(supervisor, profile),
+                    detail=detail,
+                )
+            )
+    except Exception as exc:
+        logger.debug("Serve/dashboard inventory failed: %s", exc)
+
     return plan
 
 
@@ -365,19 +516,15 @@ def match_runtime_outcomes(
             if r is None:
                 continue
             outcome = "unaccounted"
-            if r.profile in relaunched or r.profile in external:
+            if r.kind == "gateway" and (
+                r.profile in relaunched or r.profile in external
+            ):
                 outcome = "restarted"
             elif r.pid is not None and r.pid in killed:
                 outcome = "stopped"
-            elif any(
-                r.profile in unit or (r.profile == "default" and "hermes-gateway" in unit)
-                for unit in failed_set
-            ):
+            elif any(_service_matches_runtime(unit, r) for unit in failed_set):
                 outcome = "failed"
-            elif any(
-                r.profile in svc or (r.profile == "default" and "hermes-gateway" in svc)
-                for svc in restarted_set
-            ):
+            elif any(_service_matches_runtime(svc, r) for svc in restarted_set):
                 outcome = "restarted"
             outcomes.append(
                 {

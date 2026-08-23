@@ -88,6 +88,54 @@ def test_restarted_service_unit_matches_profile():
     assert outcomes[0]["outcome"] == "restarted"
 
 
+def test_profile_service_matching_is_exact_not_substring():
+    outcomes = match_runtime_outcomes(
+        _plan(
+            _rt("work", 401, supervisor="systemd"),
+            _rt("default", 402, supervisor="systemd"),
+        ),
+        restarted_services=["hermes-gateway-mywork.service"],
+        relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[],
+    )
+    assert [row["outcome"] for row in outcomes] == ["unaccounted", "unaccounted"]
+
+
+def test_service_kind_must_match_planned_runtime():
+    serve = RuntimeRecord(
+        kind="serve",
+        profile="work",
+        pid=403,
+        supervisor="systemd",
+        restart_via="systemd",
+    )
+    wrong_kind = match_runtime_outcomes(
+        _plan(serve),
+        restarted_services=["hermes-gateway-work"],
+        relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[],
+    )
+    assert wrong_kind[0]["outcome"] == "unaccounted"
+
+    exact = match_runtime_outcomes(
+        _plan(serve),
+        restarted_services=["hermes-serve-work.service"],
+        relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[],
+    )
+    assert exact[0]["outcome"] == "restarted"
+
+
+def test_service_restart_does_not_claim_same_profile_manual_process():
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("work", 404, supervisor="manual")),
+        restarted_services=["hermes-gateway-work"],
+        relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "unaccounted"
+
+
 def test_untouched_runtime_is_unaccounted_and_escalates(capsys):
     """The tripwire: plan saw it, NO bookkeeping mentions it."""
     outcomes = match_runtime_outcomes(

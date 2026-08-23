@@ -34,6 +34,7 @@ def fleet(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda all_profiles=False: {100})
     monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: True)
     monkeypatch.setattr("hermes_cli.gateway.find_profile_gateway_processes", lambda exclude_pids=None: [])
+    monkeypatch.setattr("hermes_cli.dashboard_procs._scan_dashboard_processes", lambda: [])
     monkeypatch.setattr(
         "hermes_cli.build_info.get_code_identity",
         lambda refresh=False: {"sha": "a" * 40, "short_sha": "a" * 8, "version": "1.0", "source": "git"},
@@ -99,6 +100,35 @@ class TestCollectInventory:
         assert profiles.count("default") == 1  # deduped by pid
         assert "legacy" in profiles
 
+    def test_collects_serve_and_dashboard_without_gateway_state(self, fleet, monkeypatch):
+        """Every long-lived backend enters the plan, not only gateways."""
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_procs._scan_dashboard_processes",
+            lambda: [
+                (300, "python -m hermes_cli.main --profile work serve --port 9119"),
+                (400, "hermes dashboard --port 8300"),
+            ],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_procs._hermes_home_for_pid",
+            lambda pid: None,
+        )
+        monkeypatch.setattr(
+            ui,
+            "_systemd_service_for_pid",
+            lambda pid: "hermes-serve-work.service" if pid == 300 else None,
+        )
+
+        plan = ui.collect_runtime_inventory()
+        by_pid = {runtime.pid: runtime for runtime in plan.runtimes}
+        assert by_pid[300].kind == "serve"
+        assert by_pid[300].profile == "work"
+        assert by_pid[300].supervisor == "systemd"
+        assert by_pid[300].detail["service"] == "hermes-serve-work.service"
+        assert by_pid[400].kind == "dashboard"
+        assert by_pid[400].profile == "default"
+        assert by_pid[400].supervisor == "manual"
+
     def test_never_raises_when_everything_fails(self, monkeypatch):
         def _boom(*a, **k):
             raise RuntimeError("probe down")
@@ -109,6 +139,7 @@ class TestCollectInventory:
             "hermes_cli.profiles._get_default_hermes_home",
             "hermes_cli.gateway._get_service_pids",
             "hermes_cli.gateway.find_profile_gateway_processes",
+            "hermes_cli.dashboard_procs._scan_dashboard_processes",
         ):
             monkeypatch.setattr(target, _boom)
         plan = ui.collect_runtime_inventory()
