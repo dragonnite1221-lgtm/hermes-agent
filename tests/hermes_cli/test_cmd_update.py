@@ -10,6 +10,9 @@ import pytest
 from hermes_cli.main import cmd_update, PROJECT_ROOT
 
 
+pytestmark = pytest.mark.usefixtures("isolate_update_host_runtime")
+
+
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
     """Build a side_effect function for subprocess.run that simulates git commands."""
 
@@ -68,24 +71,6 @@ def _patch_managed_uv(request):
     with patch("hermes_cli.managed_uv.resolve_uv", side_effect=_fake_resolve_uv), \
          patch("hermes_cli.managed_uv.ensure_uv", side_effect=_fake_ensure_uv), \
          patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv):
-        yield
-
-
-@pytest.fixture(autouse=True)
-def _patch_gateway_discovery():
-    """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
-
-    The restart phase used to swallow every exception at debug level, so these
-    end-to-end tests never noticed it touching real gateway discovery. Since
-    the phase is surfaced (#78574: an aborted restart now fails the update),
-    an unmocked ``find_gateway_pids`` on a box with a live gateway reaches the
-    conftest live-system guard and turns into a spurious ``sys.exit(1)``.
-    Discovery returning nothing makes the phase a clean no-op for every test
-    in this module (none of them assert on gateway restarts).
-    """
-    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
-         patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
         yield
 
 

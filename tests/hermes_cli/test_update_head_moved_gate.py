@@ -16,6 +16,9 @@ import pytest
 from hermes_cli import main as hermes_main
 
 
+pytestmark = pytest.mark.usefixtures("isolate_update_host_runtime")
+
+
 def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
     """Simulate git commands where HEAD advances from pre_sha to post_sha."""
     calls = {"n": 0}
