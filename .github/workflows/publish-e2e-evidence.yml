@@ -53,6 +53,7 @@ jobs:
           # The run's own ``pull_requests`` payload is always empty for a
           # fork PR, so resolve the PR from its head reference instead.
           # The head-SHA match skips runs that a newer push superseded.
+          # shellcheck disable=SC2016 # $ENV.HEAD_SHA is jq syntax, not shell expansion.
           PR_NUMBER=$(gh api -X GET "repos/$SOURCE_REPO/pulls" \
             -f head="$HEAD_OWNER:$HEAD_BRANCH" -f state=open \
             --jq '.[] | select(.head.sha == $ENV.HEAD_SHA) | .number' \

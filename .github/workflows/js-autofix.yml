@@ -65,7 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 26
           cache: npm
@@ -154,7 +154,7 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
       - name: Download patch
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: js-fix-patch
           # ${{ runner.temp }} expands in with: params (shell-style $VAR does not).
@@ -206,6 +206,7 @@ jobs:
           if [ -z "$PR_NUM" ]; then
             # gh pr create prints the PR URL. Extract the number from it
             # (https://github.com/<org>/<repo>/pull/<number>).
+            # shellcheck disable=SC2016 # Markdown backticks are intentional literals.
             PR_URL=$(gh pr create \
               --head "$BOT_BRANCH" --base main \
               --title 'fmt(js): `npm run fix` auto-fix' \
@@ -234,7 +235,7 @@ jobs:
           # Poll every 15s for up to ~10 minutes. Auto-merge will handle the
           # PR even if this job times out — the polling is for cleanup only
           # (auto-close on CI failure, conflicts, or main moving).
-          for i in $(seq 1 40); do
+          for _ in {1..40}; do
             sleep 15
 
             STATE=$(gh pr view "$PR_NUM" --json state --jq '.state')
