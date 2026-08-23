@@ -1,6 +1,8 @@
 """Tests for /goal quality gates (GoalGate, run_gate, GoalManager gate flow)."""
 
 import json
+import shlex
+import subprocess
 import sys
 import time
 from unittest.mock import patch
@@ -13,6 +15,7 @@ from hermes_cli.goals import (
     GoalGate,
     GoalManager,
     GoalState,
+    workspace_fingerprint,
     run_gate,
     save_goal,
     load_goal,
@@ -78,6 +81,47 @@ def test_run_gate_timeout():
     assert "timed out" in out
 
 
+@pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
+def test_run_gate_timeout_kills_detached_descendants(tmp_path):
+    """A timed-out shell must not leave a detached grandchild running."""
+    pid_file = tmp_path / "child.pid"
+    script = tmp_path / "spawn_tree.py"
+    script.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+        "    start_new_session=True,\n"
+        ")\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='ascii')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    command = " ".join(
+        shlex.quote(value) for value in (sys.executable, str(script), str(pid_file))
+    )
+
+    passed, code, _ = run_gate(GoalGate(command=command, timeout_seconds=2))
+
+    assert passed is False
+    assert code == -1
+    assert pid_file.exists(), "grandchild never started before the gate deadline"
+    child_pid = int(pid_file.read_text(encoding="ascii"))
+    import psutil
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and psutil.pid_exists(child_pid):
+        try:
+            if psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE:
+                break
+        except psutil.NoSuchProcess:
+            break
+        time.sleep(0.05)
+    assert not psutil.pid_exists(child_pid) or (
+        psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+    )
+
+
 def test_run_gate_keeps_diagnostics_when_a_byte_will_not_decode(tmp_path):
     """A gate's output tail must survive bytes the decoder rejects.
 
@@ -105,6 +149,41 @@ def test_run_gate_keeps_diagnostics_when_a_byte_will_not_decode(tmp_path):
     assert "FAILED: 3 tests broken" in out, (
         f"gate diagnostics were lost to a decode failure (tail={out!r})"
     )
+
+
+def test_workspace_fingerprint_tracks_bytes_after_path_is_already_dirty(tmp_path):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=tmp_path,
+        check=True,
+    )
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=tmp_path, check=True)
+
+    tracked.write_text("first dirty value\n", encoding="utf-8")
+    status_before = subprocess.check_output(
+        ["git", "status", "--porcelain"], cwd=tmp_path
+    )
+    first = workspace_fingerprint(str(tmp_path))
+    tracked.write_text("second dirty value\n", encoding="utf-8")
+    status_after = subprocess.check_output(
+        ["git", "status", "--porcelain"], cwd=tmp_path
+    )
+    second = workspace_fingerprint(str(tmp_path))
+
+    assert status_before == status_after == b" M tracked.txt\n"
+    assert first and second and first != second
+
+    untracked = tmp_path / "untracked.txt"
+    untracked.write_text("first untracked value\n", encoding="utf-8")
+    third = workspace_fingerprint(str(tmp_path))
+    untracked.write_text("second untracked value\n", encoding="utf-8")
+    fourth = workspace_fingerprint(str(tmp_path))
+    assert third != fourth
 
 
 # ──────────────────────────────────────────────────────────────────────

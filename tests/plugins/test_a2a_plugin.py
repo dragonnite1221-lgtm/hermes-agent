@@ -1223,6 +1223,114 @@ class TestInboundRoundTrip:
 
         asyncio.run(run())
 
+    def test_authenticated_peers_cannot_cross_access_tasks(self, monkeypatch):
+        monkeypatch.setenv("A2A_PEER_TOKENS", "alice:tok-alice,bob:tok-bob")
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.setenv("A2A_HOST", "127.0.0.1")
+        adapter, base = _make_live_adapter(monkeypatch)
+        alice = {"Authorization": "Bearer tok-alice"}
+        bob = {"Authorization": "Bearer tok-bob"}
+
+        async def run():
+            assert await adapter.connect() is True
+            created = await asyncio.to_thread(
+                _post_json, base + "/", _send_body("alice secret"), alice
+            )
+            task_id = created["result"]["id"]
+
+            for method in ("tasks/get", "tasks/cancel", "tasks/subscribe"):
+                hidden = await asyncio.to_thread(
+                    _post_json,
+                    base + "/",
+                    {
+                        "jsonrpc": "2.0",
+                        "id": method,
+                        "method": method,
+                        "params": {"taskId": task_id},
+                    },
+                    bob,
+                )
+                assert hidden["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+
+            listed = await asyncio.to_thread(
+                _post_json,
+                base + "/",
+                {
+                    "jsonrpc": "2.0",
+                    "id": "list",
+                    "method": "tasks/list",
+                    "params": {},
+                },
+                bob,
+            )
+            assert listed["result"]["tasks"] == []
+
+            denied_push = await asyncio.to_thread(
+                _post_json,
+                base + "/",
+                {
+                    "jsonrpc": "2.0",
+                    "id": "push",
+                    "method": "tasks/pushNotificationConfig/create",
+                    "params": {
+                        "taskId": task_id,
+                        "pushNotificationConfig": {
+                            "url": "https://example.com/hook"
+                        },
+                    },
+                },
+                bob,
+            )
+            assert denied_push["error"]["code"] == protocol.ERR_TASK_NOT_FOUND
+
+            owner_get = await asyncio.to_thread(
+                _post_json,
+                base + "/",
+                {
+                    "jsonrpc": "2.0",
+                    "id": "owner",
+                    "method": "tasks/get",
+                    "params": {"taskId": task_id},
+                },
+                alice,
+            )
+            assert owner_get["result"]["id"] == task_id
+            await adapter.disconnect()
+
+        asyncio.run(run())
+
+    def test_negative_content_length_is_rejected_without_reading_to_eof(self, monkeypatch):
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+        adapter, base = _make_live_adapter(monkeypatch)
+        port = int(base.rsplit(":", 1)[1])
+
+        def raw_request() -> bytes:
+            with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
+                sock.settimeout(2)
+                sock.sendall(
+                    b"POST / HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: -1\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                chunks = []
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        return b"".join(chunks)
+                    chunks.append(chunk)
+
+        async def run():
+            assert await adapter.connect() is True
+            response = await asyncio.to_thread(raw_request)
+            assert response.startswith(b"HTTP/1.0 400")
+            assert b"parse error" in response
+            await adapter.disconnect()
+
+        asyncio.run(run())
+
 
 # --------------------------------------------------------------------------
 # Push notifications end-to-end (inline config in message/send)

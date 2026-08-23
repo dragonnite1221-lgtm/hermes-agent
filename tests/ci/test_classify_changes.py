@@ -8,7 +8,9 @@ change could have broken.
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -277,6 +279,56 @@ def test_ci_jobs_only_gate_on_detect_outputs_that_detect_actually_declares():
 
     assert referenced, "found no detect-gated jobs — the walk is broken, not the wiring"
     assert referenced - declared == set(), "job(s) gate on an output detect never declares"
+
+
+def test_aggregate_gate_needs_every_policy_job():
+    ci = _yaml(".github/workflows/ci.yaml")
+    aggregate_needs = set(ci["jobs"]["all-checks-pass"]["needs"])
+    assert "infographic-check" in aggregate_needs
+
+
+def test_infographic_policy_excludes_shipped_docs_but_rejects_other_images(tmp_path):
+    workflow = _yaml(".github/workflows/infographic-check.yml")
+    steps = workflow["jobs"]["check-no-committed-infographics"]["steps"]
+    script = next(step["run"] for step in steps if step.get("id") == "infographic-check")
+
+    excluded = [
+        tmp_path / "docs/assets/infographic/guide.png",
+        tmp_path / "website/static/infografico/product.webp",
+    ]
+    for path in excluded:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"image")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    output = tmp_path / "github-output.txt"
+    env = {**os.environ, "GITHUB_OUTPUT": str(output)}
+
+    allowed = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+
+    offender = tmp_path / "artifacts/infographics/review.png"
+    offender.parent.mkdir(parents=True)
+    offender.write_bytes(b"image")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    rejected = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected.returncode == 1
+    assert "artifacts/infographics/review.png" in rejected.stdout
+    assert all(str(path.relative_to(tmp_path)) not in rejected.stdout for path in excluded)
 
 
 def _iter_if_expressions(job: object):

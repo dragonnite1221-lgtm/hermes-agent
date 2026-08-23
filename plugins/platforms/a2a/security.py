@@ -26,13 +26,16 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import time
+import urllib.parse
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -283,25 +286,69 @@ def sign_push_payload(payload: dict) -> str:
 # SSRF protection for push notification callback URLs
 # --------------------------------------------------------------------------
 
-import ipaddress
-import urllib.parse
+_MAX_CALLBACK_IPS = 8
+_MAX_CALLBACK_REDIRECTS = 5
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
-# Blocked IP ranges for push callback URLs (SSRF prevention).
-# Even in localhost-only mode we block these — a remote peer shouldn't
-# be able to make us probe internal services.
-_BLOCKED_PREFIXES = (
-    "169.254.",    # link-local / AWS metadata
-    "127.",        # loopback
-    "10.",         # RFC1918 private
-    "172.16.", "172.17.", "172.18.", "172.19.", "172.20.",
-    "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
-    "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",  # RFC1918 private
-    "192.168.",    # RFC1918 private
-    "0.0.0.0",     # unspecified
-    "::1",         # IPv6 loopback
-    "fe80:",       # IPv6 link-local
-    "fc00:", "fd00:",  # IPv6 unique-local
-)
+
+class UnsafeCallbackURL(ValueError):
+    """Raised when an A2A push callback violates the outbound network policy."""
+
+
+def _callback_ip_allowed(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    *,
+    allow_loopback: bool,
+) -> bool:
+    """Allow public addresses, plus loopback only for localhost-only A2A."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_loopback:
+        return allow_loopback
+    # ``is_global`` excludes private, link-local, metadata, CGNAT, reserved,
+    # multicast, and unspecified space across both address families.
+    return bool(ip.is_global)
+
+
+def _resolve_callback_ips(
+    hostname: str,
+    port: int,
+    *,
+    allow_loopback: bool,
+) -> list[str]:
+    """Resolve and validate every address immediately before a connection."""
+    try:
+        answers = socket.getaddrinfo(
+            hostname,
+            port,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+        )
+    except (socket.gaierror, OSError) as exc:
+        raise UnsafeCallbackURL(
+            f"callback DNS resolution failed for {hostname}"
+        ) from exc
+
+    safe: list[str] = []
+    seen: set[str] = set()
+    for _family, _socktype, _proto, _canonname, sockaddr in answers:
+        raw_ip = str(sockaddr[0]).split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(raw_ip)
+        except ValueError as exc:
+            raise UnsafeCallbackURL(
+                f"callback DNS returned an invalid address for {hostname}"
+            ) from exc
+        if not _callback_ip_allowed(ip, allow_loopback=allow_loopback):
+            raise UnsafeCallbackURL(
+                f"callback resolved to a private or non-routable address: {hostname}"
+            )
+        if raw_ip not in seen and len(safe) < _MAX_CALLBACK_IPS:
+            safe.append(raw_ip)
+            seen.add(raw_ip)
+    if not safe:
+        raise UnsafeCallbackURL(f"callback DNS returned no addresses for {hostname}")
+    return safe
 
 
 def is_safe_callback_url(url: str) -> bool:
@@ -321,24 +368,130 @@ def is_safe_callback_url(url: str) -> bool:
     hostname = parsed.hostname or ""
     if not hostname:
         return False
-    hostname_lower = hostname.lower()
-    if hostname_lower == "localhost":
-        # Loopback callbacks only make sense for local testing.
-        return localhost_only()
-    for prefix in _BLOCKED_PREFIXES:
-        if hostname_lower.startswith(prefix.lower()):
-            if localhost_only() and prefix in ("127.", "::1"):
-                return True
-            return False
     try:
-        ip = ipaddress.ip_address(hostname)
-        if ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_reserved:
-            if localhost_only() and ip.is_loopback:
-                return True
+        if parsed.username is not None or parsed.password is not None:
             return False
-    except ValueError:
-        pass  # not an IP, it's a hostname — fine
-    return True
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        _resolve_callback_ips(
+            hostname,
+            port,
+            allow_loopback=localhost_only(),
+        )
+        return True
+    except (UnsafeCallbackURL, ValueError):
+        return False
+
+
+class _CallbackNetworkBackend:
+    """httpcore backend that dials only the IPs vetted at connect time.
+
+    httpcore retains the original URL hostname above this layer, so HTTPS SNI,
+    certificate verification, and the Host header still use the callback host
+    even though the TCP socket is pinned to a validated concrete address.
+    """
+
+    def __init__(self, *, allow_loopback: bool):
+        from httpcore._backends.sync import SyncBackend
+
+        self._backend = SyncBackend()
+        self._allow_loopback = allow_loopback
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> Any:
+        import httpcore
+
+        ips = _resolve_callback_ips(
+            host,
+            port,
+            allow_loopback=self._allow_loopback,
+        )
+        last_error: Exception | None = None
+        for ip in ips:
+            try:
+                return self._backend.connect_tcp(
+                    ip,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise UnsafeCallbackURL(f"callback DNS returned no usable address: {host}")
+
+    def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> Any:
+        raise UnsafeCallbackURL("Unix sockets are not valid A2A callbacks")
+
+    def sleep(self, seconds: float) -> None:
+        self._backend.sleep(seconds)
+
+
+def post_safe_callback(
+    url: str,
+    payload: bytes,
+    headers: dict[str, str],
+    *,
+    timeout: float = 10,
+) -> int:
+    """POST a callback with connect-time DNS pinning and guarded redirects."""
+    import httpx
+
+    allow_loopback = localhost_only()
+
+    class _CallbackTransport(httpx.HTTPTransport):
+        def __init__(self) -> None:
+            super().__init__(retries=0)
+            self._pool._network_backend = _CallbackNetworkBackend(  # type: ignore[attr-defined]
+                allow_loopback=allow_loopback
+            )
+
+    current_url = url
+    method = "POST"
+    content: bytes | None = payload
+    current_headers = dict(headers)
+    with httpx.Client(
+        transport=_CallbackTransport(),
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        for _ in range(_MAX_CALLBACK_REDIRECTS + 1):
+            # Resolve now for a clear early rejection; the transport resolves
+            # again and pins the TCP connection, closing DNS rebinding races.
+            if not is_safe_callback_url(current_url):
+                raise UnsafeCallbackURL("unsafe A2A callback URL")
+            response = client.request(
+                method,
+                current_url,
+                content=content,
+                headers=current_headers,
+            )
+            if response.status_code not in _REDIRECT_STATUSES:
+                return response.status_code
+            location = response.headers.get("location")
+            if not location:
+                raise UnsafeCallbackURL("callback redirect omitted Location")
+            current_url = urllib.parse.urljoin(current_url, location)
+            if response.status_code == 303 or (
+                response.status_code in {301, 302} and method == "POST"
+            ):
+                method = "GET"
+                content = None
+                current_headers = {}
+    raise UnsafeCallbackURL("too many A2A callback redirects")
 
 
 # --------------------------------------------------------------------------

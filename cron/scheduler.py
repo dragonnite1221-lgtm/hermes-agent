@@ -2753,9 +2753,8 @@ def _send_media_via_adapter(
             try:
                 # Large attachments (long TTS audio, concatenated recordings,
                 # big exports) can legitimately exceed a fixed 30s upload
-                # window. Configurable, matching the other cron timeouts
-                # (cron.media_send_timeout_seconds in config.yaml, or the
-                # HERMES_CRON_MEDIA_SEND_TIMEOUT env override).
+                # window. Configure cron.media_send_timeout_seconds in
+                # config.yaml to match the deployment's upload bandwidth.
                 result = future.result(timeout=_get_media_send_timeout())
             except TimeoutError:
                 future.cancel()
@@ -3706,26 +3705,12 @@ _DEFAULT_MEDIA_SEND_TIMEOUT = 300
 
 
 def _get_media_send_timeout() -> int:
-    """Resolve the per-attachment media-send timeout from env/config.
+    """Resolve the per-attachment media-send timeout from config.
 
-    Mirrors the ``script_timeout_seconds`` resolution pattern: the
-    HERMES_CRON_MEDIA_SEND_TIMEOUT env var wins, then
-    ``cron.media_send_timeout_seconds`` in config.yaml, then the default
-    (300s — large attachments like long TTS audio can legitimately exceed
-    the old fixed 30s upload window).
+    ``cron.media_send_timeout_seconds`` in config.yaml is the sole public
+    override; otherwise the 300s default applies. Large attachments like long
+    TTS audio can legitimately exceed the old fixed 30s upload window.
     """
-    env_value = os.getenv("HERMES_CRON_MEDIA_SEND_TIMEOUT", "").strip()
-    if env_value:
-        try:
-            timeout = int(float(env_value))
-            if timeout > 0:
-                return timeout
-        except Exception:
-            logger.warning(
-                "Invalid HERMES_CRON_MEDIA_SEND_TIMEOUT=%r; using config/default",
-                env_value,
-            )
-
     try:
         cfg = load_config() or {}
         cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}

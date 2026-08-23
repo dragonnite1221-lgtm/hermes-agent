@@ -18,9 +18,11 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
@@ -520,6 +522,31 @@ class TestTaskStore:
         assert store.pop_push_url("t1") == ""  # consumed
         assert store.set_push_config("ghost", "https://x/") is None
 
+    def test_authenticated_peer_scope_covers_tasks_watchers_and_push_configs(self):
+        store = protocol.TaskStore()
+        store.create("t1", "c1", "alice", "agent", "tenant")
+
+        assert store.get("t1", "agent", "tenant", "alice") is not None
+        assert store.get("t1", "agent", "tenant", "bob") is None
+        assert store.watch("t1", "agent", "tenant", "bob") is None
+        recs, _ = store.list(agent_slug="agent", tenant="tenant", peer="bob")
+        assert recs == []
+        assert store.set_push_config(
+            "t1", "https://example.com/hook", "agent", "tenant", "bob"
+        ) is None
+
+        config = store.set_push_config(
+            "t1", "https://example.com/hook", "agent", "tenant", "alice"
+        )
+        assert config is not None
+        assert store.get_push_config(
+            "t1", "", "agent", "tenant", "bob"
+        ) is None
+        assert store.list_push_configs("t1", "agent", "tenant", "bob") == []
+        assert store.delete_push_config(
+            "t1", "", "agent", "tenant", "bob"
+        ) is False
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Dynamic Agent Cards
@@ -653,7 +680,18 @@ class TestA2AOrchestrate:
 
 
 class TestSSRFProtection:
-    def test_safe_public_urls_allowed(self):
+    @staticmethod
+    def _dns(ip: str, port: int = 443):
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        sockaddr = (ip, port, 0, 0) if family == socket.AF_INET6 else (ip, port)
+        return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", sockaddr)]
+
+    def test_safe_public_urls_allowed(self, monkeypatch):
+        monkeypatch.setattr(
+            security.socket,
+            "getaddrinfo",
+            lambda *args, **kwargs: self._dns("93.184.216.34"),
+        )
         assert security.is_safe_callback_url("https://example.com/webhook") is True
         assert security.is_safe_callback_url("http://example.com/webhook") is True
 
@@ -685,3 +723,80 @@ class TestSSRFProtection:
     def test_empty_url_blocked(self):
         assert security.is_safe_callback_url("") is False
         assert security.is_safe_callback_url(None) is False
+
+    def test_hostname_resolving_private_or_mixed_is_blocked(self, monkeypatch):
+        monkeypatch.setenv("A2A_BEARER_TOKEN", "tok")
+        monkeypatch.setattr(
+            security.socket,
+            "getaddrinfo",
+            lambda *args, **kwargs: self._dns("10.0.0.9"),
+        )
+        assert security.is_safe_callback_url("https://callback.example/hook") is False
+
+        monkeypatch.setattr(
+            security.socket,
+            "getaddrinfo",
+            lambda *args, **kwargs: (
+                self._dns("93.184.216.34") + self._dns("127.0.0.1")
+            ),
+        )
+        assert security.is_safe_callback_url("https://mixed.example/hook") is False
+
+    def test_callback_userinfo_is_blocked(self, monkeypatch):
+        monkeypatch.setattr(
+            security.socket,
+            "getaddrinfo",
+            lambda *args, **kwargs: self._dns("93.184.216.34"),
+        )
+        assert security.is_safe_callback_url(
+            "https://user:password@example.com/hook"
+        ) is False
+
+    def test_connect_time_dns_rebinding_is_blocked(self, monkeypatch):
+        monkeypatch.setenv("A2A_BEARER_TOKEN", "tok")
+        calls = 0
+
+        def changing_dns(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return self._dns("93.184.216.34" if calls == 1 else "127.0.0.1", 80)
+
+        monkeypatch.setattr(security.socket, "getaddrinfo", changing_dns)
+        with pytest.raises(security.UnsafeCallbackURL):
+            security.post_safe_callback(
+                "http://rebind.example/hook",
+                b"{}",
+                {"Content-Type": "application/json"},
+                timeout=1,
+            )
+        assert calls >= 2
+
+    def test_redirect_target_is_revalidated_before_following(self, monkeypatch):
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+
+        class _Redirect(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):  # noqa: N802
+                self.send_response(302)
+                self.send_header("Location", "http://169.254.169.254/latest/meta-data/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        server = HTTPServer(("127.0.0.1", 0), _Redirect)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with pytest.raises(security.UnsafeCallbackURL):
+                security.post_safe_callback(
+                    f"http://127.0.0.1:{server.server_port}/hook",
+                    b"{}",
+                    {"Content-Type": "application/json"},
+                    timeout=2,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)

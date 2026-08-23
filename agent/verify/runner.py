@@ -22,7 +22,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from agent.deadline import kill_process_tree
 from agent.verify.recipes import Recipe
+from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 
 DEFAULT_PHASE_TIMEOUT = 600.0
 DEFAULT_READY_TIMEOUT = 60.0
@@ -109,17 +111,24 @@ def _run_phase_command(
 ) -> PhaseResult:
     started = time.monotonic()
     try:
-        proc = subprocess.run(
+        popen_kwargs = (
+            {"creationflags": windows_hide_flags()}
+            if IS_WINDOWS
+            else {"process_group": 0}
+        )
+        proc = subprocess.Popen(
             command,
             shell=True,  # project-authored commands; see module docstring
             cwd=str(root),
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=timeout,
             text=True,
             errors="replace",
+            **popen_kwargs,
         )
-        output = proc.stdout or ""
+        output, _ = proc.communicate(timeout=timeout)
+        output = output or ""
         exit_code: int | None = proc.returncode
         timed_out = False
     except subprocess.TimeoutExpired as exc:
@@ -128,6 +137,13 @@ def _run_phase_command(
             output = raw.decode("utf-8", errors="replace")
         else:
             output = raw or ""
+        if "proc" in locals():
+            kill_process_tree(proc.pid)
+            try:
+                drained, _ = proc.communicate(timeout=1.0)
+                output = drained or output
+            except (subprocess.TimeoutExpired, OSError, ValueError):
+                pass
         exit_code = None
         timed_out = True
     duration = time.monotonic() - started

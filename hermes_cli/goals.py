@@ -42,6 +42,9 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.deadline import kill_process_tree
+from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
+
 logger = logging.getLogger(__name__)
 
 
@@ -470,31 +473,77 @@ class GoalGate:
 
 
 def workspace_fingerprint(cwd: Optional[str] = None) -> str:
-    """Cheap workspace change fingerprint for unchanged-gate skip.
+    """Content-aware workspace fingerprint for unchanged-gate skip.
 
-    Uses ``git status --porcelain`` + ``git rev-parse HEAD`` when inside a git
-    repo (covers tracked edits, stages, and commits). Outside git, returns
-    an empty string — an empty fingerprint never matches, so gates simply
-    always re-run (safe fallback, no behavior regression for non-repo work).
+    Git status alone records that a path is modified, not *which* bytes it
+    contains. Hash HEAD, binary-safe porcelain/index metadata, and the current
+    bytes of every modified or untracked path so two edits to the same already-
+    dirty file cannot be mistaken for an unchanged failed gate. Outside git,
+    returns an empty string; empty fingerprints never match, so gates re-run.
     """
     workdir = cwd or os.getcwd()
+
+    def _git(root: str, *args: str, timeout: int = 30) -> bytes:
+        proc = subprocess.run(
+            ["git", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            cwd=root,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"git {' '.join(args)} failed")
+        return proc.stdout
+
     try:
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=10, cwd=workdir,
+        root = os.fsdecode(
+            _git(workdir, "rev-parse", "--show-toplevel", timeout=10).rstrip(b"\r\n")
         )
-        if head.returncode != 0:
-            return ""
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=30, cwd=workdir,
-        )
-        if status.returncode != 0:
-            return ""
-        blob = head.stdout.strip() + "\n" + status.stdout
-        return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()
+        head = _git(root, "rev-parse", "HEAD", timeout=10)
+        status = _git(root, "status", "--porcelain=v2", "-z", "--untracked-files=all")
+        staged = _git(root, "diff", "--cached", "--raw", "-z", "--no-ext-diff")
+        paths = _git(
+            root,
+            "ls-files",
+            "--modified",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ).split(b"\0")
+
+        digest = hashlib.sha256()
+        for label, value in ((b"head", head), (b"status", status), (b"staged", staged)):
+            digest.update(label + b"\0" + len(value).to_bytes(8, "big") + value)
+
+        root_bytes = os.fsencode(root)
+        for relpath in sorted(path for path in paths if path):
+            digest.update(b"path\0" + len(relpath).to_bytes(8, "big") + relpath)
+            path = os.path.join(root_bytes, relpath)
+            if os.path.islink(path):
+                target = os.readlink(path)
+                target_bytes = target if isinstance(target, bytes) else os.fsencode(target)
+                digest.update(b"symlink\0" + len(target_bytes).to_bytes(8, "big") + target_bytes)
+                continue
+            if os.path.isdir(path):
+                nested = workspace_fingerprint(os.fsdecode(path))
+                if not nested:
+                    return ""
+                digest.update(b"nested-repo\0" + nested.encode("ascii"))
+                continue
+            try:
+                file_digest = hashlib.sha256()
+                with open(path, "rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        file_digest.update(chunk)
+                digest.update(b"file\0" + file_digest.digest())
+            except FileNotFoundError:
+                # A tracked deletion is fully described by porcelain status.
+                digest.update(b"missing\0")
+            except (IsADirectoryError, PermissionError, OSError):
+                # An unreadable current value cannot safely participate in an
+                # equality decision. Empty fingerprints force the gate to run.
+                return ""
+        return digest.hexdigest()
     except Exception:
         return ""
 
@@ -508,10 +557,17 @@ def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, s
     ``_GATE_OUTPUT_TAIL_CHARS``.
     """
     try:
-        proc = subprocess.run(
+        popen_kwargs = (
+            {"creationflags": windows_hide_flags()}
+            if IS_WINDOWS
+            else {"process_group": 0}
+        )
+        proc = subprocess.Popen(
             gate.command,
             shell=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             text=True,
             # A gate runs whatever the operator configured, so its output is
             # arbitrary bytes. The default text mode decodes with the process
@@ -521,10 +577,11 @@ def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, s
             # and the tail the agent needs to fix the failure arrives empty.
             encoding="utf-8",
             errors="replace",
-            timeout=max(1, int(gate.timeout_seconds)),
             cwd=cwd or None,
+            **popen_kwargs,
         )
-        combined = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+        stdout, stderr = proc.communicate(timeout=max(1, int(gate.timeout_seconds)))
+        combined = (stdout or "") + (("\n" + stderr) if stderr else "")
         tail = combined[-_GATE_OUTPUT_TAIL_CHARS:]
         return proc.returncode == 0, proc.returncode, tail
     except subprocess.TimeoutExpired as exc:
@@ -532,6 +589,13 @@ def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, s
         for chunk in (exc.stdout, exc.stderr):
             if chunk:
                 out += chunk if isinstance(chunk, str) else chunk.decode("utf-8", "replace")
+        if "proc" in locals():
+            kill_process_tree(proc.pid)
+            try:
+                stdout, stderr = proc.communicate(timeout=1.0)
+                out = (stdout or "") + (("\n" + stderr) if stderr else "")
+            except (subprocess.TimeoutExpired, OSError, ValueError):
+                pass
         tail = (out + f"\n[gate timed out after {gate.timeout_seconds}s]")[-_GATE_OUTPUT_TAIL_CHARS:]
         return False, -1, tail
     except Exception as exc:

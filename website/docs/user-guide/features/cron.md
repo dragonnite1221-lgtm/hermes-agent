@@ -568,7 +568,7 @@ cron:
   media_send_timeout_seconds: 600   # 10 minutes per attachment
 ```
 
-Or set the `HERMES_CRON_MEDIA_SEND_TIMEOUT` environment variable. The resolution order is: env var → config.yaml → 300s default. A timed-out attachment is recorded in the job's run status as a partial delivery failure (the text still delivers).
+A timed-out attachment is recorded in the job's run status as a partial delivery failure (the text still delivers).
 
 ## Bot Chat delivery timeout
 

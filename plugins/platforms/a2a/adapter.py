@@ -39,7 +39,6 @@ import subprocess
 import threading
 import time
 import urllib.parse
-import urllib.request
 from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -253,6 +252,8 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
 
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if length < 0:
+                raise ValueError("negative Content-Length")
             if length > _MAX_BODY:
                 self._json(413, protocol.jsonrpc_error(None, protocol.ERR_PARSE, "payload too large"))
                 return
@@ -309,28 +310,32 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             adapter._rpc_message_stream(self, req_id, params, identity, agent=agent)
             return
         if operation == "get":
-            self._json(200, adapter._rpc_tasks_get(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_tasks_get(req_id, params, agent=agent, peer=identity))
             return
         if operation == "list":
-            self._json(200, adapter._rpc_tasks_list(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_tasks_list(req_id, params, agent=agent, peer=identity))
             return
         if operation == "cancel":
-            self._json(200, adapter._rpc_tasks_cancel(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_tasks_cancel(req_id, params, agent=agent, peer=identity))
             return
         if operation == "subscribe":
-            adapter._rpc_tasks_subscribe(self, req_id, params, agent=agent)
+            adapter._rpc_tasks_subscribe(self, req_id, params, agent=agent, peer=identity)
             return
         if operation == "push_create":
-            self._json(200, adapter._rpc_push_config_create(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_push_config_create(
+                req_id, params, agent=agent, peer=identity))
             return
         if operation == "push_get":
-            self._json(200, adapter._rpc_push_config_get(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_push_config_get(
+                req_id, params, agent=agent, peer=identity))
             return
         if operation == "push_list":
-            self._json(200, adapter._rpc_push_config_list(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_push_config_list(
+                req_id, params, agent=agent, peer=identity))
             return
         if operation == "push_delete":
-            self._json(200, adapter._rpc_push_config_delete(req_id, params, agent=agent))
+            self._json(200, adapter._rpc_push_config_delete(
+                req_id, params, agent=agent, peer=identity))
             return
 
 
@@ -683,6 +688,10 @@ class A2AAdapter(BasePlatformAdapter):
         agent = agent or self._agents[""]
         return str(agent.get("slug") or ""), str(agent.get("tenant") or "")
 
+    def _task_scope(self, agent: Optional[dict], peer: str) -> tuple[str, str, str]:
+        agent_slug, tenant = self._scope_for_agent(agent)
+        return agent_slug, tenant, str(peer or "")
+
     def _forward_lock(self, key: tuple[str, str, str]) -> threading.Lock:
         with self._profile_session_locks_guard:
             lock = self._profile_session_locks.get(key)
@@ -735,7 +744,7 @@ class A2AAdapter(BasePlatformAdapter):
         protocol.metrics.inbound_total += 1
 
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
-        self._register_inline_push(task_id, params, agent=agent)
+        self._register_inline_push(task_id, params, agent=agent, peer=peer)
 
         if not agent.get("local", True):
             reply, state = self._forward_to_profile(agent, peer, context_id, framed)
@@ -1026,10 +1035,17 @@ class A2AAdapter(BasePlatformAdapter):
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: stream client disconnected")
 
-    def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None) -> None:
+    def _rpc_tasks_subscribe(
+        self,
+        handler,
+        req_id: Any,
+        params: dict,
+        agent: Optional[dict] = None,
+        peer: str = "",
+    ) -> None:
         """Reconnect to an existing task's stream (v1.0 SubscribeToTask)."""
         task_id = str(params.get("taskId") or params.get("id") or "")
-        rec = self.tasks.get(task_id, *self._scope_for_agent(agent))
+        rec = self.tasks.get(task_id, *self._task_scope(agent, peer))
         if not rec:
             handler._json(200, protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}"))
@@ -1037,7 +1053,7 @@ class A2AAdapter(BasePlatformAdapter):
 
         self._sse_headers(handler)
         try:
-            fut = self.tasks.watch(task_id, *self._scope_for_agent(agent))
+            fut = self.tasks.watch(task_id, *self._task_scope(agent, peer))
             if fut is None:
                 self._sse_write(handler, protocol.sse_done())
                 return
@@ -1057,9 +1073,15 @@ class A2AAdapter(BasePlatformAdapter):
 
     # ── Task queries ──────────────────────────────────────────────────────
 
-    def _rpc_tasks_get(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_tasks_get(
+        self,
+        req_id: Any,
+        params: dict,
+        agent: Optional[dict] = None,
+        peer: str = "",
+    ) -> dict:
         task_id = str(params.get("taskId") or params.get("id") or "")
-        rec = self.tasks.get(task_id, *self._scope_for_agent(agent))
+        rec = self.tasks.get(task_id, *self._task_scope(agent, peer))
         if not rec:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}")
@@ -1070,7 +1092,13 @@ class A2AAdapter(BasePlatformAdapter):
             history_len = None
         return protocol.jsonrpc_result(req_id, protocol.TaskStore.to_task(rec, history_length=history_len))
 
-    def _rpc_tasks_list(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_tasks_list(
+        self,
+        req_id: Any,
+        params: dict,
+        agent: Optional[dict] = None,
+        peer: str = "",
+    ) -> dict:
         try:
             offset = int(params.get("pageToken") or 0)
         except (ValueError, TypeError):
@@ -1086,6 +1114,7 @@ class A2AAdapter(BasePlatformAdapter):
             offset=max(0, offset),
             agent_slug=self._scope_for_agent(agent)[0],
             tenant=self._scope_for_agent(agent)[1],
+            peer=peer,
             with_total=True,
         )
         include_artifacts = bool(params.get("includeArtifacts", False))
@@ -1101,9 +1130,15 @@ class A2AAdapter(BasePlatformAdapter):
             "totalSize": total,
         })
 
-    def _rpc_tasks_cancel(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_tasks_cancel(
+        self,
+        req_id: Any,
+        params: dict,
+        agent: Optional[dict] = None,
+        peer: str = "",
+    ) -> dict:
         task_id = str(params.get("taskId") or params.get("id") or "")
-        rec = self.tasks.get(task_id, *self._scope_for_agent(agent))
+        rec = self.tasks.get(task_id, *self._task_scope(agent, peer))
         if not rec:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}")
@@ -1114,21 +1149,33 @@ class A2AAdapter(BasePlatformAdapter):
         self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
         self._turns.reset(rec["context_id"])
         self._resolve_task(task_id, protocol.STATE_CANCELED, "")
-        rec = self.tasks.get(task_id, *self._scope_for_agent(agent)) or rec
+        rec = self.tasks.get(task_id, *self._task_scope(agent, peer)) or rec
         return protocol.jsonrpc_result(req_id, protocol.TaskStore.to_task(rec))
 
     # ── Push notifications ────────────────────────────────────────────────
 
-    def _register_inline_push(self, task_id: str, params: dict, agent: Optional[dict] = None) -> None:
+    def _register_inline_push(
+        self,
+        task_id: str,
+        params: dict,
+        agent: Optional[dict] = None,
+        peer: str = "",
+    ) -> None:
         """v1.0: message/send can carry configuration.taskPushNotificationConfig."""
         cfg = (params.get("configuration") or {}).get("taskPushNotificationConfig") or {}
         if not isinstance(cfg, dict):
             return
         url = cfg.get("url") or (cfg.get("pushNotificationConfig") or {}).get("url") or ""
         if url:
-            self.tasks.set_push_config(task_id, str(url), *self._scope_for_agent(agent))
+            self.tasks.set_push_config(task_id, str(url), *self._task_scope(agent, peer))
 
-    def _rpc_push_config_create(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_push_config_create(
+        self,
+        req_id: Any,
+        params: dict,
+        agent: Optional[dict] = None,
+        peer: str = "",
+    ) -> dict:
         task_id = str(params.get("taskId") or "")
         cfg = params.get("pushNotificationConfig") or params.get("config") or {}
         url = str((cfg or {}).get("url") or "")
@@ -1136,43 +1183,64 @@ class A2AAdapter(BasePlatformAdapter):
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_INVALID_PARAMS,
                 "taskId and pushNotificationConfig.url required")
-        stored = self.tasks.set_push_config(task_id, url, *self._scope_for_agent(agent))
+        stored = self.tasks.set_push_config(task_id, url, *self._task_scope(agent, peer))
         if stored is None:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}")
         return protocol.jsonrpc_result(req_id, stored)
 
-    def _rpc_push_config_get(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_push_config_get(
+        self,
+        req_id: Any,
+        params: dict,
+        agent: Optional[dict] = None,
+        peer: str = "",
+    ) -> dict:
         """GetTaskPushNotificationConfig — retrieve a push config by task id."""
         task_id = str(params.get("taskId") or "")
         config_id = str(params.get("id") or params.get("configId") or "")
         if not task_id:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_INVALID_PARAMS, "taskId required")
-        cfg = self.tasks.get_push_config(task_id, config_id, *self._scope_for_agent(agent))
+        cfg = self.tasks.get_push_config(
+            task_id, config_id, *self._task_scope(agent, peer))
         if cfg is None:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND,
                 f"push config not found for task: {task_id}")
         return protocol.jsonrpc_result(req_id, cfg)
 
-    def _rpc_push_config_list(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_push_config_list(
+        self,
+        req_id: Any,
+        params: dict,
+        agent: Optional[dict] = None,
+        peer: str = "",
+    ) -> dict:
         """ListTaskPushNotificationConfigs — list push configs for a task."""
         task_id = str(params.get("taskId") or "")
         if not task_id:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_INVALID_PARAMS, "taskId required")
-        configs = self.tasks.list_push_configs(task_id, *self._scope_for_agent(agent))
+        configs = self.tasks.list_push_configs(
+            task_id, *self._task_scope(agent, peer))
         return protocol.jsonrpc_result(req_id, {"configs": configs, "nextPageToken": ""})
 
-    def _rpc_push_config_delete(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_push_config_delete(
+        self,
+        req_id: Any,
+        params: dict,
+        agent: Optional[dict] = None,
+        peer: str = "",
+    ) -> dict:
         """DeleteTaskPushNotificationConfig — remove a push config."""
         task_id = str(params.get("taskId") or "")
         config_id = str(params.get("id") or params.get("configId") or "")
         if not task_id:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_INVALID_PARAMS, "taskId required")
-        deleted = self.tasks.delete_push_config(task_id, config_id, *self._scope_for_agent(agent))
+        deleted = self.tasks.delete_push_config(
+            task_id, config_id, *self._task_scope(agent, peer))
         if not deleted:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_FOUND,
@@ -1190,12 +1258,6 @@ class A2AAdapter(BasePlatformAdapter):
         if not callback_url:
             return
 
-        if not security.is_safe_callback_url(callback_url):
-            logger.warning("A2A: push notification for task %s blocked — unsafe callback URL: %s",
-                           task_id, callback_url)
-            protocol.metrics.push_failed += 1
-            return
-
         # Push payload uses the StreamResponse format (same as streaming).
         payload = protocol.status_update(task_id, context_id, state, (reply or "")[:2000])
 
@@ -1206,14 +1268,22 @@ class A2AAdapter(BasePlatformAdapter):
 
         try:
             data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(callback_url, data=data, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-                if 200 <= resp.status < 300:
-                    protocol.metrics.push_sent += 1
-                    logger.debug("A2A: push notification sent for task %s", task_id)
-                else:
-                    protocol.metrics.push_failed += 1
-                    logger.warning("A2A: push notification for task %s got HTTP %d", task_id, resp.status)
+            status = security.post_safe_callback(
+                callback_url,
+                data,
+                headers,
+                timeout=10,
+            )
+            if 200 <= status < 300:
+                protocol.metrics.push_sent += 1
+                logger.debug("A2A: push notification sent for task %s", task_id)
+            else:
+                protocol.metrics.push_failed += 1
+                logger.warning(
+                    "A2A: push notification for task %s got HTTP %d",
+                    task_id,
+                    status,
+                )
         except Exception as e:
             protocol.metrics.push_failed += 1
             logger.warning("A2A: push notification for task %s failed: %s", task_id, e)

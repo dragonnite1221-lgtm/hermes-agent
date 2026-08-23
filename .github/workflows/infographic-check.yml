@@ -48,6 +48,7 @@ jobs:
           # and are excluded; those are referenced from shipped docs pages.
           OFFENDERS=$(git ls-files -z \
             | tr '\0' '\n' \
+            | grep -ivE '^(docs/assets/|website/)' \
             | grep -iE '(^|/)(infograph|infograf)[^/]*/' \
             | grep -iE '\.(png|jpe?g|webp|gif)$' \
             || true)

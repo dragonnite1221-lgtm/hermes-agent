@@ -2,8 +2,12 @@
 
 import http.server
 import json
+import shlex
+import sys
 import threading
 import time
+
+import pytest
 
 from agent.verify.environment import (
     load_manifest,
@@ -103,6 +107,45 @@ class TestRunner:
         assert not result.ok
         assert result.phases[0].timed_out
         assert result.phases[0].exit_code is None
+
+    @pytest.mark.linux_only
+    @pytest.mark.live_system_guard_bypass
+    def test_phase_timeout_kills_detached_descendants(self, tmp_path):
+        pid_file = tmp_path / "child.pid"
+        script = tmp_path / "spawn_tree.py"
+        script.write_text(
+            "import pathlib, subprocess, sys, time\n"
+            "child = subprocess.Popen(\n"
+            "    [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+            "    start_new_session=True,\n"
+            ")\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='ascii')\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        command = " ".join(
+            shlex.quote(value) for value in (sys.executable, str(script), str(pid_file))
+        )
+        recipe = Recipe(name="x", test=[command])
+
+        result = run_verify(tmp_path, recipe, phase_timeout=2, skip_start=True)
+
+        assert result.phases[0].timed_out
+        assert pid_file.exists(), "grandchild never started before the phase deadline"
+        child_pid = int(pid_file.read_text(encoding="ascii"))
+        import psutil
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and psutil.pid_exists(child_pid):
+            try:
+                if psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE:
+                    break
+            except psutil.NoSuchProcess:
+                break
+            time.sleep(0.05)
+        assert not psutil.pid_exists(child_pid) or (
+            psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+        )
 
     def test_commands_run_in_project_root(self, tmp_path):
         (tmp_path / "marker.txt").write_text("here", encoding="utf-8")

@@ -9,10 +9,8 @@ Covers two salvaged fixes:
 - PR #87967 (@AiwendilInTheWoods): the per-attachment send timeout was a
   hardcoded 30s; large attachments (long TTS audio, big exports) failed on
   slow uplinks with no way to raise it. Now resolved via
-  HERMES_CRON_MEDIA_SEND_TIMEOUT → cron.media_send_timeout_seconds → 300s.
+  cron.media_send_timeout_seconds → 300s.
 """
-
-import pytest
 
 from cron.scheduler import (
     _DEFAULT_MEDIA_SEND_TIMEOUT,
@@ -27,13 +25,13 @@ class TestMediaSendTimeoutResolution:
         monkeypatch.setattr("cron.scheduler.load_config", lambda: {})
         assert _get_media_send_timeout() == _DEFAULT_MEDIA_SEND_TIMEOUT == 300
 
-    def test_env_wins(self, monkeypatch):
+    def test_undocumented_env_does_not_override_config(self, monkeypatch):
         monkeypatch.setenv("HERMES_CRON_MEDIA_SEND_TIMEOUT", "45")
         monkeypatch.setattr(
             "cron.scheduler.load_config",
             lambda: {"cron": {"media_send_timeout_seconds": 900}},
         )
-        assert _get_media_send_timeout() == 45
+        assert _get_media_send_timeout() == 900
 
     def test_config_value(self, monkeypatch):
         monkeypatch.delenv("HERMES_CRON_MEDIA_SEND_TIMEOUT", raising=False)
@@ -43,9 +41,8 @@ class TestMediaSendTimeoutResolution:
         )
         assert _get_media_send_timeout() == 900
 
-    @pytest.mark.parametrize("bad", ["abc", "-5", "0", ""])
-    def test_invalid_env_falls_back(self, monkeypatch, bad):
-        monkeypatch.setenv("HERMES_CRON_MEDIA_SEND_TIMEOUT", bad)
+    def test_undocumented_env_does_not_create_an_override(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_MEDIA_SEND_TIMEOUT", "45")
         monkeypatch.setattr("cron.scheduler.load_config", lambda: {})
         assert _get_media_send_timeout() == _DEFAULT_MEDIA_SEND_TIMEOUT
 
