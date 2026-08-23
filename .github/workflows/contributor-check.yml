@@ -27,6 +27,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          REPOSITORY_IS_FORK: ${{ github.event.repository.fork }}
         run: |
           set -euo pipefail
 
@@ -35,6 +36,15 @@ jobs:
           # contributions and must not be re-audited against the fork's stale
           # base. Exclude only commits reachable from the verified parent
           # default branch; cherry-picks and fork-local commits remain in scope.
+          # The event payload already carries the authoritative fork bit. Avoid
+          # adding an API availability dependency to the primary repository's
+          # otherwise-local attribution check; only a confirmed fork needs
+          # parent metadata and therefore the fail-closed lookup below.
+          if [ "$REPOSITORY_IS_FORK" != "true" ]; then
+            echo "parent_ref=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # Query the parent name and branch together, retrying transient API
           # and rate-limit failures. An exhausted retry remains fail-closed:
           # silently treating a fork as a standalone repository would audit
