@@ -35,7 +35,25 @@ jobs:
           # contributions and must not be re-audited against the fork's stale
           # base. Exclude only commits reachable from the verified parent
           # default branch; cherry-picks and fork-local commits remain in scope.
-          PARENT_FULL_NAME=$(gh api "repos/${REPO}" --jq '.parent.full_name // empty')
+          # Query the parent name and branch together, retrying transient API
+          # and rate-limit failures. An exhausted retry remains fail-closed:
+          # silently treating a fork as a standalone repository would audit
+          # imported upstream commits as if they were new contributions.
+          PARENT_METADATA=""
+          for attempt in 1 2 3; do
+            if PARENT_METADATA=$(gh api "repos/${REPO}" \
+              --jq '[.parent.full_name // "", .parent.default_branch // ""] | @tsv'); then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::could not query fork parent metadata after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::fork parent metadata query failed (attempt ${attempt}); retrying in 10s"
+            sleep 10
+          done
+
+          IFS=$'\t' read -r PARENT_FULL_NAME PARENT_BRANCH <<< "$PARENT_METADATA"
           if [ -z "$PARENT_FULL_NAME" ]; then
             echo "parent_ref=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -45,12 +63,25 @@ jobs:
             exit 1
           fi
 
-          PARENT_BRANCH=$(gh api "repos/${PARENT_FULL_NAME}" --jq '.default_branch')
+          if [ -z "$PARENT_BRANCH" ]; then
+            echo "::error::fork parent metadata did not include a default branch"
+            exit 1
+          fi
           git check-ref-format --branch "$PARENT_BRANCH" >/dev/null
           PARENT_REF="refs/remotes/attribution-parent/${PARENT_BRANCH}"
           git remote add attribution-parent "https://github.com/${PARENT_FULL_NAME}.git"
-          git fetch --no-tags --filter=blob:none attribution-parent \
-            "+refs/heads/${PARENT_BRANCH}:${PARENT_REF}"
+          for attempt in 1 2 3; do
+            if git fetch --no-tags --filter=blob:none attribution-parent \
+              "+refs/heads/${PARENT_BRANCH}:${PARENT_REF}"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::could not fetch fork parent history after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::fork parent history fetch failed (attempt ${attempt}); retrying in 10s"
+            sleep 10
+          done
           echo "parent_ref=${PARENT_REF}" >> "$GITHUB_OUTPUT"
 
       - name: Check for unmapped contributor emails
