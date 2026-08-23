@@ -329,25 +329,34 @@ def _kill_stale_dashboard_processes(
     no benefit (review on #83595). PIDs owned by one of these units are
     left untouched.
     """
+    managed_unit_handled = False
+    managed_restarted_services: list[str] = []
+    managed_failed_services: list[str] = []
     if restart_managed:
         managed_restart = _m()._restart_managed_dashboard_service(reason)
         if managed_restart:
             # A managed unit is never raw-killed, even when its own restart
-            # failed. Only propagate units whose restart was actually verified
-            # so runtime reconciliation cannot report success for a failed
-            # systemctl call or failure for a successful one.
-            restarted_services = (
-                managed_restart.get("restarted_services", [])
-                if isinstance(managed_restart, dict)
-                else []
+            # failed. Keep its verified outcome, then continue below so a
+            # second manual/custom-service backend cannot remain on stale
+            # code merely because hermes-dashboard.service also exists.
+            managed_unit_handled = True
+            if isinstance(managed_restart, dict):
+                managed_restarted_services = list(
+                    managed_restart.get("restarted_services", [])
+                )
+                managed_failed_services = list(
+                    managed_restart.get("failed_services", [])
+                )
+
+    def _empty_result() -> dict[str, list]:
+        result: dict[str, list] = {"matched": [], "killed": [], "failed": []}
+        if managed_unit_handled:
+            result.update(
+                unrecovered=[],
+                restarted_services=list(managed_restarted_services),
+                failed_services=list(managed_failed_services),
             )
-            return {
-                "matched": [],
-                "killed": [],
-                "failed": [],
-                "unrecovered": [],
-                "restarted_services": list(restarted_services),
-            }
+        return result
 
     # When the Hermes Desktop Electron app spawns this dashboard as a
     # backend child, it sets HERMES_DESKTOP_CHILD_PID so that the update
@@ -371,7 +380,7 @@ def _kill_stale_dashboard_processes(
 
     pids = _m()._find_stale_dashboard_pids(exclude_pids=exclude)
     if not pids:
-        return {"matched": [], "killed": [], "failed": []}
+        return _empty_result()
 
     # Before killing, snapshot systemd cgroup info for each PID so we can
     # restart supervised services after the kill (the cgroup disappears
@@ -397,6 +406,16 @@ def _kill_stale_dashboard_processes(
                     pid_cmdline[pid] = cmdline
                     pid_home[pid] = _hermes_home_for_pid(pid)
 
+        if managed_unit_handled:
+            # The process table is scanned after the managed restart, so it
+            # may contain the unit's newly-created PID. Exclude that exact
+            # owner while preserving every co-located manual/custom unit.
+            pids = [
+                pid
+                for pid in pids
+                if pid_service.get(pid) != "hermes-dashboard.service"
+            ]
+
         if already_restarted_units:
             # Already handled directly by the caller (e.g. hermes update's
             # systemd fleet-restart loop) — leave these alone instead of
@@ -408,7 +427,10 @@ def _kill_stale_dashboard_processes(
                 not in already_restarted_units
             ]
             if not pids:
-                return {"matched": [], "killed": [], "failed": []}
+                return _empty_result()
+
+        if not pids:
+            return _empty_result()
 
     print()
     print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
@@ -487,7 +509,8 @@ def _kill_stale_dashboard_processes(
     #    (#40449) — detached, headless, logged to logs/dashboard-restart.log.
     #    Filtered so Desktop ``serve|dashboard --port 0`` backends are not
     #    resurrected and duplicates collapse to one per profile (#78821).
-    restarted_services: list[str] = []
+    restarted_services: list[str] = list(managed_restarted_services)
+    failed_services: list[str] = list(managed_failed_services)
     unrecovered: list[int] = []
     if killed and restart_managed:
         failed_restarts: list[tuple[str, str]] = []
@@ -503,6 +526,7 @@ def _kill_stale_dashboard_processes(
                     restarted_services.append(svc_name)
                 else:
                     failed_restarts.append((svc_name, "systemctl restart returned non-zero"))
+                    failed_services.append(svc_name)
                     unrecovered.append(pid)
             elif pid in pid_cmdline:
                 respawn_candidates.append(
@@ -540,6 +564,9 @@ def _kill_stale_dashboard_processes(
         # serve/dashboard service is reported as untouched even after its
         # verified systemd restart.
         "restarted_services": list(restarted_services),
+        # Keep service restart failures separate from raw process-stop errors.
+        # The update command folds both into its fail-closed completion state.
+        "failed_services": list(failed_services),
     }
 
 def _detect_concurrent_hermes_instances(

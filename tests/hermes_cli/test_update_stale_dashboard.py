@@ -177,7 +177,7 @@ class TestKillStaleDashboardPosix:
             raise AssertionError(f"unexpected subprocess.run call: {args}")
 
         with patch("subprocess.run", side_effect=fake_run), \
-             patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[12345]) as find_pids, \
+             patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[]) as find_pids, \
              patch("os.kill") as kill:
             result = _kill_stale_dashboard_processes(restart_managed=True)
 
@@ -188,7 +188,7 @@ class TestKillStaleDashboardPosix:
             ["systemctl", "--user", "restart", "hermes-dashboard.service"],
         ]
         assert all(call[:1] != ["sudo"] and call[:2] != ["systemctl"] for call in calls)
-        find_pids.assert_not_called()
+        find_pids.assert_called_once_with(exclude_pids=None)
         kill.assert_not_called()
         assert result["restarted_services"] == ["hermes-dashboard.service"]
         assert "✓ restarted hermes-dashboard.service" in capsys.readouterr().out
@@ -223,14 +223,69 @@ class TestKillStaleDashboardPosix:
             raise AssertionError(f"unexpected subprocess.run call: {args}")
 
         with patch("subprocess.run", side_effect=fake_run), \
-             patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[12345]) as find_pids, \
+             patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[]) as find_pids, \
              patch("os.kill") as kill:
             result = _kill_stale_dashboard_processes(restart_managed=True)
 
-        find_pids.assert_not_called()
+        find_pids.assert_called_once_with(exclude_pids=None)
         kill.assert_not_called()
         assert result["restarted_services"] == []
+        assert result["failed_services"] == ["hermes-dashboard.service"]
         assert "failed to restart hermes-dashboard.service" in capsys.readouterr().out
+
+    def test_managed_unit_does_not_hide_custom_supervised_backend(self):
+        """A managed dashboard and custom serve unit can coexist.
+
+        Restart the managed unit, exclude only its newly-created PID, and
+        still stop/restart the custom unit discovered in the same scan.
+        """
+        import signal as _signal
+
+        live = sys.modules["hermes_cli.main"]
+        signals: list[tuple[int, int]] = []
+
+        def fake_kill(pid, sig):
+            signals.append((pid, sig))
+            if sig == 0:
+                raise ProcessLookupError
+
+        with patch.object(
+            live,
+            "_restart_managed_dashboard_service",
+            return_value={
+                "restarted_services": ["hermes-dashboard.service"],
+                "failed_services": [],
+            },
+        ), patch.object(
+            live, "_find_stale_dashboard_pids", return_value=[1111, 2222]
+        ), patch.object(
+            live,
+            "_get_pid_cgroup_path",
+            side_effect=lambda pid: f"/system.slice/{pid}.service",
+        ), patch.object(
+            live,
+            "_get_systemd_service_for_pid",
+            side_effect=lambda pid: (
+                "hermes-dashboard.service" if pid == 1111 else "custom-serve.service"
+            ),
+        ), patch.object(
+            live, "_try_restart_systemd_service", return_value=True
+        ) as restart, patch(
+            "os.kill", side_effect=fake_kill
+        ), patch("time.sleep"):
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        assert all(pid != 1111 for pid, _ in signals)
+        assert (2222, _signal.SIGTERM) in signals
+        restart.assert_called_once_with(
+            "custom-serve.service", "/system.slice/2222.service"
+        )
+        assert result["matched"] == [2222]
+        assert result["killed"] == [2222]
+        assert result["restarted_services"] == [
+            "hermes-dashboard.service",
+            "custom-serve.service",
+        ]
 
 
 
@@ -288,6 +343,52 @@ class TestDashboardUpdateCleanup:
             _finish_dashboard_update_cleanup([])
 
         assert "stopped during update" not in capsys.readouterr().out
+
+
+class TestDashboardCleanupRuntimeBookkeeping:
+    def test_unrecovered_pid_is_not_counted_as_stopped(self):
+        from hermes_cli import update_cmd
+
+        killed_pids = {99, 4321}
+        restarted_services = ["hermes-gateway"]
+
+        incomplete = update_cmd._fold_dashboard_cleanup_runtime_bookkeeping(
+            {
+                "killed": [4321, 5678],
+                "unrecovered": [4321],
+                "failed": [],
+                "restarted_services": ["custom-serve.service"],
+                "failed_services": ["broken-serve.service"],
+            },
+            killed_pids=killed_pids,
+            restarted_services=restarted_services,
+        )
+
+        assert incomplete is True
+        assert killed_pids == {99, 5678}
+        assert restarted_services == ["hermes-gateway", "custom-serve"]
+
+    def test_verified_cleanup_remains_successful(self):
+        from hermes_cli import update_cmd
+
+        killed_pids: set[int] = set()
+        restarted_services: list[str] = []
+
+        incomplete = update_cmd._fold_dashboard_cleanup_runtime_bookkeeping(
+            {
+                "killed": [5678],
+                "unrecovered": [],
+                "failed": [],
+                "restarted_services": ["custom-serve.service"],
+                "failed_services": [],
+            },
+            killed_pids=killed_pids,
+            restarted_services=restarted_services,
+        )
+
+        assert incomplete is False
+        assert killed_pids == {5678}
+        assert restarted_services == ["custom-serve"]
 
 
 class TestWindowsWmicEncoding:

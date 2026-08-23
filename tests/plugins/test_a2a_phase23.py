@@ -800,3 +800,40 @@ class TestSSRFProtection:
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_callback_ack_does_not_buffer_response_body(self, monkeypatch):
+        """A status-only callback must return after headers, not read its body."""
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+        release_body = threading.Event()
+
+        class _SlowBody(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Length", str(64 * 1024 * 1024))
+                self.end_headers()
+                self.wfile.flush()
+                release_body.wait(timeout=2)
+                try:
+                    self.wfile.write(b"x")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        server = HTTPServer(("127.0.0.1", 0), _SlowBody)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            assert security.post_safe_callback(
+                f"http://127.0.0.1:{server.server_port}/hook",
+                b"{}",
+                {"Content-Type": "application/json"},
+                timeout=0.25,
+            ) == 200
+        finally:
+            release_body.set()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)

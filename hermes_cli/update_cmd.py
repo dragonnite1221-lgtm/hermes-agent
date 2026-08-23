@@ -891,6 +891,38 @@ def _finish_dashboard_update_cleanup(
     print("    hermes dashboard --port <port>")
     return stop_result
 
+
+def _fold_dashboard_cleanup_runtime_bookkeeping(
+    cleanup: dict,
+    *,
+    killed_pids: set[int],
+    restarted_services: list[str],
+) -> bool:
+    """Merge dashboard cleanup outcomes without turning failures into success.
+
+    A PID can be stopped yet still be ``unrecovered`` when its owning service
+    or manual command failed to restart.  Such a PID is not a successful
+    runtime outcome: remove it from the shared ``killed_pids`` set so plan
+    reconciliation reports it as unaccounted, and return an explicit
+    incomplete flag for the update's final exit status.
+    """
+    killed = {int(pid) for pid in cleanup.get("killed", [])}
+    unrecovered = {int(pid) for pid in cleanup.get("unrecovered", [])}
+
+    killed_pids.difference_update(unrecovered)
+    killed_pids.update(killed - unrecovered)
+
+    for service in cleanup.get("restarted_services", []):
+        normalized = str(service).removesuffix(".service")
+        if normalized and normalized not in restarted_services:
+            restarted_services.append(normalized)
+
+    return bool(
+        unrecovered
+        or cleanup.get("failed")
+        or cleanup.get("failed_services")
+    )
+
 def _atomic_replace_dir(src: str, dst: str) -> None:
     """Replace directory *dst* with *src* without leaving *dst* half-deleted.
 
@@ -8292,16 +8324,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Fold this later cleanup phase into the same exact bookkeeping so a
         # backend we actually stopped/restarted is not reported as untouched.
         try:
-            killed_pids.update(int(pid) for pid in _dashboard_cleanup.get("killed", []))
-            for service in _dashboard_cleanup.get("restarted_services", []):
-                normalized = str(service).removesuffix(".service")
-                if normalized not in restarted_services:
-                    restarted_services.append(normalized)
+            if _fold_dashboard_cleanup_runtime_bookkeeping(
+                _dashboard_cleanup,
+                killed_pids=killed_pids,
+                restarted_services=restarted_services,
+            ):
+                gateway_fleet_restart_incomplete = True
         except Exception as _cleanup_bookkeeping_exc:
             logger.debug(
                 "Could not fold dashboard cleanup into runtime bookkeeping: %s",
                 _cleanup_bookkeeping_exc,
             )
+            # Bookkeeping is part of the update's proof that every runtime was
+            # restored.  If it cannot be interpreted, fail closed rather than
+            # issuing a success receipt with unknown process state.
+            gateway_fleet_restart_incomplete = True
 
         print()
         print("Tip: You can now select a provider and model:")

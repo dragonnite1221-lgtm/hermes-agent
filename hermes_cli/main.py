@@ -8262,7 +8262,10 @@ def _restart_managed_dashboard_service(
             continue
         if result.returncode == 0:
             print(f"    ✓ restarted {unit}")
-            return {"restarted_services": [unit]}
+            return {
+                "restarted_services": [unit],
+                "failed_services": [],
+            }
         errors.append(
             f"{' '.join(command)}: {(result.stderr or result.stdout or '').strip()}"
         )
@@ -8276,7 +8279,10 @@ def _restart_managed_dashboard_service(
         "systemd would treat that as a clean stop."
     )
     print(f"  Restart manually: {scope_label} restart {unit}")
-    return {"restarted_services": []}
+    return {
+        "restarted_services": [],
+        "failed_services": [unit],
+    }
 
 
 def _get_systemd_service_for_pid(pid: int) -> str | None:

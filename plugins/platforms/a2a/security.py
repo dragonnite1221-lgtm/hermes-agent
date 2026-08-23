@@ -473,20 +473,24 @@ def post_safe_callback(
             # again and pins the TCP connection, closing DNS rebinding races.
             if not is_safe_callback_url(current_url):
                 raise UnsafeCallbackURL("unsafe A2A callback URL")
-            response = client.request(
+            # A callback acknowledgement is status-only. Streaming lets us
+            # validate the headers without buffering an attacker-controlled
+            # response body into memory; leaving the context closes the body.
+            with client.stream(
                 method,
                 current_url,
                 content=content,
                 headers=current_headers,
-            )
-            if response.status_code not in _REDIRECT_STATUSES:
-                return response.status_code
-            location = response.headers.get("location")
+            ) as response:
+                status_code = response.status_code
+                location = response.headers.get("location")
+            if status_code not in _REDIRECT_STATUSES:
+                return status_code
             if not location:
                 raise UnsafeCallbackURL("callback redirect omitted Location")
             current_url = urllib.parse.urljoin(current_url, location)
-            if response.status_code == 303 or (
-                response.status_code in {301, 302} and method == "POST"
+            if status_code == 303 or (
+                status_code in {301, 302} and method == "POST"
             ):
                 method = "GET"
                 content = None
