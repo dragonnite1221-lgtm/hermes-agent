@@ -12,7 +12,12 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
+
+
+pytestmark = pytest.mark.usefixtures("isolate_update_host_runtime")
 
 
 def _make_run_side_effect(
