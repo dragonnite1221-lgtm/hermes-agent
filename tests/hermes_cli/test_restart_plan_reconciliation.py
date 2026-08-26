@@ -1,0 +1,236 @@
+"""Plan-vs-execution reconciliation (#91277 Phase 2: restart via declared mechanism).
+
+Pins:
+- _restart_mechanism returns machine-readable ids; describe_restart_mechanism
+  derives display strings (policy table is data, not prose).
+- match_runtime_outcomes classifies every planned runtime against the restart
+  phase's bookkeeping: restarted / stopped / failed / unaccounted.
+- report_unaccounted_runtimes escalates (returns True) ONLY on unaccounted
+  rows — the silent-miss tripwire.
+"""
+
+from hermes_cli.update_inventory import (
+    RuntimeRecord,
+    UpdatePlan,
+    _restart_mechanism,
+    describe_restart_mechanism,
+    match_runtime_outcomes,
+    report_unaccounted_runtimes,
+)
+
+
+def _plan(*runtimes: RuntimeRecord) -> UpdatePlan:
+    plan = UpdatePlan()
+    plan.runtimes = list(runtimes)
+    return plan
+
+
+def _rt(profile: str, pid: int, supervisor: str = "manual") -> RuntimeRecord:
+    return RuntimeRecord(
+        kind="gateway",
+        profile=profile,
+        pid=pid,
+        supervisor=supervisor,
+        restart_via=_restart_mechanism(supervisor, profile),
+    )
+
+
+def test_mechanism_ids_are_machine_readable_and_described():
+    assert _restart_mechanism("systemd", "default") == "systemd"
+    assert _restart_mechanism("launchd", "work") == "launchd"
+    assert _restart_mechanism("desktop", "default") == "desktop"
+    assert _restart_mechanism("manual", "work") == "manual"
+    # display derives FROM the id
+    assert "systemctl" in describe_restart_mechanism("systemd", "default")
+    assert "kickstart" in describe_restart_mechanism("launchd", "work")
+    assert "-p work" in describe_restart_mechanism("manual", "work")
+    assert describe_restart_mechanism("manual", "default") == "hermes gateway restart"
+
+
+def test_relaunched_profile_is_restarted():
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("default", 100)),
+        restarted_services=[], relaunched_profiles=["default"],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+    )
+    assert outcomes == [
+        {"kind": "gateway", "profile": "default", "pid": 100,
+         "mechanism": "manual", "outcome": "restarted"}
+    ]
+    assert report_unaccounted_runtimes(outcomes) is False
+
+
+def test_killed_pid_is_stopped():
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("work", 200)),
+        restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids={200}, failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "stopped"
+
+
+def test_failed_unit_is_failed():
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("work", 300, supervisor="systemd")),
+        restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(),
+        failed_units=["hermes-gateway-work.service"],
+    )
+    assert outcomes[0]["outcome"] == "failed"
+
+
+def test_restarted_service_unit_matches_profile():
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("default", 400, supervisor="systemd")),
+        restarted_services=["hermes-gateway.service"], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "restarted"
+
+
+def test_profile_service_matching_is_exact_not_substring():
+    outcomes = match_runtime_outcomes(
+        _plan(
+            _rt("work", 401, supervisor="systemd"),
+            _rt("default", 402, supervisor="systemd"),
+        ),
+        restarted_services=["hermes-gateway-mywork.service"],
+        relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[],
+    )
+    assert [row["outcome"] for row in outcomes] == ["unaccounted", "unaccounted"]
+
+
+def test_service_kind_must_match_planned_runtime():
+    serve = RuntimeRecord(
+        kind="serve",
+        profile="work",
+        pid=403,
+        supervisor="systemd",
+        restart_via="systemd",
+    )
+    wrong_kind = match_runtime_outcomes(
+        _plan(serve),
+        restarted_services=["hermes-gateway-work"],
+        relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[],
+    )
+    assert wrong_kind[0]["outcome"] == "unaccounted"
+
+    exact = match_runtime_outcomes(
+        _plan(serve),
+        restarted_services=["hermes-serve-work.service"],
+        relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[],
+    )
+    assert exact[0]["outcome"] == "restarted"
+
+
+def test_managed_dashboard_restart_matches_inventory_record():
+    dashboard = RuntimeRecord(
+        kind="dashboard",
+        profile="default",
+        pid=405,
+        supervisor="systemd",
+        restart_via="systemd",
+        detail={"service": "hermes-dashboard.service"},
+    )
+    outcomes = match_runtime_outcomes(
+        _plan(dashboard),
+        restarted_services=["hermes-dashboard"],
+        relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "restarted"
+
+
+def test_desktop_owned_backend_is_accounted_for_without_kill():
+    desktop_serve = RuntimeRecord(
+        kind="serve",
+        profile="work",
+        pid=406,
+        supervisor="desktop",
+        restart_via="desktop",
+    )
+    outcomes = match_runtime_outcomes(
+        _plan(desktop_serve),
+        restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "externally-supervised"
+    assert report_unaccounted_runtimes(outcomes) is False
+
+
+def test_manual_backend_without_bookkeeping_remains_unaccounted():
+    manual_serve = RuntimeRecord(
+        kind="serve",
+        profile="work",
+        pid=407,
+        supervisor="manual",
+        restart_via="manual",
+    )
+    outcomes = match_runtime_outcomes(
+        _plan(manual_serve),
+        restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "unaccounted"
+
+
+def test_service_restart_does_not_claim_same_profile_manual_process():
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("work", 404, supervisor="manual")),
+        restarted_services=["hermes-gateway-work"],
+        relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "unaccounted"
+
+
+def test_untouched_runtime_is_unaccounted_and_escalates(capsys):
+    """The tripwire: plan saw it, NO bookkeeping mentions it."""
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("coder", 500)),
+        restarted_services=["hermes-gateway.service"],
+        relaunched_profiles=["default"],
+        externally_supervised_profiles=[], killed_pids={123}, failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "unaccounted"
+    assert report_unaccounted_runtimes(outcomes) is True
+    out = capsys.readouterr().out
+    assert "never touched" in out
+    assert "coder" in out and "500" in out
+    assert "hermes -p <profile> gateway restart" in out
+
+
+def test_external_supervisor_counts_as_restarted():
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("default", 600, supervisor="desktop")),
+        restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=["default"], killed_pids=set(),
+        failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "restarted"
+
+
+def test_mixed_fleet_only_the_missed_one_escalates(capsys):
+    outcomes = match_runtime_outcomes(
+        _plan(
+            _rt("default", 700, supervisor="systemd"),
+            _rt("work", 701),
+            _rt("ghost", 702),
+        ),
+        restarted_services=["hermes-gateway.service"],
+        relaunched_profiles=["work"],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+    )
+    by_profile = {o["profile"]: o["outcome"] for o in outcomes}
+    assert by_profile == {
+        "default": "restarted", "work": "restarted", "ghost": "unaccounted"
+    }
+    assert report_unaccounted_runtimes(outcomes) is True
+    out = capsys.readouterr().out
+    missed_block = out.split("never touched")[1]
+    assert "ghost" in missed_block
+    assert "[default]" not in missed_block
+    assert "[work]" not in missed_block

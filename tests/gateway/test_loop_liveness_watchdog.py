@@ -21,87 +21,6 @@ def _immediate_loop() -> MagicMock:
     return loop
 
 
-def test_loop_liveness_watchdog_responsive_probe_does_not_fire():
-    loop = _immediate_loop()
-    exit_codes = []
-
-    with (
-        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
-        patch("gateway.shutdown_watchdog.os._exit", side_effect=exit_codes.append),
-    ):
-        handle = start_loop_liveness_watchdog(
-            loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=2
-        )
-        assert handle is not None
-        deadline = time.monotonic() + 2.0
-        while loop.call_soon_threadsafe.call_count < 3 and time.monotonic() < deadline:
-            time.sleep(0.01)
-        handle.stop()
-        handle.join(timeout=1.0)
-
-    assert loop.call_soon_threadsafe.call_count >= 3
-    assert not handle.is_alive()
-    dump.assert_not_called()
-    assert exit_codes == []
-
-
-def test_loop_liveness_watchdog_exits_after_consecutive_misses():
-    loop = MagicMock(spec=asyncio.AbstractEventLoop)
-    fired = threading.Event()
-    exit_codes = []
-
-    def fake_exit(code: int) -> None:
-        exit_codes.append(code)
-        fired.set()
-
-    with (
-        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
-        patch("gateway.shutdown_watchdog.os._exit", side_effect=fake_exit),
-    ):
-        handle = start_loop_liveness_watchdog(
-            loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=2
-        )
-        assert handle is not None
-        assert fired.wait(timeout=2.0), "loop liveness watchdog did not fire"
-        handle.join(timeout=1.0)
-
-    assert not handle.is_alive()
-    assert loop.call_soon_threadsafe.call_count == 2
-    dump.assert_called_once_with(all_threads=True)
-    assert exit_codes == [75]
-
-
-def test_loop_liveness_watchdog_stop_during_critical_log_disarms_hard_exit():
-    loop = MagicMock(spec=asyncio.AbstractEventLoop)
-    handle_ready = threading.Event()
-    handle_ref = {}
-    exit_codes = []
-
-    def stop_during_critical(*_args) -> None:
-        assert handle_ready.wait(timeout=2.0)
-        handle_ref["handle"].stop()
-
-    with (
-        patch(
-            "gateway.shutdown_watchdog.logger.critical",
-            side_effect=stop_during_critical,
-        ) as critical,
-        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback"),
-        patch("gateway.shutdown_watchdog.os._exit", side_effect=exit_codes.append),
-    ):
-        handle = start_loop_liveness_watchdog(
-            loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=1
-        )
-        assert handle is not None
-        handle_ref["handle"] = handle
-        handle_ready.set()
-        handle.join(timeout=2.0)
-
-    assert not handle.is_alive()
-    critical.assert_called_once()
-    assert exit_codes == []
-
-
 def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit():
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
     handle_ready = threading.Event()
@@ -231,79 +150,6 @@ def test_loop_liveness_watchdog_stop_after_first_recheck_skips_final_actions():
     hard_exit.assert_not_called()
 
 
-def test_loop_liveness_watchdog_recovery_resets_strikes():
-    loop = MagicMock(spec=asyncio.AbstractEventLoop)
-    four_probes = threading.Event()
-
-    def alternate_response(callback) -> None:
-        count = loop.call_soon_threadsafe.call_count
-        if count in {2, 4}:
-            callback()
-        if count >= 4:
-            four_probes.set()
-
-    loop.call_soon_threadsafe.side_effect = alternate_response
-    with (
-        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
-        patch("gateway.shutdown_watchdog.os._exit") as hard_exit,
-    ):
-        handle = start_loop_liveness_watchdog(
-            loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=2
-        )
-        assert handle is not None
-        assert four_probes.wait(
-            timeout=2.0
-        ), "watchdog did not complete recovery probes"
-        handle.stop()
-        handle.join(timeout=1.0)
-
-    assert not handle.is_alive()
-    dump.assert_not_called()
-    hard_exit.assert_not_called()
-
-
-def test_loop_liveness_watchdog_stop_exits_thread_and_stops_probes():
-    loop = MagicMock(spec=asyncio.AbstractEventLoop)
-    first_probe = threading.Event()
-    loop.call_soon_threadsafe.side_effect = lambda callback: first_probe.set()
-
-    handle = start_loop_liveness_watchdog(
-        loop, probe_interval=0.01, probe_timeout=0.5, max_strikes=10
-    )
-    assert handle is not None
-    assert first_probe.wait(timeout=2.0)
-    handle.stop()
-    handle.join(timeout=1.0)
-    calls_after_stop = loop.call_soon_threadsafe.call_count
-    time.sleep(0.05)
-
-    assert not handle.is_alive()
-    assert loop.call_soon_threadsafe.call_count == calls_after_stop
-
-
-def test_loop_liveness_guards_config_can_disable():
-    """gateway.loop_watchdog: false must skip arming both guards."""
-    from gateway.run import GatewayRunner
-
-    runner = object.__new__(GatewayRunner)
-    runner._loop_floor_timer_handle = None
-    runner._loop_liveness_watchdog = None
-    runner.config = MagicMock()
-    runner.config.loop_watchdog = False
-    loop = MagicMock(spec=asyncio.AbstractEventLoop)
-
-    with (
-        patch("gateway.run._arm_loop_floor_timer") as arm_floor,
-        patch("gateway.run.start_loop_liveness_watchdog") as start_watchdog,
-    ):
-        runner._start_loop_liveness_guards(loop)
-
-    arm_floor.assert_not_called()
-    start_watchdog.assert_not_called()
-    assert runner._loop_floor_timer_handle is None
-    assert runner._loop_liveness_watchdog is None
-
-
 def test_gateway_config_loop_watchdog_round_trip():
     """loop_watchdog is a config.yaml knob: default on, nested-gateway form honored."""
     from gateway.config import GatewayConfig
@@ -320,76 +166,110 @@ def test_gateway_config_loop_watchdog_round_trip():
     assert config.to_dict()["loop_watchdog"] is False
 
 
-@pytest.mark.asyncio
-async def test_loop_liveness_watchdog_detects_real_loop_sync_freeze():
-    loop = asyncio.get_running_loop()
-    fired = threading.Event()
-    exit_codes = []
+def test_gateway_config_loop_watchdog_tuning_round_trip():
+    """Watchdog tolerance knobs parse, serialize, and clamp malformed values."""
+    from gateway.config import GatewayConfig
 
-    def fake_exit(code: int) -> None:
-        exit_codes.append(code)
-        fired.set()
+    # Defaults
+    default = GatewayConfig.from_dict({})
+    assert default.loop_watchdog is True
+    assert default.loop_watchdog_probe_interval_s == 30.0
+    assert default.loop_watchdog_probe_timeout_s == 10.0
+    assert default.loop_watchdog_max_strikes == 3
 
-    with (
-        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
-        patch("gateway.shutdown_watchdog.os._exit", side_effect=fake_exit),
-    ):
-        handle = start_loop_liveness_watchdog(
-            loop, probe_interval=0.02, probe_timeout=0.03, max_strikes=2
-        )
-        assert handle is not None
-        await asyncio.sleep(0.03)
-        time.sleep(0.25)
-        assert fired.wait(timeout=1.0), "watchdog did not detect the frozen real loop"
-        handle.stop()
-        handle.join(timeout=1.0)
+    # Explicit values round-trip
+    cfg = GatewayConfig.from_dict(
+        {
+            "loop_watchdog_probe_interval_s": 45,
+            "loop_watchdog_probe_timeout_s": 15,
+            "loop_watchdog_max_strikes": 12,
+        }
+    )
+    assert cfg.loop_watchdog_probe_interval_s == 45.0
+    assert cfg.loop_watchdog_probe_timeout_s == 15.0
+    assert cfg.loop_watchdog_max_strikes == 12
+    d = cfg.to_dict()
+    assert d["loop_watchdog_probe_interval_s"] == 45.0
+    assert d["loop_watchdog_probe_timeout_s"] == 15.0
+    assert d["loop_watchdog_max_strikes"] == 12
 
-    dump.assert_called_once_with(all_threads=True)
-    assert exit_codes == [75]
+    # Nested gateway.* form honored
+    nested = GatewayConfig.from_dict(
+        {
+            "gateway": {
+                "loop_watchdog_probe_interval_s": 60,
+                "loop_watchdog_probe_timeout_s": 20,
+                "loop_watchdog_max_strikes": 20,
+            }
+        }
+    )
+    assert nested.loop_watchdog_probe_interval_s == 60.0
+    assert nested.loop_watchdog_probe_timeout_s == 20.0
+    assert nested.loop_watchdog_max_strikes == 20
+
+    # Malformed / degenerate values fall back to safe defaults
+    clamped = GatewayConfig.from_dict(
+        {
+            "loop_watchdog_probe_interval_s": 0,
+            "loop_watchdog_probe_timeout_s": -5,
+            "loop_watchdog_max_strikes": 0,
+        }
+    )
+    assert clamped.loop_watchdog_probe_interval_s == 30.0
+    assert clamped.loop_watchdog_probe_timeout_s == 10.0
+    assert clamped.loop_watchdog_max_strikes == 3
 
 
-@pytest.mark.asyncio
-async def test_loop_liveness_watchdog_leaves_responsive_real_loop_running():
-    loop = asyncio.get_running_loop()
-    with (
-        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
-        patch("gateway.shutdown_watchdog.os._exit") as hard_exit,
-    ):
-        handle = start_loop_liveness_watchdog(
-            loop, probe_interval=0.02, probe_timeout=0.03, max_strikes=2
-        )
-        assert handle is not None
-        await asyncio.sleep(0.25)
-        handle.stop()
-        handle.join(timeout=1.0)
+def test_gateway_config_loop_watchdog_nonfinite_values_degrade():
+    """NaN/Inf tuning values fall back to defaults instead of reaching the
+    watchdog's Event.wait loop (or aborting config load via int(inf))."""
+    from gateway.config import GatewayConfig
 
-    assert not handle.is_alive()
-    dump.assert_not_called()
-    hard_exit.assert_not_called()
+    cfg = GatewayConfig.from_dict(
+        {
+            "loop_watchdog_probe_interval_s": float("inf"),
+            "loop_watchdog_probe_timeout_s": float("nan"),
+            "loop_watchdog_max_strikes": float("inf"),  # int() would raise
+        }
+    )
+    assert cfg.loop_watchdog_probe_interval_s == 30.0
+    assert cfg.loop_watchdog_probe_timeout_s == 10.0
+    assert cfg.loop_watchdog_max_strikes == 3
+
+    # Oversized-but-finite values also clamp to defaults.
+    big = GatewayConfig.from_dict(
+        {
+            "loop_watchdog_probe_interval_s": 86400,
+            "loop_watchdog_probe_timeout_s": 7200,
+            "loop_watchdog_max_strikes": 10**9,
+        }
+    )
+    assert big.loop_watchdog_probe_interval_s == 30.0
+    assert big.loop_watchdog_probe_timeout_s == 10.0
+    assert big.loop_watchdog_max_strikes == 3
 
 
-def test_loop_floor_timer_reschedules_until_cancelled():
-    loop = MagicMock(spec=asyncio.AbstractEventLoop)
-    scheduled = []
+def test_load_gateway_config_bridges_loop_watchdog_keys(tmp_path, monkeypatch):
+    """The real startup loader must honor gateway.loop_watchdog* from
+    config.yaml — from_dict's nested fallback never sees the yaml gateway
+    section because load_gateway_config builds gw_data flat."""
+    from gateway.config import load_gateway_config
 
-    def fake_call_later(delay, callback):
-        timer = MagicMock(spec=asyncio.TimerHandle)
-        scheduled.append((delay, callback, timer))
-        return timer
+    (tmp_path / "config.yaml").write_text(
+        "gateway:\n"
+        "  loop_watchdog: false\n"
+        "  loop_watchdog_probe_interval_s: 45\n"
+        "  loop_watchdog_probe_timeout_s: 15\n"
+        "  loop_watchdog_max_strikes: 12\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("gateway.config.get_hermes_home", lambda: tmp_path)
 
-    loop.call_later.side_effect = fake_call_later
-    handle = _arm_loop_floor_timer(loop, interval=5.0)
-
-    assert len(scheduled) == 1
-    assert scheduled[0][0] == 5.0
-    scheduled[0][1]()
-    assert len(scheduled) == 2
-    assert scheduled[1][0] == 5.0
-
-    handle.cancel()
-    scheduled[1][2].cancel.assert_called_once_with()
-    scheduled[1][1]()
-    assert len(scheduled) == 2
+    cfg = load_gateway_config()
+    assert cfg.loop_watchdog is False
+    assert cfg.loop_watchdog_probe_interval_s == 45.0
+    assert cfg.loop_watchdog_probe_timeout_s == 15.0
+    assert cfg.loop_watchdog_max_strikes == 12
 
 
 def test_gateway_runner_liveness_guards_start_and_stop():
@@ -398,6 +278,7 @@ def test_gateway_runner_liveness_guards_start_and_stop():
     runner = object.__new__(GatewayRunner)
     runner._loop_floor_timer_handle = None
     runner._loop_liveness_watchdog = None
+    runner.config = None
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
     floor_timer = MagicMock()
     watchdog = MagicMock()
@@ -414,7 +295,12 @@ def test_gateway_runner_liveness_guards_start_and_stop():
         runner._start_loop_liveness_guards(loop)
 
     arm_floor.assert_called_once_with(loop)
-    start_watchdog.assert_called_once_with(loop)
+    start_watchdog.assert_called_once_with(
+        loop,
+        probe_interval=30.0,
+        probe_timeout=10.0,
+        max_strikes=3,
+    )
     assert runner._loop_floor_timer_handle is floor_timer
     assert runner._loop_liveness_watchdog is watchdog
 

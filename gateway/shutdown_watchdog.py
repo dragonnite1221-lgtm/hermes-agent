@@ -48,6 +48,12 @@ DEFAULT_HEARTBEAT_INTERVAL_S = 30.0
 DEFAULT_LOOP_FLOOR_TIMER_INTERVAL_S = 5.0
 DEFAULT_LOOP_WATCHDOG_INTERVAL_S = 30.0
 DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
+# 3 sustained misses (~90-120s of loop block) escalate. The false-positive
+# class that motivated raising this (the watchdog's own on-loop heartbeat
+# fsync stalling the loop it monitors) is fixed at the root by the off-loop
+# heartbeat write + two-witness probe (#90502), so the default stays tight
+# for genuine wedges. Deployments with legitimately slow loops can tune via
+# gateway.loop_watchdog_* in config.yaml.
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
@@ -185,6 +191,14 @@ def start_loop_liveness_watchdog(
                 logger.debug("Loop liveness faulthandler dump failed", exc_info=True)
             if stop_event.is_set():
                 return
+            # Record the watchdog exit in the lifecycle sentinel so the next
+            # boot reports "watchdog hard-exit" instead of misclassifying
+            # this as an unclean SIGKILL/OOM death (NS-608).
+            try:
+                from gateway.lifecycle_ledger import mark_exited
+                mark_exited(exit_code, reason="loop_liveness_watchdog")
+            except Exception:
+                pass
             os._exit(exit_code)
             return
 
@@ -241,6 +255,19 @@ def write_loop_heartbeat(
     }
     if start_time is not None:
         payload["start_time"] = float(start_time)
+    # Embed a cheap memory sample (own RSS + MemAvailable + swap) so the
+    # heartbeat doubles as a rolling pre-death telemetry snapshot: after an
+    # unclean death (SIGKILL/OOM/VM loss) the last heartbeat is the closest
+    # surviving record of memory pressure — see gateway.lifecycle_ledger
+    # (NS-608).  Best-effort; <1ms of /proc reads on Linux, {} elsewhere.
+    try:
+        from gateway.lifecycle_ledger import sample_memory
+
+        mem = sample_memory()
+        if mem:
+            payload["mem"] = mem
+    except Exception:
+        pass
     if extra:
         payload.update(extra)
     try:
@@ -389,6 +416,13 @@ def arm_shutdown_watchdog(
         try:
             from hermes_logging import drain_log_queue
             drain_log_queue(timeout=1.0)
+        except Exception:
+            pass
+        # Record the watchdog exit so the next boot's unclean-death detector
+        # reports "shutdown watchdog fired" instead of SIGKILL/OOM (NS-608).
+        try:
+            from gateway.lifecycle_ledger import mark_exited
+            mark_exited(exit_code, reason="shutdown_watchdog")
         except Exception:
             pass
         os._exit(exit_code)

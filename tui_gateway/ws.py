@@ -89,10 +89,19 @@ class WSTransport:
         loop: asyncio.AbstractEventLoop,
         *,
         peer: str = "unknown",
+        auth_identity: dict | None = None,
     ) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
+        #: Server-verified identity carried from the WS-upgrade credential
+        #: (dashboard ticket / internal credential) — stamped by
+        #: ``hermes_cli.web_server._ws_auth_reason`` onto the WS object and
+        #: passed through ``handle_ws``. None for transports that
+        #: authenticated via the legacy token path or stdio. RPC params can
+        #: never populate this: it is the only identity authority for
+        #: browser-controller registration.
+        self.auth_identity = auth_identity
         self._closed = False
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
         # short timer flushes the batch. The lock guards the buffer + the
@@ -283,8 +292,21 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
-async def handle_ws(ws: Any) -> None:
-    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
+async def handle_ws(
+    ws: Any,
+    *,
+    auth_identity: dict | None = None,
+    subprotocol: str | None = None,
+) -> None:
+    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
+
+    *auth_identity* is the server-minted ``{user_id, provider}`` recorded at
+    WS-upgrade authentication (``hermes_cli.web_server._ws_auth_reason``); it
+    is stored on the transport as ``WSTransport.auth_identity`` and is the
+    only identity authority for browser-controller registration. Existing
+    callers (stdio-free harnesses, the embedded TUI child) omit it and get a
+    ``None`` transport identity — unchanged behaviour.
+    """
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
     messages = 0
@@ -294,38 +316,41 @@ async def handle_ws(ws: Any) -> None:
     disconnect_reason = "not_connected"
 
     try:
-        await ws.accept()
+        if subprotocol:
+            await ws.accept(subprotocol=subprotocol)
+        else:
+            await ws.accept()
         disconnect_reason = "connected"
         # Push small streamed frames out immediately instead of letting Nagle
         # batch them — keeps the live token cadence intact for GUI clients.
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
 
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
-
-        # The desktop app and dashboard chat reach the agent through this WS
-        # sidecar, NOT through tui_gateway.entry.main() (the stdio TUI path that
-        # spawns the background MCP discovery thread). Without starting it here,
-        # discovery never runs in this process: _make_agent only *waits* on the
-        # thread (wait_for_mcp_discovery), which no-ops when it was never
-        # created, so the agent snapshots an MCP-less tool list and the only way
-        # to surface MCP tools is a manual /reload-mcp. Start it once per
-        # process here (idempotent, config-gated) before gateway.ready so the
-        # first agent build can pick up already-spawning servers. (#38945)
-        from hermes_cli.mcp_startup import start_background_mcp_discovery
-
-        start_background_mcp_discovery(
-            logger=_log,
-            thread_name="tui-ws-mcp-discovery",
+        transport = WSTransport(
+            ws,
+            asyncio.get_running_loop(),
+            peer=peer,
+            auth_identity=auth_identity,
         )
 
+        # resolve_skin() reads config + initializes the skin engine —
+        # synchronous I/O + CPU work that should not block the event loop
+        # during the cold-start window. Run it in the thread pool so the
+        # WS read loop stays free to drain the frontend's initial RPC
+        # burst (setup.status, session.list, ...) without a stall
+        # (#60800). The skin payload is small (a dict of strings/arrays),
+        # so the to_thread overhead is negligible.
+        skin_payload = await asyncio.to_thread(server.resolve_skin)
         ready_ok = await transport.write_async(
             {
                 "jsonrpc": "2.0",
                 "method": "event",
                 "params": {
                     "type": "gateway.ready",
-                    "payload": {"skin": server.resolve_skin()},
+                    # change_events: this backend broadcasts pet.changed /
+                    # cron.changed / sessions.changed, so clients can demote
+                    # their legacy polls to slow backstops.
+                    "payload": {"skin": skin_payload, "change_events": True},
                 },
             }
         )
@@ -436,7 +461,34 @@ async def handle_ws(ws: Any) -> None:
         detached_sessions = 0
         if transport is not None:
             server.unregister_live_transport(transport)
+
+            # Owner-safely park browser controllers this transport registered.
+            # A reconnect with the same stable identity may deliver a terminal
+            # result for work already in flight; no new dispatch is admitted
+            # while the controller is offline.
+            #
+            # Offloaded via to_thread: disconnect acquires the controller's
+            # send_lock, which a worker-thread dispatch may hold while blocking
+            # on THIS loop to transmit its frame (run_coroutine_threadsafe +
+            # result(timeout=10)). Acquiring it synchronously here would park
+            # the whole event loop behind that 10s send bridge.
+            try:
+                from gateway.browser_control_broker import (
+                    get_browser_control_broker,
+                )
+
+                await asyncio.to_thread(
+                    get_browser_control_broker().disconnect_owner, transport
+                )
+            except Exception:
+                _log.exception("ws browser-controller disconnect failed peer=%s", peer)
+
             transport.close()
+
+            try:
+                await asyncio.to_thread(server._release_wake_for_transport, transport)
+            except Exception:
+                _log.exception("ws wake-word teardown failed peer=%s", peer)
 
             # Reap sessions this transport owned (close_on_disconnect sidecar
             # sessions) or detach the rest to the drop sentinel so later emits

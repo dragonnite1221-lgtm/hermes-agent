@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ctypes
 import locale
+import logging
 import os
 import re
 import shlex
@@ -40,10 +41,13 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from hermes_cli._subprocess_compat import (
+    _WINDOWS_GATEWAY_BREAKAWAY_ENV,
     windows_detach_flags,
     windows_detach_flags_without_breakaway,
     windows_hide_flags,
 )
+
+logger = logging.getLogger(__name__)
 
 # Short timeouts: schtasks occasionally wedges and we don't want to hang forever.
 _SCHTASKS_TIMEOUT_S = 15
@@ -744,8 +748,26 @@ def _resolve_detached_python(python_exe: str) -> tuple[str, Path, list[str]]:
     ``extra_pythonpath`` is always empty now; the tuple shape is kept so the
     call sites (argv builders, cmd/vbs renderers, restart-spec rewriter,
     gateway watcher) stay unchanged.
+
+    Legacy normalization: launchers and argv snapshots from pre-aa2ae36c3f
+    installs lead with ``pythonw.exe``. When the sibling console
+    ``python.exe`` exists, swap to it so respawns and regenerated launchers
+    get the hidden-console design instead of resurrecting the console-less
+    daemon (the #54220/#56747 flash class, plus the ``sys.stderr is None``
+    startup-crash class from #71671).
     """
     p = Path(python_exe)
+    if p.name.lower() in ("pythonw.exe", "pythonw"):
+        sibling = p.with_name("python.exe" if p.suffix else "python")
+        try:
+            if sibling.exists():
+                p = sibling
+                python_exe = str(sibling)
+        except OSError:
+            # Can't stat the sibling — keep the original interpreter. A
+            # console-less gateway is worse than a hidden-console one, but a
+            # failed respawn is worse still.
+            pass
     venv_dir = p.parent.parent
     return (python_exe, venv_dir, [])
 
@@ -895,6 +917,7 @@ def _spawn_detached(script_path: Path | None = None) -> int:
 
     # Inherit PATH etc. from the current env, overlay our required vars.
     env = {**os.environ, **env_overlay}
+    primary_env = {**env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "1"}
 
     # CREATE_NEW_PROCESS_GROUP 0x00000200 — child gets its own group, won't
     #                                       receive Ctrl+C from our group
@@ -924,25 +947,34 @@ def _spawn_detached(script_path: Path | None = None) -> int:
             proc = subprocess.Popen(
                 argv,
                 cwd=working_dir,
-                env=env,
+                env=primary_env,
                 creationflags=flags,
                 close_fds=True,
                 stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,
             )
-    except OSError:
+    except OSError as exc:
         # CREATE_BREAKAWAY_FROM_JOB can fail with "access denied" when the
         # parent's job object doesn't permit breakaway (some Windows
         # Terminal configs). Retry without the breakaway flag — in most
         # setups the hidden-console CREATE_NO_WINDOW spawn is enough on
         # its own.
+        error_code = getattr(exc, "winerror", None)
+        if error_code is None:
+            error_code = exc.errno
+        logger.warning(
+            "Gateway breakaway spawn failed (error=%s); retrying without "
+            "CREATE_BREAKAWAY_FROM_JOB",
+            error_code,
+        )
         flags_no_breakaway = windows_detach_flags_without_breakaway()
+        fallback_env = {**env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "0"}
         with open(stray_log, "ab", buffering=0) as log_fh:
             proc = subprocess.Popen(
                 argv,
                 cwd=working_dir,
-                env=env,
+                env=fallback_env,
                 creationflags=flags_no_breakaway,
                 close_fds=True,
                 stdin=subprocess.DEVNULL,

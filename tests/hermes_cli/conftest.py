@@ -54,3 +54,27 @@ def _suppress_concurrent_hermes_gate(request, monkeypatch):
         lambda *_a, **_k: [],
         raising=False,
     )
+
+
+@pytest.fixture
+def isolate_update_host_runtime(monkeypatch):
+    """Prevent updater unit tests from discovering live host runtimes.
+
+    Successful update paths purge cached Hermes modules before lazily importing
+    gateway helpers. Without disabling that purge, per-test gateway mocks are
+    evicted and the later restart phase can rediscover and signal real Hermes
+    processes on a developer machine. Keep discovery and the final fleet probe
+    hermetic for tests that opt into this fixture.
+    """
+    from hermes_cli import gateway, main, update_receipt
+
+    monkeypatch.setattr(main, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda *args, **kwargs: [])
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(
+        gateway, "find_profile_gateway_processes", lambda *args, **kwargs: []
+    )
+    monkeypatch.setattr(gateway, "_get_service_pids", lambda *args, **kwargs: set())
+    monkeypatch.setattr(
+        update_receipt, "collect_fleet_versions", lambda *args, **kwargs: []
+    )

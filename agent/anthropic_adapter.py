@@ -23,7 +23,26 @@ from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
-from utils import base_url_host_matches, normalize_proxy_env_vars
+from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
+from agent.secret_scope import get_secret as _get_secret
+
+try:
+    import hermes_cli as _hermes_cli
+
+    _HERMES_VERSION = str(_hermes_cli.__version__)
+except Exception:
+    _HERMES_VERSION = "0.0.0"
+
+
+def _getenv(name: str, default: str = "") -> str:
+    """Profile-scoped replacement for os.getenv on credential reads.
+
+    Routes through the secret scope (Workstream A): identical to os.getenv
+    when multiplexing is off, scope-aware (and fail-closed on an unscoped
+    read) when on. Mirrors the same wrapper in hermes_cli/runtime_provider.py.
+    """
+    val = _get_secret(name, default)
+    return val if val is not None else default
 
 # NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
 # ~220 ms of imports (anthropic.types, anthropic.lib.tools._beta_runner, etc.)
@@ -111,6 +130,17 @@ _LEGACY_MANUAL_THINKING_CLAUDE_SUBSTRINGS = (
 _NO_XHIGH_CLAUDE_SUBSTRINGS = (
     "claude-opus-4-6", "claude-opus-4.6",
     "claude-sonnet-4-6", "claude-sonnet-4.6",
+)
+
+# Adaptive Claude families that REJECT a thinking disable — thinking is
+# mandatory and ``thinking: {"type": "disabled"}`` answers HTTP 400. The Portal
+# catalog flags the same families with ``reasoning.mandatory``.
+#
+# Unlike the two lists above, the failure here is asymmetric: a missing entry
+# 400s the turn, while a spurious one only leaves thinking on. When in doubt,
+# add the family.
+_MANDATORY_THINKING_CLAUDE_SUBSTRINGS = (
+    "claude-fable",
 )
 
 
@@ -277,6 +307,32 @@ def _supports_xhigh_effort(model: str) -> bool:
         return False
     m = model.lower()
     return not any(v in m for v in _NO_XHIGH_CLAUDE_SUBSTRINGS)
+
+
+def _accepts_thinking_disable(model: str) -> bool:
+    """Return True when *model* accepts an explicit thinking disable.
+
+    Adaptive Claude models default to thinking ON, so "thinking off" only
+    takes effect if we actively send ``thinking: {"type": "disabled"}`` —
+    omitting the parameter leaves the upstream default in place and the model
+    thinks anyway.  Reasoning-mandatory families reject the disable outright
+    with an HTTP 400, so they keep the omit-everything behavior.
+
+    Legacy manual-thinking Claude models are excluded because they need no
+    disable: thinking is opt-in there via ``budget_tokens``, so not sending
+    the block already means off.
+
+    Scoped to Claude deliberately.  Kimi/Moonshot endpoints also speak the
+    adaptive contract, but their documented disable behavior is omission
+    (#13848) and they are not part of this bug; sending them a new parameter
+    on the strength of Claude's contract would be a guess.
+    """
+    if not _is_claude_model(model):
+        return False
+    if not _supports_adaptive_thinking(model):
+        return False
+    m = model.lower()
+    return not any(v in m for v in _MANDATORY_THINKING_CLAUDE_SUBSTRINGS)
 
 
 def _forbids_sampling_params(model: str) -> bool:
@@ -455,6 +511,11 @@ def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
     return normalized.rstrip("/").lower().startswith("https://api.kimi.com/coding")
 
 
+def _is_opencode_endpoint(base_url: str | None) -> bool:
+    """Return True for OpenCode's Zen/Go relay (opencode.ai)."""
+    return base_url_host_matches(base_url or "", "opencode.ai")
+
+
 # Model-name prefixes that identify the Kimi / Moonshot family.  Covers
 # - official slugs: ``kimi-k2.5``, ``kimi_thinking``, ``moonshot-v1-8k``
 # - common release lines: ``k1.5-...``, ``k2-thinking``, ``k25-...``, ``k2.5-...``,
@@ -546,15 +607,49 @@ def _is_deepseek_anthropic_endpoint(base_url: str | None) -> bool:
     return "/anthropic" in normalized.rstrip("/").lower()
 
 
+def _is_nous_portal_endpoint(base_url: str | None) -> bool:
+    """Return True for Nous Portal's Anthropic Messages route.
+
+    Portal serves its ``anthropic/*`` catalog natively at
+    ``https://inference-api.nousresearch.com/v1/messages``.  Portal-specific
+    behaviours key off this: Bearer JWT auth, verbatim catalog model ids,
+    and native thinking-signature replay.
+
+    Trusted hosts only:
+
+    1. Prod hostname ``inference-api.nousresearch.com``
+    2. The operator-set ``NOUS_INFERENCE_BASE_URL`` hostname (staging/preview)
+
+    Lookalikes such as ``inference-api.nousresearch.com.attacker.test`` are
+    rejected (hostname match, not substring).
+    """
+    if base_url_host_matches(base_url or "", "inference-api.nousresearch.com"):
+        return True
+    try:
+        from hermes_cli.auth import _nous_inference_env_override
+
+        override = _nous_inference_env_override()
+    except Exception:
+        return False
+    if not override:
+        return False
+    # Exact host equality (not subdomain) so the env override can't broaden
+    # into sibling hosts the operator did not set.
+    override_host = base_url_hostname(override)
+    return bool(override_host) and base_url_hostname(base_url or "") == override_host
+
+
 def _requires_bearer_auth(base_url: str | None) -> bool:
     """Return True for Anthropic-compatible providers that require Bearer auth.
 
     Some third-party /anthropic endpoints implement Anthropic's Messages API but
     require Authorization: Bearer instead of Anthropic's native x-api-key header.
     MiniMax's global and China Anthropic-compatible endpoints, Azure AI
-    Foundry's Anthropic-style endpoint, and Palantir Foundry's LLM proxy
-    follow this pattern.
+    Foundry's Anthropic-style endpoint, Palantir Foundry's LLM proxy, and Nous
+    Portal's Messages route follow this pattern.
     """
+    if _is_nous_portal_endpoint(base_url):
+        return True
     normalized = _normalize_base_url_text(base_url)
     if not normalized:
         return False
@@ -567,6 +662,10 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
         # Hostname match (not substring) so e.g. evil.com/palantirfoundry
         # paths don't trigger Bearer auth.
         or base_url_host_matches(normalized, "palantirfoundry.com")
+        # CommandCode's /provider/v1/messages endpoint uses Bearer auth,
+        # not Anthropic's native x-api-key header. Hostname match for the
+        # same reason as above.
+        or base_url_host_matches(normalized, "api.commandcode.ai")
     )
 
 
@@ -721,7 +820,11 @@ def _build_anthropic_client_with_bearer_hook(
     if common_betas:
         kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
-    return _anthropic_sdk.Anthropic(**kwargs)
+    client = _anthropic_sdk.Anthropic(**kwargs)
+    # Same env-inference trap as build_anthropic_client: auth_token-only
+    # construction would otherwise also send ANTHROPIC_API_KEY as X-Api-Key.
+    client.api_key = None
+    return client
 
 
 def build_anthropic_client(
@@ -807,12 +910,18 @@ def build_anthropic_client(
     )
 
     if _is_kimi_coding_endpoint(base_url):
-        # Kimi's /coding endpoint requires User-Agent: claude-code/0.1.0
-        # to be recognized as a valid Coding Agent. Without it, returns 403.
-        # Check this BEFORE _requires_bearer_auth since both match api.kimi.com/coding.
+        # Kimi's /coding endpoint requires a non-empty User-Agent to be
+        # recognized as a valid Coding Agent. Originally we sent
+        # ``claude-code/0.1.0`` (the minimum that avoided a 403), but the Kimi
+        # team asked us to identify ourselves properly so they can attribute
+        # traffic correctly. Send the same attribution header set we send to
+        # OpenRouter, Vercel AI Gateway, and Fireworks:
+        # HTTP-Referer + X-Title + HermesAgent User-Agent.
         kwargs["api_key"] = api_key
         kwargs["default_headers"] = {
-            "User-Agent": "claude-code/0.1.0",
+            "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+            "X-Title": "Hermes Agent",
+            "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
             **( {"anthropic-beta": ",".join(common_betas)} if common_betas else {} )
         }
     elif _requires_bearer_auth(normalized_base_url):
@@ -850,7 +959,28 @@ def build_anthropic_client(
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
-    return _anthropic_sdk.Anthropic(**kwargs)
+    if _is_opencode_endpoint(base_url):
+        # OpenCode identifies clients by request headers, like OpenRouter does.
+        # The OpenAI-wire paths pick these up from profile.default_headers
+        # (plugins/model-providers/opencode-zen), but the Anthropic Messages
+        # route builds its client right here and never sees the profile. Merge
+        # the same set on top of whatever auth branch ran above.
+        headers = dict(kwargs.get("default_headers") or {})
+        headers.setdefault("HTTP-Referer", "https://hermes-agent.nousresearch.com")
+        headers.setdefault("X-Title", "Hermes Agent")
+        headers.setdefault("User-Agent", f"HermesAgent/{_HERMES_VERSION}")
+        kwargs["default_headers"] = headers
+
+    client = _anthropic_sdk.Anthropic(**kwargs)
+    # Bearer-only construction leaves ``api_key`` unset, so the SDK fills it
+    # from ``ANTHROPIC_API_KEY`` (Hermes loads that into the process env from
+    # ``~/.hermes/.env``). The result is dual auth —
+    # ``X-Api-Key: sk-ant-…`` *and* ``Authorization: Bearer <portal-jwt>`` —
+    # on every Portal / MiniMax / OAuth Messages request. Clear the env-filled
+    # key whenever we intentionally authenticated via auth_token alone.
+    if "auth_token" in kwargs and "api_key" not in kwargs:
+        client.api_key = None
+    return client
 
 
 def build_anthropic_bedrock_client(region: str):
@@ -1275,7 +1405,7 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
         # to auth.json or trigger a network refresh from a bare resolve. select()
         # is deliberately NOT used — it runs clear_expired=True, refresh=True,
         # which would violate this read-only contract.
-        entries = pool._available_entries(clear_expired=False, refresh=False)
+        entries, _pending = pool._available_entries(clear_expired=False, refresh=False)
     except Exception:
         logger.debug("Failed to read Anthropic credential_pool", exc_info=True)
         return None
@@ -1301,46 +1431,54 @@ def resolve_anthropic_token() -> Optional[str]:
     Priority:
       1. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Hermes)
       2. CLAUDE_CODE_OAUTH_TOKEN env var
-      3. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
+      3. ANTHROPIC_API_KEY env var (explicit regular API key)
+      4. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
          — with automatic refresh if expired and a refresh token is available
-      4. Anthropic credential_pool OAuth entry (~/.hermes/auth.json)
-      5. ANTHROPIC_API_KEY env var (regular API key, or legacy fallback)
+      5. Anthropic credential_pool OAuth entry (~/.hermes/auth.json)
 
     Returns the token string or None.
     """
-    creds = read_claude_code_credentials()
+    creds: Optional[Dict[str, Any]] = None
+    creds_loaded = False
+
+    def _read_creds() -> Optional[Dict[str, Any]]:
+        nonlocal creds, creds_loaded
+        if not creds_loaded:
+            creds = read_claude_code_credentials()
+            creds_loaded = True
+        return creds
 
     # 1. Hermes-managed OAuth/setup token env var
-    token = os.getenv("ANTHROPIC_TOKEN", "").strip()
+    token = _getenv("ANTHROPIC_TOKEN").strip()
     if token:
-        preferred = _prefer_refreshable_claude_code_token(token, creds)
+        preferred = _prefer_refreshable_claude_code_token(token, _read_creds())
         if preferred:
             return preferred
         return token
 
     # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
-    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    cc_token = _getenv("CLAUDE_CODE_OAUTH_TOKEN").strip()
     if cc_token:
-        preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
+        preferred = _prefer_refreshable_claude_code_token(cc_token, _read_creds())
         if preferred:
             return preferred
         return cc_token
 
-    # 3. Claude Code credential file
-    resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
+    # 3. Regular API key. An explicit user-configured key must not be shadowed
+    # by auto-discovered Claude Code or credential-pool OAuth credentials.
+    api_key = _getenv("ANTHROPIC_API_KEY").strip()
+    if api_key:
+        return api_key
+
+    # 4. Claude Code credential file
+    resolved_claude_token = _resolve_claude_code_token_from_credentials(_read_creds())
     if resolved_claude_token:
         return resolved_claude_token
 
-    # 4. Hermes credential_pool OAuth entry.
+    # 5. Hermes credential_pool OAuth entry.
     resolved_pool_token = _resolve_anthropic_pool_token()
     if resolved_pool_token:
         return resolved_pool_token
-
-    # 5. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
-    # This remains as a compatibility fallback for pre-migration Hermes configs.
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if api_key:
-        return api_key
 
     return None
 
@@ -1381,7 +1519,7 @@ def run_oauth_setup_token() -> Optional[str]:
 
     # Check env vars that may have been set
     for env_var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_TOKEN"):
-        val = os.getenv(env_var, "").strip()
+        val = _getenv(env_var).strip()
         if val:
             return val
 
@@ -1800,7 +1938,16 @@ def _to_plain_data(value: Any, *, _depth: int = 0, _path: Optional[set] = None) 
 
     if hasattr(value, "model_dump"):
         _path.add(obj_id)
-        result = _to_plain_data(value.model_dump(), _depth=_depth + 1, _path=_path)
+        try:
+            # warnings=False: content blocks from the streaming accumulator
+            # (ParsedTextBlock et al.) trip pydantic's serializer-mismatch
+            # UserWarning against the generic Message union; the dump itself
+            # is correct, and the warning leaks to the user's terminal.
+            dumped = value.model_dump(warnings=False)
+        except TypeError:
+            # Duck-typed model_dump without pydantic's signature.
+            dumped = value.model_dump()
+        result = _to_plain_data(dumped, _depth=_depth + 1, _path=_path)
         _path.discard(obj_id)
         return result
     if isinstance(value, dict):
@@ -2060,6 +2207,28 @@ def _convert_assistant_message(m: Dict[str, Any]) -> Dict[str, Any]:
             _apply_assistant_cache_control_to_last_cacheable_block(
                 replayed, m.get("cache_control")
             )
+            # apply_anthropic_cache_control marks an assistant turn with
+            # non-empty text by writing cache_control INTO ``content`` (see
+            # _apply_cache_marker's list branch), not at the top level. This
+            # branch rebuilds the message from ordered_blocks and never reads
+            # ``content``, so that marker would be dropped -- and because
+            # _can_carry_marker already counted this message as a carrier, the
+            # breakpoint is burned rather than relocated. #56195 covered the
+            # complementary shape (blank content -> top-level marker); this is
+            # the interleaved thinking + preamble-text + tool_use shape.
+            _inline_cc = None
+            _msg_content = m.get("content")
+            if isinstance(_msg_content, list):
+                for _blk in _msg_content:
+                    if isinstance(_blk, dict) and isinstance(
+                        _blk.get("cache_control"), dict
+                    ):
+                        _inline_cc = _blk["cache_control"]
+                        break
+            if _inline_cc is not None:
+                _apply_assistant_cache_control_to_last_cacheable_block(
+                    replayed, _inline_cc
+                )
             return {"role": "assistant", "content": replayed}
 
     blocks = _extract_preserved_thinking_blocks(m)
@@ -2230,13 +2399,14 @@ def _convert_user_message(content: Any) -> Dict[str, Any]:
     """Validate and convert a user message to anthropic format."""
     if isinstance(content, list):
         converted_blocks = _convert_content_to_anthropic(content)
-        if not converted_blocks or all(
-            (b.get("text") or "").strip() == ""
-            for b in converted_blocks
-            if isinstance(b, dict) and b.get("type") == "text"
-        ):
-            converted_blocks = [{"type": "text", "text": "(empty message)"}]
-        return {"role": "user", "content": converted_blocks}
+        kept_blocks = _fix_blank_text_blocks_in_list(
+            converted_blocks,
+            placeholder_text="(empty message)",
+            msg_index=-1,
+            role="user",
+            location="_convert_user_message",
+        )
+        return {"role": "user", "content": kept_blocks}
     else:
         if not content or (isinstance(content, str) and not content.strip()):
             content = "(empty message)"
@@ -2394,10 +2564,22 @@ def _manage_thinking_signatures(
     replayed assistant tool-call messages.  See hermes-agent#13848 (Kimi) and
     hermes-agent#16748 (DeepSeek).
 
+    Nous Portal's ``/v1/messages`` route is the exception among third-party
+    hosts: it proxies Claude to Anthropic/Vertex/Bedrock and validates the
+    same signed thinking blocks.  Sticky ``session_id`` keeps a conversation
+    on one upstream instance so those signatures stay warm — stripping them
+    here would 400 the first tool-loop turn ("thinking must be passed back").
+    Portal therefore takes the native Anthropic replay path below.
+
     Mutates ``result`` in place.
     """
     _THINKING_TYPES = frozenset(("thinking", "redacted_thinking"))
-    _is_third_party = _is_third_party_anthropic_endpoint(base_url)
+    # Portal speaks Anthropic's thinking contract end-to-end; do not treat it
+    # as a signature-blind proxy even though the host is not anthropic.com.
+    _is_third_party = (
+        _is_third_party_anthropic_endpoint(base_url)
+        and not _is_nous_portal_endpoint(base_url)
+    )
 
     last_assistant_idx = None
     for i in range(len(result) - 1, -1, -1):
@@ -2527,9 +2709,114 @@ def _ensure_leading_user_turn(result: List[Dict[str, Any]]) -> None:
     Mirror the Bedrock Converse adapter, which unconditionally prepends a
     minimal user turn when the first message is not user
     (convert_messages_to_converse).
+
+    The inserted text block must be non-whitespace: Anthropic separately
+    rejects any text content block whose text is empty or whitespace-only
+    ("text content blocks must contain non-whitespace text"), so a single
+    space here traded the "leading assistant turn" 400 for that one (#69512
+    class). Uses the same placeholder as every other synthesized filler
+    block in this module for consistency.
     """
     if result and result[0].get("role") != "user":
-        result.insert(0, {"role": "user", "content": [{"type": "text", "text": " "}]})
+        result.insert(
+            0, {"role": "user", "content": [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER}]}
+        )
+
+
+def _fix_blank_text_blocks_in_list(
+    blocks: List[Any],
+    *,
+    placeholder_text: str,
+    msg_index: int,
+    role: Any,
+    location: str,
+) -> List[Any]:
+    """Drop blank/whitespace-only text blocks from ``blocks``, in place logic.
+
+    Non-text blocks (tool_use, tool_result, image, document, thinking, …)
+    and the relative order of everything else are left untouched. A
+    cache_control marker riding on a dropped block is relocated onto the
+    last surviving text/tool_use block so a breakpoint is never silently
+    lost. If nothing survives, a single non-blank placeholder text block
+    takes the dropped blocks' place (carrying the relocated cache_control,
+    if any) so the message never has empty content.
+
+    Returns a new list; does not mutate ``blocks``.
+    """
+    kept: List[Any] = []
+    relocated_cache_control = None
+    for block_index, blk in enumerate(blocks):
+        if (
+            isinstance(blk, dict)
+            and blk.get("type") == "text"
+            and not (isinstance(blk.get("text"), str) and blk["text"].strip())
+        ):
+            if isinstance(blk.get("cache_control"), dict):
+                relocated_cache_control = blk["cache_control"]
+            logger.warning(
+                "Pre-call sanitizer: dropped blank text content block "
+                "(message_index=%d role=%s location=%s block_index=%d "
+                "block_type=text)",
+                msg_index,
+                role,
+                location,
+                block_index,
+            )
+            continue
+        kept.append(blk)
+    if not kept:
+        placeholder: Dict[str, Any] = {"type": "text", "text": placeholder_text}
+        if relocated_cache_control is not None:
+            placeholder["cache_control"] = relocated_cache_control
+        kept.append(placeholder)
+    elif relocated_cache_control is not None:
+        _apply_assistant_cache_control_to_last_cacheable_block(kept, relocated_cache_control)
+    return kept
+
+
+def _scrub_blank_text_blocks(result: List[Dict[str, Any]]) -> None:
+    """Final provider-boundary guard against blank Anthropic text blocks.
+
+    Anthropic rejects any text content block whose ``text`` is empty or
+    whitespace-only with HTTP 400 ("text content blocks must contain
+    non-whitespace text"). ``_convert_assistant_message``,
+    ``_convert_user_message`` and ``_ensure_leading_user_turn`` already
+    avoid emitting these for the paths that build them, but this pass runs
+    last — after every other transform in ``convert_messages_to_anthropic``
+    — so a blank block from any current or future producer (including one
+    nested inside a ``tool_result``'s own content list) never reaches the
+    wire. Diagnostics are structural only: message index, role, content
+    location, block index/type. Never logs message text, tool arguments,
+    tokens, or credentials. Mutates ``result`` in place.
+    """
+    for msg_index, msg in enumerate(result):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if not isinstance(content, list) or not content:
+            continue
+        placeholder_text = _EMPTY_TEXT_PLACEHOLDER if role == "assistant" else "(empty message)"
+        new_content = _fix_blank_text_blocks_in_list(
+            content,
+            placeholder_text=placeholder_text,
+            msg_index=msg_index,
+            role=role,
+            location="content",
+        )
+        for blk in new_content:
+            if not isinstance(blk, dict) or blk.get("type") != "tool_result":
+                continue
+            inner = blk.get("content")
+            if isinstance(inner, list) and inner:
+                blk["content"] = _fix_blank_text_blocks_in_list(
+                    inner,
+                    placeholder_text="(no output)",
+                    msg_index=msg_index,
+                    role=role,
+                    location="tool_result",
+                )
+        msg["content"] = new_content
 
 
 def convert_messages_to_anthropic(
@@ -2568,7 +2855,26 @@ def convert_messages_to_anthropic(
                     p.get("cache_control") for p in content if isinstance(p, dict)
                 )
                 if has_cache:
-                    system = [p for p in content if isinstance(p, dict)]
+                    # Copy blocks before coercing so the caller's message
+                    # dicts are never mutated, then replace blank/whitespace
+                    # text with the shared non-whitespace placeholder —
+                    # Anthropic rejects a blank system text block with the
+                    # same HTTP 400 as message blocks ("text content blocks
+                    # must contain non-whitespace text"), and a blank block
+                    # carrying a cache_control breakpoint cannot simply be
+                    # dropped (#70909).
+                    system = []
+                    for p in content:
+                        if not isinstance(p, dict):
+                            continue
+                        if (
+                            p.get("type") == "text"
+                            and isinstance(p.get("text"), str)
+                            and not p["text"].strip()
+                        ):
+                            p = dict(p)
+                            p["text"] = _EMPTY_TEXT_PLACEHOLDER
+                        system.append(p)
                 else:
                     system = "\n".join(
                         p["text"] for p in content if p.get("type") == "text"
@@ -2593,6 +2899,7 @@ def convert_messages_to_anthropic(
     _ensure_leading_user_turn(result)
     _manage_thinking_signatures(result, base_url, model)
     _evict_old_screenshots(result)
+    _scrub_blank_text_blocks(result)
 
     return system, result
 
@@ -2654,7 +2961,12 @@ def build_anthropic_kwargs(
     )
     anthropic_tools = convert_tools_to_anthropic(tools) if tools else []
 
-    model = normalize_model_name(model, preserve_dots=preserve_dots)
+    # Nous Portal routes on its own catalog ids (``anthropic/claude-opus-4.8``);
+    # normalizing to the bare Anthropic slug would make the model unresolvable
+    # there. Skipping the call preserves the prefix AND the dots, so
+    # ``preserve_dots`` stays irrelevant for Portal.
+    if not _is_nous_portal_endpoint(base_url):
+        model = normalize_model_name(model, preserve_dots=preserve_dots)
     # effective_max_tokens = output cap for this call (≠ total context window)
     # Use the resolver helper so non-positive values (negative ints,
     # fractional floats, NaN, non-numeric) fail locally with a clear error
@@ -2778,7 +3090,15 @@ def build_anthropic_kwargs(
     # request "summarized" so the reasoning blocks stay populated — matching
     # 4.6 behavior and preserving the activity-feed UX during long tool runs.
     if reasoning_config and isinstance(reasoning_config, dict):
-        if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
+        if reasoning_config.get("enabled") is False:
+            # "Thinking off". Adaptive models think by DEFAULT, so omitting the
+            # parameter is not a disable — it silently leaves thinking on and
+            # the user keeps paying for it. Send the disable explicitly.
+            # Mandatory-thinking models reject it with a 400, so they keep the
+            # omission: a silently-ignored disable beats a dead turn.
+            if _accepts_thinking_disable(model):
+                kwargs["thinking"] = {"type": "disabled"}
+        elif "haiku" not in model.lower():
             effort = str(reasoning_config.get("effort", "medium")).lower()
             budget = THINKING_BUDGET.get(effort, 8000)
             if _supports_adaptive_thinking(model):
@@ -2894,6 +3214,7 @@ def create_anthropic_message(
     log_prefix: str = "",
     prefer_stream: bool = True,
     on_stream_event=None,
+    on_response=None,
 ) -> Any:
     """Create an Anthropic message, aggregating via stream when available.
 
@@ -2910,6 +3231,13 @@ def create_anthropic_message(
     progress hook so a slow-but-generating summary model isn't treated as
     hung. Only fires on the streaming path; the ``create()`` fallback has no
     events to report.
+
+    ``on_response``: optional callable invoked once with the underlying httpx
+    response before the message is aggregated (best-effort, exceptions
+    swallowed). Response *headers* carry out-of-band provider state that the
+    parsed ``Message`` drops — Nous Portal's ``x-nous-credits-*`` balance family
+    in particular. Only fires on the streaming path, which is the one the main
+    turn loop takes.
     """
     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
 
@@ -2920,6 +3248,14 @@ def create_anthropic_message(
         stream_kwargs.pop("stream", None)
         try:
             with stream_fn(**stream_kwargs) as stream:
+                if callable(on_response):
+                    try:
+                        on_response(getattr(stream, "response", None))
+                    except Exception:
+                        logger.debug(
+                            "%son_response callback failed",
+                            log_prefix, exc_info=True,
+                        )
                 if callable(on_stream_event):
                     # Consume the event stream manually so each event can
                     # tick the caller's progress callback; get_final_message

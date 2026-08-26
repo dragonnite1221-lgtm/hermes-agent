@@ -20,19 +20,105 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0  # Full history needed for git log
+          persist-credentials: false
+
+      - name: Fetch parent history for fork attribution
+        id: parent-history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REPOSITORY_IS_FORK: ${{ github.event.repository.fork }}
+        run: |
+          set -euo pipefail
+
+          # A fork catch-up PR can contain thousands of commits that were
+          # already accepted by the parent repository. They are not new fork
+          # contributions and must not be re-audited against the fork's stale
+          # base. Exclude only commits reachable from the verified parent
+          # default branch; cherry-picks and fork-local commits remain in scope.
+          # The event payload already carries the authoritative fork bit. Avoid
+          # adding an API availability dependency to the primary repository's
+          # otherwise-local attribution check; only a confirmed fork needs
+          # parent metadata and therefore the fail-closed lookup below.
+          if [ "$REPOSITORY_IS_FORK" != "true" ]; then
+            echo "parent_ref=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Query the parent name and branch together, retrying transient API
+          # and rate-limit failures. An exhausted retry remains fail-closed:
+          # silently treating a fork as a standalone repository would audit
+          # imported upstream commits as if they were new contributions.
+          PARENT_METADATA=""
+          for attempt in 1 2 3; do
+            if PARENT_METADATA=$(gh api "repos/${REPO}" \
+              --jq '[.parent.full_name // "", .parent.default_branch // ""] | @tsv'); then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::could not query fork parent metadata after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::fork parent metadata query failed (attempt ${attempt}); retrying in 10s"
+            sleep 10
+          done
+
+          IFS=$'\t' read -r PARENT_FULL_NAME PARENT_BRANCH <<< "$PARENT_METADATA"
+          if [ -z "$PARENT_FULL_NAME" ]; then
+            echo "parent_ref=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ ! "$PARENT_FULL_NAME" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::invalid parent repository name: ${PARENT_FULL_NAME}"
+            exit 1
+          fi
+
+          if [ -z "$PARENT_BRANCH" ]; then
+            echo "::error::fork parent metadata did not include a default branch"
+            exit 1
+          fi
+          git check-ref-format --branch "$PARENT_BRANCH" >/dev/null
+          PARENT_REF="refs/remotes/attribution-parent/${PARENT_BRANCH}"
+          git remote add attribution-parent "https://github.com/${PARENT_FULL_NAME}.git"
+          for attempt in 1 2 3; do
+            if git fetch --no-tags --filter=blob:none attribution-parent \
+              "+refs/heads/${PARENT_BRANCH}:${PARENT_REF}"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::could not fetch fork parent history after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::fork parent history fetch failed (attempt ${attempt}); retrying in 10s"
+            sleep 10
+          done
+          echo "parent_ref=${PARENT_REF}" >> "$GITHUB_OUTPUT"
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          PARENT_REF: ${{ steps.parent-history.outputs.parent_ref }}
         run: |
+          set -euo pipefail
+
           # Get the merge base between this PR and main
           MERGE_BASE=$(git merge-base origin/main HEAD)
 
-          # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          # Find author emails introduced by the PR itself. On a fork, commits
+          # already reachable from the parent's default branch are imported
+          # history, not new contributors to the fork.
+          LOG_EXCLUSIONS=()
+          if [ -n "$PARENT_REF" ]; then
+            git rev-parse --verify "${PARENT_REF}^{commit}" >/dev/null
+            LOG_EXCLUSIONS=(--not "$PARENT_REF")
+          fi
+          NEW_EMAILS=$(git log "${MERGE_BASE}..HEAD" "${LOG_EXCLUSIONS[@]}" \
+            --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."
             echo "review_status=[]" >> "$GITHUB_OUTPUT"
+            echo "review_status=[]" > review-status.json
             exit 0
           fi
 
@@ -67,6 +153,8 @@ jobs:
             echo -e "$MISSING"
             echo ""
             echo "Add a mapping file (do NOT edit AUTHOR_MAP in release.py):"
+            echo "  python3 scripts/audit_pr_attribution.py --fix   # auto-resolve + create files"
+            echo "or manually:"
             echo -e "$MISSING" | while read -r line; do
               email=$(echo "$line" | sed 's/^ *//' | cut -d' ' -f1)
               [ -z "$email" ] && continue
@@ -78,14 +166,28 @@ jobs:
 
             # Emit review_status for unmapped emails
             DETAIL=$(echo -e "$MISSING" | sed '/^$/d; s/^  //')
-            HOW_TO_FIX=$'Add mappings to scripts/release.py AUTHOR_MAP:\n```\n"<email>": "<github-username>",\n```\nTo find the GitHub username for an email:\n```\ngh api \'search/users?q=EMAIL+in:email\' --jq \'.items[0].login\'\n```\n'
+            HOW_TO_FIX=$'Run from the PR branch:\n```\npython3 scripts/audit_pr_attribution.py --fix\ngit add contributors && git commit -m "chore: map contributor emails" && git push\n```\nOr map one email manually (do NOT edit AUTHOR_MAP in release.py):\n```\npython3 scripts/add_contributor.py <email> <github-username>\n```\nTo find the GitHub username for an email:\n```\ngh api \'search/users?q=EMAIL+in:email\' --jq \'.items[0].login\'\n```\n'
             REVIEW_STATUS=$(jq -nc \
               --arg detail "$DETAIL" \
               --arg how_to_fix "$HOW_TO_FIX" \
               '[{"source":"contributor attribution","results":[{"kind":"action_required","title":"Unmapped contributor email(s)","summary":"New contributor email(s) are not in AUTHOR_MAP.","detail":$detail,"how_to_fix":$how_to_fix}]}]')
             echo "review_status=$REVIEW_STATUS" >> "$GITHUB_OUTPUT"
+            echo "review_status=$REVIEW_STATUS" > review-status.json
 
             exit 1
           else
             echo "✅ All contributor emails are mapped."
+            echo "review_status=[]" >> "$GITHUB_OUTPUT"
+            echo "review_status=[]" > review-status.json
           fi
+
+      - name: Upload review status artifact
+        if: always() && steps.check-emails.outcome != 'skipped'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: review-status-contributor-check
+          path: review-status.json
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore

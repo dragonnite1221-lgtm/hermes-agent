@@ -76,7 +76,11 @@ _STORE_DIRNAME = "store"
 _REFS_PREFIX = "refs/hermes"
 _INDEXES_DIRNAME = "indexes"
 _PROJECTS_DIRNAME = "projects"
+_LEDGERS_DIRNAME = "ledgers"
 _LEGACY_PREFIX = "legacy-"
+
+# Agent-write ledger cap: newest entries retained per project.
+_LEDGER_MAX_ENTRIES = 2000
 
 DEFAULT_EXCLUDES = [
     # Dependency / build output
@@ -224,6 +228,56 @@ def _index_path(store: Path, dir_hash: str) -> Path:
     return store / _INDEXES_DIRNAME / dir_hash
 
 
+def _ledger_path(store: Path, dir_hash: str) -> Path:
+    return store / _LEDGERS_DIRNAME / f"{dir_hash}.json"
+
+
+def _hash_file(path: Path) -> Optional[str]:
+    """Streaming sha256 of a file's bytes. None if unreadable/missing."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _load_ledger(store: Path, dir_hash: str) -> Dict[str, Dict]:
+    """Load the agent-write ledger: {relpath: {"sha256": ..., "ts": ...}}.
+
+    The ledger records the content hash of every file the last successful
+    ``write_file`` / ``patch`` produced, so restores can tell "Hermes wrote
+    this" apart from "the user hand-edited this afterwards".
+    """
+    try:
+        raw = _ledger_path(store, dir_hash).read_text(encoding="utf-8")
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_ledger(store: Path, dir_hash: str, ledger: Dict[str, Dict]) -> None:
+    """Persist the agent-write ledger, capped to the newest entries."""
+    try:
+        if len(ledger) > _LEDGER_MAX_ENTRIES:
+            newest = sorted(
+                ledger.items(),
+                key=lambda kv: kv[1].get("ts", 0) if isinstance(kv[1], dict) else 0,
+                reverse=True,
+            )[:_LEDGER_MAX_ENTRIES]
+            ledger = dict(newest)
+        path = _ledger_path(store, dir_hash)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(ledger), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        logger.debug("Failed to save agent-write ledger for %s", dir_hash, exc_info=True)
+
+
 def _ref_name(dir_hash: str) -> str:
     return f"{_REFS_PREFIX}/{dir_hash}"
 
@@ -258,7 +312,10 @@ def _git_env(
     ``store/indexes/<hash>`` so projects don't race on a shared index.
     """
     normalized_working_dir = _normalize_path(working_dir)
-    env = os.environ.copy()
+    # git child with hand-isolated config env; exact preservation — a HOME
+    # rewrite would change which ~/.gitconfig the isolation vars are hiding.
+    from tools.environments.local import build_subprocess_env
+    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
     env["GIT_DIR"] = str(store)
     env["GIT_WORK_TREE"] = str(normalized_working_dir)
     env.pop("GIT_NAMESPACE", None)
@@ -442,7 +499,8 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
     # ``git init --bare`` rejects GIT_WORK_TREE, so we can't use _run_git
     # here (which always sets GIT_DIR + GIT_WORK_TREE).  Use a raw
     # subprocess with just the config-isolation env vars.
-    init_env = os.environ.copy()
+    from tools.environments.local import build_subprocess_env
+    init_env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
     init_env["GIT_CONFIG_GLOBAL"] = os.devnull
     init_env["GIT_CONFIG_SYSTEM"] = os.devnull
     init_env["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -742,6 +800,99 @@ class CheckpointManager:
     # Public API
     # ------------------------------------------------------------------
 
+    def record_agent_write(self, file_path: str) -> None:
+        """Record the content hash of a file Hermes just successfully wrote.
+
+        Feeds the agent-write ledger used by :meth:`restore` in safe mode:
+        at restore time, a file whose current content no longer matches the
+        recorded hash was hand-edited by the user after Hermes last touched
+        it, and is skipped instead of clobbered.
+
+        Never raises — the ledger is best-effort bookkeeping.
+        """
+        if not self.enabled:
+            return
+        try:
+            path = _normalize_path(file_path)
+            digest = _hash_file(path)
+            if digest is None:
+                return
+            working_dir = self.get_working_dir_for_path(str(path))
+            store = _store_path(CHECKPOINT_BASE)
+            dir_hash = _project_hash(working_dir)
+            ledger = _load_ledger(store, dir_hash)
+            ledger[str(path)] = {"sha256": digest, "ts": time.time()}
+            _save_ledger(store, dir_hash, ledger)
+        except Exception as exc:
+            logger.debug("record_agent_write failed for %s: %s", file_path, exc)
+
+    def safe_restore_plan(self, working_dir: str, commit_hash: str) -> Dict:
+        """Classify files changed since ``commit_hash`` for a safe restore.
+
+        Returns ``{"success", "restore": [rel...], "skipped": [rel...],
+        "error"?}`` where ``restore`` lists files whose current content
+        still matches what Hermes last wrote (per the agent-write ledger)
+        and ``skipped`` lists files the user hand-edited after Hermes'
+        last write or that Hermes never wrote at all.
+        """
+        hash_err = _validate_commit_hash(commit_hash)
+        if hash_err:
+            return {"success": False, "error": hash_err}
+
+        abs_dir = str(_normalize_path(working_dir))
+        store = _store_path(CHECKPOINT_BASE)
+        if not (store / "HEAD").exists():
+            return {"success": False, "error": "No checkpoints exist for this directory"}
+
+        dir_hash = _project_hash(abs_dir)
+        index_file = _index_path(store, dir_hash)
+
+        # Stage the current tree so the name-only diff sees new files too.
+        _run_git(["add", "-A"], store, abs_dir,
+                 timeout=_GIT_TIMEOUT * 2, index_file=index_file)
+        ok, names_out, err = _run_git(
+            ["diff", "--name-only", commit_hash, "--cached"],
+            store, abs_dir, index_file=index_file,
+        )
+        # Reset the index back to the project ref so it doesn't drift.
+        _run_git(["read-tree", _ref_name(dir_hash)], store, abs_dir,
+                 index_file=index_file, allowed_returncodes={128})
+        if not ok:
+            return {"success": False, "error": f"Could not compute changed files: {err}"}
+
+        ledger = _load_ledger(store, dir_hash)
+        if not ledger:
+            # No agent-write ledger yet (pre-existing store, or Hermes has
+            # not written any files here since the ledger was introduced).
+            # Signal callers to fall back to a full restore rather than
+            # skipping every file.
+            return {"success": True, "restore": [], "skipped": [],
+                    "ledger_empty": True}
+        restore: List[str] = []
+        skipped: List[str] = []
+        for rel in names_out.splitlines():
+            rel = rel.strip()
+            if not rel:
+                continue
+            abs_path = Path(abs_dir) / rel
+            entry = ledger.get(str(abs_path))
+            recorded = entry.get("sha256") if isinstance(entry, dict) else None
+            if recorded is None:
+                # Hermes never wrote this file (or the ledger predates it) —
+                # do not touch it in safe mode.
+                skipped.append(rel)
+                continue
+            current = _hash_file(abs_path)
+            if current is None:
+                # File deleted since Hermes wrote it: restoring it back is
+                # safe — its last content was Hermes-authored.
+                restore.append(rel)
+            elif current == recorded:
+                restore.append(rel)
+            else:
+                skipped.append(rel)
+        return {"success": True, "restore": restore, "skipped": skipped}
+
     def ensure_checkpoint(self, working_dir: str, reason: str = "auto") -> bool:
         """Take a checkpoint if enabled and not already done this turn.
 
@@ -817,6 +968,29 @@ class CheckpointManager:
                 results.append(entry)
         return results
 
+    def list_all_checkpoints(self) -> List[Dict]:
+        """List checkpoints across every registered project (most recent first).
+
+        Surgical reapply of PR #10633 by @nightq (#10505) onto the v2
+        single-store layout: iterate ``projects/<hash>.json`` metadata via
+        ``_list_projects`` instead of the pre-v2 per-shadow-dir scan. Each
+        entry carries the extra ``workdir`` key so callers can label which
+        project a checkpoint belongs to.
+        """
+        store = _store_path(CHECKPOINT_BASE)
+        if not (store / "HEAD").exists():
+            return []
+        results: List[Dict] = []
+        for meta in _list_projects(store):
+            workdir = meta.get("workdir") or ""
+            if not workdir:
+                continue
+            for entry in self.list_checkpoints(workdir):
+                entry["workdir"] = workdir
+                results.append(entry)
+        results.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        return results
+
     @staticmethod
     def _parse_shortstat(stat_line: str, entry: Dict) -> None:
         """Parse git --shortstat output into entry dict."""
@@ -880,8 +1054,52 @@ class CheckpointManager:
             "diff": diff_out if ok_diff else "",
         }
 
-    def restore(self, working_dir: str, commit_hash: str, file_path: str = None) -> Dict:
-        """Restore files to a checkpoint state."""
+    def session_diff(self, working_dir: str) -> Dict:
+        """Show the cumulative diff of everything changed in this directory.
+
+        This powers ``/diff session``.  It answers "what has Hermes changed
+        here?" by diffing the *earliest retained checkpoint* — the snapshot
+        taken before the first recorded edit — against the current working
+        tree.  Because checkpoints are captured just before each file-mutating
+        tool call, that baseline is the pre-edit state, so the diff covers the
+        first edit and everything after it.
+
+        Note: checkpoints are a persistent per-project ref, so the earliest
+        *retained* checkpoint may predate the current session (or, after
+        pruning, postdate its true start).  It is an approximation of "what
+        Hermes changed", not an exact per-session ledger.
+
+        Returns the same shape as :meth:`diff` (``{"success", "stat",
+        "diff"}``).  When no checkpoints exist yet — nothing has been edited —
+        the call still *succeeds* with empty output and ``"empty": True`` so
+        callers can show a friendly "no changes" message rather than an error.
+        """
+        checkpoints = self.list_checkpoints(working_dir)
+        if not checkpoints:
+            return {"success": True, "stat": "", "diff": "", "empty": True}
+
+        baseline = checkpoints[-1].get("hash") or ""
+        result = self.diff(working_dir, baseline)
+        if result.get("success"):
+            result.setdefault("baseline", baseline)
+            if not result.get("stat") and not result.get("diff"):
+                result["empty"] = True
+        return result
+
+    def restore(
+        self,
+        working_dir: str,
+        commit_hash: str,
+        file_path: str = None,
+        safe: bool = False,
+    ) -> Dict:
+        """Restore files to a checkpoint state.
+
+        With ``safe=True`` (full-directory restores only), files the user
+        hand-edited after Hermes' last write — per the agent-write ledger —
+        are left untouched, and only Hermes-authored changes are reverted.
+        The result gains ``skipped_user_edits`` listing the preserved paths.
+        """
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
             return {"success": False, "error": hash_err}
@@ -905,18 +1123,67 @@ class CheckpointManager:
             return {"success": False, "error": f"Checkpoint '{commit_hash}' not found",
                     "debug": err or None}
 
+        skipped_user_edits: List[str] = []
+        restore_paths: Optional[List[str]] = None
+        if safe and not file_path:
+            plan = self.safe_restore_plan(abs_dir, commit_hash)
+            if not plan.get("success"):
+                return {"success": False, "error": plan.get("error", "Safe-restore plan failed")}
+            if plan.get("ledger_empty"):
+                # No agent-write history to compare against — fall back to
+                # the classic full restore rather than restoring nothing.
+                restore_paths = None
+            else:
+                restore_paths = plan["restore"]
+                skipped_user_edits = plan["skipped"]
+                if not restore_paths:
+                    return {
+                        "success": True,
+                        "restored_to": commit_hash[:8],
+                        "reason": "nothing to restore (all changed files were user-edited)",
+                        "directory": abs_dir,
+                        "restored_files": [],
+                        "skipped_user_edits": skipped_user_edits,
+                    }
+
         # Take a pre-rollback snapshot so you can undo the undo.
         self._take(abs_dir, f"pre-rollback snapshot (restoring to {commit_hash[:8]})")
 
         dir_hash = _project_hash(abs_dir)
         index_file = _index_path(store, dir_hash)
 
-        restore_target = file_path if file_path else "."
-        ok, stdout, err = _run_git(
-            ["checkout", commit_hash, "--", restore_target],
-            store, abs_dir, timeout=_GIT_TIMEOUT * 2,
-            index_file=index_file,
-        )
+        if restore_paths is not None:
+            # Split into files present in the checkpoint (checkout) and
+            # Hermes-created files absent from it (delete to restore state).
+            checkout_targets: List[str] = []
+            delete_targets: List[str] = []
+            for rel in restore_paths:
+                ok_in_commit, _, _ = _run_git(
+                    ["cat-file", "-e", f"{commit_hash}:{rel}"],
+                    store, abs_dir, allowed_returncodes={1, 128},
+                )
+                (checkout_targets if ok_in_commit else delete_targets).append(rel)
+            for rel in delete_targets:
+                try:
+                    target = Path(abs_dir) / rel
+                    if target.is_file() or target.is_symlink():
+                        target.unlink()
+                except OSError as exc:
+                    logger.debug("Safe restore: could not remove %s: %s", rel, exc)
+            if not checkout_targets:
+                ok, stdout, err = True, "", ""
+            else:
+                ok, stdout, err = _run_git(
+                    ["checkout", commit_hash, "--", *checkout_targets],
+                    store, abs_dir, timeout=_GIT_TIMEOUT * 2,
+                    index_file=index_file,
+                )
+        else:
+            ok, stdout, err = _run_git(
+                ["checkout", commit_hash, "--", file_path if file_path else "."],
+                store, abs_dir, timeout=_GIT_TIMEOUT * 2,
+                index_file=index_file,
+            )
 
         if not ok:
             return {"success": False, "error": f"Restore failed: {err}",
@@ -935,6 +1202,9 @@ class CheckpointManager:
         }
         if file_path:
             result["file"] = file_path
+        if restore_paths is not None:
+            result["restored_files"] = restore_paths
+            result["skipped_user_edits"] = skipped_user_edits
         return result
 
     def get_working_dir_for_path(self, file_path: str) -> str:
@@ -1316,7 +1586,16 @@ def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:
         else:
             stat = ""
 
-        lines.append(f"  {i}. {cp['short_hash']}  {ts}  {cp['reason']}{stat}")
+        # Label per-project entries when showing the cross-project view
+        # (workdir key only present on list_all_checkpoints results).
+        workdir = cp.get("workdir", "")
+        if workdir and directory == "all directories":
+            workdir_short = Path(workdir).name or workdir
+            lines.append(
+                f"  {i}. {cp['short_hash']}  {ts}  [{workdir_short}]  {cp['reason']}{stat}"
+            )
+        else:
+            lines.append(f"  {i}. {cp['short_hash']}  {ts}  {cp['reason']}{stat}")
 
     lines.append("\n  /rollback <N>             restore to checkpoint N")
     lines.append("  /rollback diff <N>        preview changes since checkpoint N")
