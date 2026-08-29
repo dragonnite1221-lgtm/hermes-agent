@@ -33,6 +33,69 @@ class FireClaimNotAcquiredError(RuntimeError):
     """Ledger/claim setup failed before this caller acquired fire ownership."""
 
 
+def abort_fire_claim_execution(
+    claimed_job: dict,
+    error: str,
+    *,
+    prefer_recovery: bool = False,
+) -> str:
+    """Close every pre-run abort without losing a consumed occurrence.
+
+    A clean jobs-store rollback is preferred before dispatch state changes.
+    When the rollback write fails, or a dispatch write had an ambiguous
+    outcome, the active ledger row is instead assigned to the normal durable
+    interrupted-recovery path. That path restores one-shot capacity and the
+    retry marker together, avoiding a partial cross-store rewind.
+    """
+    from cron.executions import finish_execution, release_execution_for_recovery
+    from cron.jobs import rollback_fire_claim_setup
+
+    job_id = str(claimed_job.get("id") or "")
+    execution_id = str(claimed_job.get("execution_id") or "")
+    rollback_errored = False
+    restored = False
+    if not prefer_recovery and isinstance(
+        claimed_job.get("_fire_claim_rollback"), dict
+    ):
+        try:
+            restored = rollback_fire_claim_setup(claimed_job)
+        except Exception:
+            rollback_errored = True
+            logger.warning(
+                "Job '%s': failed to restore fire claim after pre-run abort; "
+                "releasing the ledger witness to periodic recovery",
+                job_id,
+                exc_info=True,
+            )
+
+    if prefer_recovery or rollback_errored:
+        try:
+            if execution_id and release_execution_for_recovery(
+                execution_id, error=error
+            ):
+                return "released"
+        except Exception:
+            logger.warning(
+                "Job '%s': failed to release its unstarted execution for "
+                "periodic recovery",
+                job_id,
+                exc_info=True,
+            )
+
+    if execution_id:
+        try:
+            finish_execution(execution_id, success=False, error=error)
+        except Exception:
+            logger.warning(
+                "Job '%s': failed to close unstarted execution ledger row",
+                job_id,
+                exc_info=True,
+            )
+    if restored:
+        return "restored"
+    return "closed"
+
+
 def commit_fire_claim_execution(
     claimed_job: dict, execution_id: str, *, attempts: int = 3
 ) -> dict:
@@ -59,9 +122,9 @@ def commit_fire_claim_execution(
             continue
         if record is not None:
             # Keep the exact jobs-store rollback witness until run_one_job has
-            # validated the durable claim and started its renewal monitor.
-            # A fenced ledger row alone does not mean the job actually began:
-            # pre-run heartbeat validation can still fail closed.
+            # validated the durable claim, started its renewal monitor, moved
+            # the ledger row to running, and committed finite dispatch state.
+            # A fenced row alone does not mean the job actually began.
             return record
         last_error = RuntimeError("execution row was not claimable")
 

@@ -338,6 +338,110 @@ def test_foreign_heartbeat_generation_resets_observer_local_lease(monkeypatch, t
     assert [row["id"] for row in executions.interrupted_execution_candidates()] == [record["id"]]
 
 
+def test_fresh_fire_claim_generation_keeps_foreign_execution_live(
+    monkeypatch, tmp_path
+):
+    import cron.jobs as jobs
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monotonic_now = [1200.0]
+    fire_at = ["2026-08-29T12:00:00+00:00"]
+    monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
+    record = executions.create_execution("remote-fire-owner", source="external")
+    executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            """UPDATE executions SET process_id='remote-process',
+               machine_id='remote-host' WHERE id=?""",
+            (record["id"],),
+        )
+    monkeypatch.setattr(executions, "_machine_id", lambda: "local-host")
+    monkeypatch.setattr(
+        jobs,
+        "load_jobs",
+        lambda: [
+            {
+                "id": "remote-fire-owner",
+                "fire_claim": {
+                    "execution_id": record["id"],
+                    "by": "remote-owner-token",
+                    "at": fire_at[0],
+                },
+            }
+        ],
+    )
+
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS + 1
+    fire_at[0] = "2026-08-29T12:05:00+00:00"
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS - 1
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += 2
+    assert [row["id"] for row in executions.interrupted_execution_candidates()] == [
+        record["id"]
+    ]
+
+
+def test_recovery_fails_closed_when_jobs_store_ownership_is_unreadable(
+    monkeypatch, tmp_path
+):
+    import cron.jobs as jobs
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("unknown-fire-owner", source="external")
+    executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET process_id='dead-owner', pid=-1 WHERE id=?",
+            (record["id"],),
+        )
+    monkeypatch.setattr(
+        jobs,
+        "load_jobs",
+        lambda: (_ for _ in ()).throw(OSError("jobs store offline")),
+    )
+
+    assert executions.interrupted_execution_candidates() == []
+
+
+def test_recovery_rechecks_fire_claim_generation_under_jobs_lock(
+    monkeypatch, tmp_path
+):
+    import cron.jobs as jobs
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("renewed-before-cas", source="external")
+    executions.mark_execution_running(record["id"])
+    candidate = {
+        **executions.latest_execution("renewed-before-cas"),
+        "_fire_claim_generation": "owner:old-generation",
+    }
+    monkeypatch.setattr(
+        executions, "interrupted_execution_candidates", lambda: [candidate]
+    )
+    monkeypatch.setattr(
+        jobs,
+        "load_jobs",
+        lambda: [
+            {
+                "id": "renewed-before-cas",
+                "retry_interrupted": True,
+                "script": "idempotent.py",
+                "no_agent": True,
+                "fire_claim": {
+                    "execution_id": record["id"],
+                    "by": "owner",
+                    "at": "new-generation",
+                },
+            }
+        ],
+    )
+
+    assert executions.recover_interrupted_executions() == 0
+    assert executions.latest_execution("renewed-before-cas")["status"] == "running"
+
+
 def test_machine_identity_does_not_depend_on_hermes_machine_id_env(monkeypatch):
     import cron.executions as executions
 
@@ -504,7 +608,8 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(
         scheduler,
         "mark_execution_running",
-        lambda execution_id: events.append(("running", execution_id)),
+        lambda execution_id: events.append(("running", execution_id))
+        or {"id": execution_id, "status": "running"},
         raising=False,
     )
     monkeypatch.setattr(

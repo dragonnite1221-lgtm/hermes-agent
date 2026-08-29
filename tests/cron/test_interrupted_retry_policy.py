@@ -1128,6 +1128,7 @@ def test_pre_run_rollback_io_failure_releases_attempt_for_periodic_recovery(
     isolated_cron, monkeypatch
 ):
     import cron.scheduler as scheduler
+    import cron.jobs as cron_jobs
     from cron.scheduler_provider import claim_fire_with_execution
 
     job = _script_job(retry_interrupted=True)
@@ -1148,7 +1149,7 @@ def test_pre_run_rollback_io_failure_releases_attempt_for_periodic_recovery(
         raise OSError("jobs store still unavailable")
 
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", _heartbeat_error)
-    monkeypatch.setattr(scheduler, "rollback_fire_claim_setup", _rollback_error)
+    monkeypatch.setattr(cron_jobs, "rollback_fire_claim_setup", _rollback_error)
 
     assert scheduler.run_one_job(claimed) is True
 
@@ -1165,3 +1166,83 @@ def test_pre_run_rollback_io_failure_releases_attempt_for_periodic_recovery(
     assert executions.recover_interrupted_executions() == 1
     retry = jobs.get_job(job["id"])["interrupted_retry"]
     assert retry["execution_ids"] == [replacement_id]
+
+
+def test_running_ledger_failure_restores_retry_before_dispatch(
+    isolated_cron, monkeypatch
+):
+    import cron.scheduler as scheduler
+    from cron.scheduler_provider import claim_fire_with_execution
+
+    job = _script_job(retry_interrupted=True)
+    abandoned = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(abandoned["id"])
+    assert jobs.requeue_interrupted_jobs([abandoned]) == {job["id"]}
+    executions.mark_interrupted_executions_unknown(
+        [abandoned["id"]], retry_job_ids={job["id"]}
+    )
+    before = jobs.get_job(job["id"])
+    claimed = claim_fire_with_execution(job["id"], source="direct")
+    dispatch_calls = []
+
+    monkeypatch.setattr(
+        scheduler,
+        "mark_execution_running",
+        lambda _execution_id: (_ for _ in ()).throw(OSError("ledger offline")),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "claim_dispatch",
+        lambda _job_id: dispatch_calls.append(True) or True,
+    )
+
+    assert scheduler.run_one_job(claimed) is True
+
+    restored = jobs.get_job(job["id"])
+    assert restored["interrupted_retry"] == before["interrupted_retry"]
+    assert restored["next_run_at"] == before["next_run_at"]
+    assert restored["fire_claim"] is None
+    assert dispatch_calls == []
+
+
+def test_ambiguous_oneshot_dispatch_is_recovered_with_its_capacity(
+    isolated_cron, monkeypatch
+):
+    import cron.scheduler as scheduler
+    from cron.scheduler_provider import claim_fire_with_execution
+
+    now = datetime(2026, 8, 29, 7, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    job = jobs.create_job(
+        prompt=None,
+        schedule=(now + timedelta(minutes=1)).isoformat(),
+        script="idempotent-sync.py",
+        no_agent=True,
+        deliver="local",
+        retry_interrupted=True,
+    )
+    assert jobs.claim_dispatch(job["id"]) is True
+    abandoned = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(abandoned["id"])
+    assert jobs.requeue_interrupted_jobs([abandoned]) == {job["id"]}
+    executions.mark_interrupted_executions_unknown(
+        [abandoned["id"]], retry_job_ids={job["id"]}
+    )
+    assert jobs.get_job(job["id"])["repeat"]["completed"] == 0
+    claimed = claim_fire_with_execution(job["id"], source="direct")
+    replacement_id = claimed["execution_id"]
+    real_claim_dispatch = jobs.claim_dispatch
+
+    def _ambiguous_dispatch(job_id):
+        assert real_claim_dispatch(job_id) is True
+        raise OSError("save acknowledgement lost")
+
+    monkeypatch.setattr(scheduler, "claim_dispatch", _ambiguous_dispatch)
+
+    assert scheduler.run_one_job(claimed) is True
+    assert jobs.get_job(job["id"])["repeat"]["completed"] == 1
+
+    assert executions.recover_interrupted_executions() == 1
+    recovered = jobs.get_job(job["id"])
+    assert recovered["repeat"]["completed"] == 0
+    assert recovered["interrupted_retry"]["execution_ids"] == [replacement_id]

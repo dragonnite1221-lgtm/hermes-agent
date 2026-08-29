@@ -416,7 +416,7 @@ def test_initially_lost_fire_claim_finishes_execution_without_running(monkeypatc
     }
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: False)
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
-    monkeypatch.setattr(scheduler, "finish_execution", finish)
+    monkeypatch.setattr("cron.executions.finish_execution", finish)
 
     assert scheduler.run_one_job(job) is True
 
@@ -467,7 +467,7 @@ def test_initial_heartbeat_exception_does_not_start_execution(monkeypatch):
         MagicMock(side_effect=OSError("store unavailable")),
     )
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
-    monkeypatch.setattr(scheduler, "finish_execution", finish)
+    monkeypatch.setattr("cron.executions.finish_execution", finish)
 
     assert scheduler.run_one_job(job) is True
 
@@ -492,7 +492,7 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
     }
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: True)
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
-    monkeypatch.setattr(scheduler, "finish_execution", finish)
+    monkeypatch.setattr("cron.executions.finish_execution", finish)
     monkeypatch.setattr(
         scheduler.threading.Thread,
         "start",
@@ -594,7 +594,11 @@ def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
     finish = MagicMock()
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: True)
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(scheduler, "mark_execution_running", lambda *_args: None)
+    monkeypatch.setattr(
+        scheduler,
+        "mark_execution_running",
+        lambda execution_id: {"id": execution_id, "status": "running"},
+    )
     monkeypatch.setattr(
         scheduler,
         "run_job",

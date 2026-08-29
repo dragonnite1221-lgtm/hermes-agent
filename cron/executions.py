@@ -227,7 +227,9 @@ def _boot_id() -> str:
     return f"hermes-boot-{digest[:32]}"
 
 
-def _foreign_owner_lease_is_stale(row: sqlite3.Row) -> bool:
+def _foreign_owner_lease_is_stale(
+    row: sqlite3.Row, *, fire_claim_generation: Optional[str] = None
+) -> bool:
     """Expire a foreign lease only after one observer sees no renewal locally.
 
     Persisted heartbeat timestamps are generations, not comparable clocks:
@@ -239,6 +241,12 @@ def _foreign_owner_lease_is_stale(row: sqlite3.Row) -> bool:
     raw = row["heartbeat_at"] or row["claimed_at"]
     execution_id = str(row["id"] or "")
     generation = str(raw or "")
+    if fire_claim_generation:
+        # jobs.json is the authoritative dispatch fence. Include its exact
+        # owner/heartbeat generation in the observer-local lease so a runner
+        # that can still renew the fire claim is never reaped merely because
+        # its best-effort audit-ledger heartbeat is temporarily unavailable.
+        generation = f"{generation}\0{fire_claim_generation}"
     if not execution_id or not generation:
         return False
     observed_now = time.monotonic()
@@ -278,6 +286,7 @@ def _owner_lease_is_stale(
     local_machine_id: str,
     local_boot_id: str,
     local_pid_namespace: str,
+    fire_claim_generation: Optional[str] = None,
 ) -> bool:
     """Prove an owner dead using PIDs only inside the same PID namespace."""
     owner_machine_id = str(row["machine_id"] or "").strip()
@@ -291,7 +300,9 @@ def _owner_lease_is_stale(
         return not _owner_is_live(int(row["pid"]), row["process_started_at"])
     # Missing legacy identities and same-host containers are both foreign PID
     # tables. Their persisted heartbeat generation is the only safe proof.
-    return _foreign_owner_lease_is_stale(row)
+    return _foreign_owner_lease_is_stale(
+        row, fire_claim_generation=fire_claim_generation
+    )
 
 
 def _prune_foreign_lease_observations_unlocked(conn: sqlite3.Connection) -> None:
@@ -412,7 +423,8 @@ def release_execution_for_recovery(
             """UPDATE executions
                SET process_id=?, pid=-1, process_started_at=NULL,
                    heartbeat_at=?, error=?
-               WHERE id=? AND status='claimed' AND fire_claim_acquired=1""",
+               WHERE id=? AND status IN ('claimed','running')
+                 AND fire_claim_acquired=1""",
             (f"released:{uuid.uuid4().hex}", now, detail, str(execution_id)),
         )
     return cur.rowcount == 1
@@ -529,8 +541,38 @@ def reconcile_unacquired_executions() -> tuple[int, int]:
     return promoted, discarded
 
 
+def _fire_claim_generation_map(
+    stored_jobs: Collection[Dict[str, Any]],
+) -> Dict[str, str]:
+    """Map execution ids to exact authoritative jobs-store lease generations."""
+    return {
+        str(claim.get("execution_id")): (
+            f"{claim.get('by') or ''}:{claim.get('at') or ''}"
+        )
+        for job in stored_jobs
+        if isinstance(job, dict)
+        for claim in [job.get("fire_claim")]
+        if isinstance(claim, dict) and claim.get("execution_id")
+    }
+
+
 def interrupted_execution_candidates() -> List[Dict[str, Any]]:
     """Return active attempts whose exact owner process is provably gone."""
+    from cron.jobs import load_jobs
+
+    try:
+        stored_jobs = load_jobs()
+    except Exception:
+        # The jobs store carries the authoritative fire-claim heartbeat. Fail
+        # closed when it cannot be read: an audit-only lease must not authorize
+        # a duplicate side effect while dispatch ownership is unknown.
+        logger.warning(
+            "Skipping interrupted execution recovery because jobs store "
+            "ownership could not be verified",
+            exc_info=True,
+        )
+        return []
+    fire_claim_generations = _fire_claim_generation_map(stored_jobs)
     abandoned: List[Dict[str, Any]] = []
     local_machine_id = _machine_id()
     local_boot_id = _boot_id()
@@ -548,10 +590,14 @@ def interrupted_execution_candidates() -> List[Dict[str, Any]]:
             local_machine_id=local_machine_id,
             local_boot_id=local_boot_id,
             local_pid_namespace=local_pid_namespace,
+            fire_claim_generation=fire_claim_generations.get(str(row["id"])),
         ):
             continue
         record = _record(row)
         if record is not None:
+            record["_fire_claim_generation"] = fire_claim_generations.get(
+                str(row["id"])
+            )
             abandoned.append(record)
     return abandoned
 
@@ -755,28 +801,46 @@ def recover_interrupted_executions() -> int:
     candidates = interrupted_execution_candidates()
     recovered: List[Dict[str, Any]] = []
     if candidates:
-        from cron.jobs import cancel_interrupted_retry_executions, requeue_interrupted_jobs
+        from cron.jobs import (
+            _jobs_lock,
+            cancel_interrupted_retry_executions,
+            load_jobs,
+            requeue_interrupted_jobs,
+        )
 
-        candidate_heartbeats = {
-            str(row["id"]): row.get("heartbeat_at") for row in candidates
-        }
-        requeued = requeue_interrupted_jobs(
-            candidates, expected_heartbeats=candidate_heartbeats
-        )
-        recovered = mark_interrupted_executions_unknown(
-            [row["id"] for row in candidates],
-            retry_job_ids=requeued,
-            expected_heartbeats=candidate_heartbeats,
-        )
-        recovered_ids = {str(row["id"]) for row in recovered}
-        lost_ids = {str(row["id"]) for row in candidates} - recovered_ids
-        # Another replica may have won the identical terminalization CAS after
-        # this process requeued the marker.  Its unknown+ACK transaction proves
-        # the retry handoff succeeded; only an owner renewal should roll it back.
-        _, concurrently_recovered_ids = interrupted_retry_states(lost_ids)
-        lost_ids -= concurrently_recovered_ids
-        if lost_ids:
-            cancel_interrupted_retry_executions(lost_ids)
+        # Revalidate the authoritative fire-claim generation and commit the
+        # jobs marker + SQLite terminal CAS while holding the same jobs lock
+        # used by owner heartbeats. This closes the last-observation race: a
+        # live owner cannot renew its claim between our proof and terminalize.
+        with _jobs_lock():
+            current_generations = _fire_claim_generation_map(load_jobs())
+            candidates = [
+                row
+                for row in candidates
+                if current_generations.get(str(row["id"]))
+                == row.get("_fire_claim_generation")
+            ]
+            candidate_heartbeats = {
+                str(row["id"]): row.get("heartbeat_at") for row in candidates
+            }
+            requeued = requeue_interrupted_jobs(
+                candidates, expected_heartbeats=candidate_heartbeats
+            )
+            recovered = mark_interrupted_executions_unknown(
+                [row["id"] for row in candidates],
+                retry_job_ids=requeued,
+                expected_heartbeats=candidate_heartbeats,
+            )
+            recovered_ids = {str(row["id"]) for row in recovered}
+            lost_ids = {str(row["id"]) for row in candidates} - recovered_ids
+            # Another replica may have won the identical terminalization CAS
+            # after this process requeued the marker. Its unknown+ACK
+            # transaction proves the retry handoff succeeded; only an owner
+            # renewal should roll it back.
+            _, concurrently_recovered_ids = interrupted_retry_states(lost_ids)
+            lost_ids -= concurrently_recovered_ids
+            if lost_ids:
+                cancel_interrupted_retry_executions(lost_ids)
         if requeued:
             logging.getLogger("cron.scheduler_provider").warning(
                 "Durably requeued %d interrupted cron job(s) under explicit at-least-once policy",

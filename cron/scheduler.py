@@ -543,7 +543,6 @@ from cron.jobs import (
     heartbeat_fire_claim,
     heartbeat_run_claim,
     mark_job_run,
-    rollback_fire_claim_setup,
     save_job_output,
     use_cron_store,
 )
@@ -554,7 +553,6 @@ from cron.executions import (
     heartbeat_execution,
     mark_execution_running,
     mark_fire_claim_acquired,
-    release_execution_for_recovery,
 )
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -6499,60 +6497,11 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
     lost_ownership = threading.Event()
     heartbeat_context = contextvars.copy_context()
 
-    def _finish_unstarted(error: str) -> None:
-        execution_id = job.get("execution_id")
-        if not execution_id:
-            return
-        try:
-            finish_execution(execution_id, success=False, error=error)
-        except Exception:
-            logger.warning(
-                "Job '%s': failed to close unstarted execution ledger row",
-                job_id,
-                exc_info=True,
-            )
-
     def _abort_unstarted(error: str) -> None:
         """Restore a provisionally consumed occurrence, then close its row."""
-        rollback_errored = False
-        if isinstance(job.get("_fire_claim_rollback"), dict):
-            try:
-                restored = rollback_fire_claim_setup(job)
-            except Exception:
-                restored = False
-                rollback_errored = True
-                logger.warning(
-                    "Job '%s': failed to restore fire claim after pre-run abort; "
-                    "the persisted claim remains a recovery witness",
-                    job_id,
-                    exc_info=True,
-                )
-            if not restored:
-                logger.warning(
-                    "Job '%s': pre-run abort could not restore the exact fire "
-                    "claim; a newer owner or the persisted claim is authoritative",
-                    job_id,
-                )
-        if rollback_errored:
-            execution_id = job.get("execution_id")
-            try:
-                released = bool(execution_id) and release_execution_for_recovery(
-                    str(execution_id), error=error
-                )
-            except Exception:
-                released = False
-                logger.warning(
-                    "Job '%s': failed to release the unstarted execution for "
-                    "periodic recovery",
-                    job_id,
-                    exc_info=True,
-                )
-            if released:
-                # Do not terminalize this row: it is the durable fallback
-                # witness from which the normal interrupted-recovery path will
-                # reconstruct the owed retry once jobs-store I/O is healthy.
-                return
-        _finish_unstarted(error)
+        from cron.scheduler_provider import abort_fire_claim_execution
+
+        abort_fire_claim_execution(job, error)
 
     try:
         owns_fire_claim = heartbeat_fire_claim(job_id, expected_owner=owner)
@@ -6649,11 +6598,6 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         return True
 
     try:
-        # This is the pre-run commit point: ownership was just validated and a
-        # renewal monitor is live. Only now may the interrupted-retry ACK and
-        # rollback snapshot be consumed. Every earlier exit restores the owed
-        # occurrence instead of postponing it to the ordinary cadence.
-        finalize_fire_claim_setup(job)
         return run(lost_ownership)
     finally:
         stop.set()
@@ -6769,45 +6713,55 @@ def _run_one_job_body(
     delivery_attempted = False
     delivery_error = None
     try:
-        # Pre-run dispatch claim (issue #38758): atomically commit a finite
-        # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
-        # mid-execution (gateway kill, OOM, segfault, hard-timeout) cannot
-        # re-fire the job forever on restart. No-op for recurring jobs (they
-        # use advance_next_run) and infinite/no-repeat jobs. This lives here in
-        # the shared body so BOTH the built-in ticker and the external provider
-        # (Chronos fire_due) get at-most-times semantics.
-        if not claim_dispatch(job["id"]):
-            logger.info(
-                "Job '%s': one-shot dispatch limit reached — skipping",
-                job.get("name", job["id"]),
-            )
-            finish_execution(
-                execution_id,
-                success=False,
-                error="Dispatch claim rejected; execution was not started.",
-            )
-            return True  # not an error — already handled/removed
+        from cron.scheduler_provider import abort_fire_claim_execution
 
-        # The attempt is claimed durably before executor/provider dispatch and
-        # becomes running only immediately before the actual run.
-        mark_execution_running(execution_id)
-
-        # Run the job under the profile's secret scope. get_secret() fails
-        # closed outside a scope once profile isolation is in play (multiple
-        # gateway profiles / room→profile multiplexing), and cron fires from
-        # the ticker thread where no per-turn scope is installed — so
-        # resolve_runtime_provider() raised UnscopedSecretError before model
-        # selection, breaking every cron job. Mirrors the per-turn pattern in
-        # gateway/run.py (_profile_runtime_scope).
+        # Prepare every fallible pre-run dependency while the exact jobs-store
+        # rollback witness is still available. The witness is finalized only
+        # after the ledger row is running and finite one-shot dispatch has
+        # durably committed.
         from agent.secret_scope import (
             build_profile_secret_scope,
             reset_secret_scope,
             set_secret_scope,
         )
 
-        _scope_token = set_secret_scope(
-            build_profile_secret_scope(_get_hermes_home())
-        )
+        _scope_token = None
+        dispatch_outcome_ambiguous = False
+        try:
+            # Cron fires outside a gateway turn, so establish the profile's
+            # secret scope before committing any execution-side state.
+            _scope_token = set_secret_scope(
+                build_profile_secret_scope(_get_hermes_home())
+            )
+            if mark_execution_running(execution_id) is None:
+                raise RuntimeError(
+                    "Execution ledger row could not enter running state."
+                )
+            # Finite one-shots claim capacity before the side effect. This is
+            # the last persistence boundary before the user workload begins.
+            try:
+                dispatch_claimed = claim_dispatch(job["id"])
+            except Exception:
+                dispatch_outcome_ambiguous = True
+                raise
+            if not dispatch_claimed:
+                raise RuntimeError(
+                    "Dispatch claim rejected; execution was not started."
+                )
+        except Exception as pre_run_error:
+            if _scope_token is not None:
+                reset_secret_scope(_scope_token)
+            abort_fire_claim_execution(
+                job,
+                str(pre_run_error),
+                prefer_recovery=dispatch_outcome_ambiguous,
+            )
+            return True
+
+        # No fallible persistence or thread setup remains between this commit
+        # point and invoking the user workload.
+        finalize_fire_claim_setup(job)
+
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
         # its finally block; doing that before _deliver_result runs means the

@@ -817,6 +817,9 @@ def _run_claimed_job(
     job_id = job["id"]
     _registered = already_registered
     fire_owner = None
+    _heartbeat_stop = None
+    _heartbeat_thread = None
+    _run_started = False
     try:
         from cron.scheduler import (
             release_running_job,
@@ -871,7 +874,6 @@ def _run_claimed_job(
             activity_cb = None
 
         _heartbeat_stop = threading.Event()
-        _heartbeat_thread = None
 
         if activity_cb is not None:
             job_name = str(job.get("name") or job_id)
@@ -923,6 +925,7 @@ def _run_claimed_job(
 
         try:
             try:
+                _run_started = True
                 processed = run_one_job(
                     job, adapters=adapters, loop=gateway_loop,
                     extra_prompt=extra_prompt,
@@ -944,6 +947,10 @@ def _run_claimed_job(
 
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
+        if _heartbeat_stop is not None:
+            _heartbeat_stop.set()
+        if _heartbeat_thread is not None and _heartbeat_thread.ident is not None:
+            _heartbeat_thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)
         if _registered:
             # Registration succeeded but we raised before the run's own
             # release ran (e.g. heartbeat setup) — don't leave the job
@@ -955,15 +962,26 @@ def _run_claimed_job(
                 _release(job_id)
             except Exception:
                 pass
-        try:
-            mark_job_run(
-                job_id,
-                False,
-                str(e),
-                expected_fire_owner=fire_owner,
-            )
-        except Exception:
-            pass
+        if not _run_started:
+            try:
+                from cron.scheduler_provider import abort_fire_claim_execution
+
+                abort_fire_claim_execution(job, str(e))
+            except Exception:
+                logger.exception(
+                    "Failed to restore cron job %s after manual pre-run abort",
+                    job_id,
+                )
+        else:
+            try:
+                mark_job_run(
+                    job_id,
+                    False,
+                    str(e),
+                    expected_fire_owner=fire_owner,
+                )
+            except Exception:
+                pass
         return {
             "claimed": True,
             "success": False,

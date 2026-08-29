@@ -254,6 +254,38 @@ class TestCronjobRunExecutesImmediately:
         finally:
             set_activity_callback(None)
 
+    def test_activity_heartbeat_start_failure_restores_claimed_job(self):
+        """A manual pre-run thread failure must not consume an owed retry."""
+        claimed = {
+            **_JOB,
+            "execution_id": "exec-heartbeat-start",
+            "fire_claim": {"by": "manual-owner"},
+            "_fire_claim_rollback": {"interrupted_retry": {}},
+        }
+        set_activity_callback(lambda _description: None)
+        try:
+            with patch(
+                "tools.cronjob_tools.claim_job_for_fire", return_value=claimed
+            ), patch(
+                "tools.cronjob_tools.threading.Thread.start",
+                side_effect=RuntimeError("thread unavailable"),
+            ), patch(
+                "cron.scheduler_provider.abort_fire_claim_execution"
+            ) as m_abort, patch(
+                "tools.cronjob_tools.mark_job_run"
+            ) as m_mark, patch(
+                "cron.scheduler.run_one_job"
+            ) as m_run:
+                result = _execute_job_now(dict(_JOB))
+
+            assert result["success"] is False
+            assert "thread unavailable" in result["error"]
+            m_abort.assert_called_once_with(claimed, "thread unavailable")
+            m_mark.assert_not_called()
+            m_run.assert_not_called()
+        finally:
+            set_activity_callback(None)
+
     def test_heartbeat_stops_at_ceiling_but_job_completes(self):
         """Past _CRON_RUN_HEARTBEAT_CEILING the heartbeat stops (so the
         gateway watchdog regains authority over a wedged run) while the job
