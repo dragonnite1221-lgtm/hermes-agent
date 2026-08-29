@@ -538,10 +538,12 @@ from cron.jobs import (
     claim_job_for_fire,
     fire_claim_fence,
     clear_run_claim,
+    finalize_fire_claim_setup,
     get_due_jobs,
     heartbeat_fire_claim,
     heartbeat_run_claim,
     mark_job_run,
+    rollback_fire_claim_setup,
     save_job_output,
     use_cron_store,
 )
@@ -552,6 +554,7 @@ from cron.executions import (
     heartbeat_execution,
     mark_execution_running,
     mark_fire_claim_acquired,
+    release_execution_for_recovery,
 )
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -6509,6 +6512,48 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                 exc_info=True,
             )
 
+    def _abort_unstarted(error: str) -> None:
+        """Restore a provisionally consumed occurrence, then close its row."""
+        rollback_errored = False
+        if isinstance(job.get("_fire_claim_rollback"), dict):
+            try:
+                restored = rollback_fire_claim_setup(job)
+            except Exception:
+                restored = False
+                rollback_errored = True
+                logger.warning(
+                    "Job '%s': failed to restore fire claim after pre-run abort; "
+                    "the persisted claim remains a recovery witness",
+                    job_id,
+                    exc_info=True,
+                )
+            if not restored:
+                logger.warning(
+                    "Job '%s': pre-run abort could not restore the exact fire "
+                    "claim; a newer owner or the persisted claim is authoritative",
+                    job_id,
+                )
+        if rollback_errored:
+            execution_id = job.get("execution_id")
+            try:
+                released = bool(execution_id) and release_execution_for_recovery(
+                    str(execution_id), error=error
+                )
+            except Exception:
+                released = False
+                logger.warning(
+                    "Job '%s': failed to release the unstarted execution for "
+                    "periodic recovery",
+                    job_id,
+                    exc_info=True,
+                )
+            if released:
+                # Do not terminalize this row: it is the durable fallback
+                # witness from which the normal interrupted-recovery path will
+                # reconstruct the owed retry once jobs-store I/O is healthy.
+                return
+        _finish_unstarted(error)
+
     try:
         owns_fire_claim = heartbeat_fire_claim(job_id, expected_owner=owner)
     except Exception:
@@ -6517,7 +6562,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
             job_id,
             exc_info=True,
         )
-        _finish_unstarted(
+        _abort_unstarted(
             "Fire claim ownership could not be validated before execution started."
         )
         return True
@@ -6527,7 +6572,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
             "Job '%s': fire claim ownership was already lost before execution",
             job_id,
         )
-        _finish_unstarted("Fire claim ownership lost before execution started.")
+        _abort_unstarted("Fire claim ownership lost before execution started.")
         return True
     execution_id = str(job.get("execution_id") or "")
     if execution_id:
@@ -6598,12 +6643,17 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
             job_id,
             exc_info=True,
         )
-        _finish_unstarted(
+        _abort_unstarted(
             "Fire claim heartbeat could not be started; execution was not run."
         )
         return True
 
     try:
+        # This is the pre-run commit point: ownership was just validated and a
+        # renewal monitor is live. Only now may the interrupted-retry ACK and
+        # rollback snapshot be consumed. Every earlier exit restores the owed
+        # occurrence instead of postponing it to the ordinary cadence.
+        finalize_fire_claim_setup(job)
         return run(lost_ownership)
     finally:
         stop.set()

@@ -394,6 +394,30 @@ def finish_execution(
     return record
 
 
+def release_execution_for_recovery(
+    execution_id: str, *, error: Optional[str] = None
+) -> bool:
+    """Durably relinquish an unstarted attempt to interrupted recovery.
+
+    This is the fallback when the exact jobs-store rollback cannot be written.
+    Keeping the acquired execution active preserves the cross-store witness;
+    replacing its local owner identity with a provably dead PID makes the next
+    periodic recovery pass classify and requeue it without waiting for the
+    still-healthy gateway process to restart.
+    """
+    now = _hermes_now().isoformat()
+    detail = str(error) if error else "Pre-run setup aborted before execution."
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions
+               SET process_id=?, pid=-1, process_started_at=NULL,
+                   heartbeat_at=?, error=?
+               WHERE id=? AND status='claimed' AND fire_claim_acquired=1""",
+            (f"released:{uuid.uuid4().hex}", now, detail, str(execution_id)),
+        )
+    return cur.rowcount == 1
+
+
 def discard_unacquired_execution(execution_id: str) -> bool:
     """Remove a ledger-first row when the corresponding job claim lost."""
     with _transaction() as conn:

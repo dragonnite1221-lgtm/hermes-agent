@@ -48,7 +48,7 @@ def commit_fire_claim_execution(
         discard_unacquired_execution,
         mark_fire_claim_acquired,
     )
-    from cron.jobs import finalize_fire_claim_setup, rollback_fire_claim_setup
+    from cron.jobs import rollback_fire_claim_setup
 
     last_error: Exception | None = None
     for _attempt in range(max(1, attempts)):
@@ -58,7 +58,10 @@ def commit_fire_claim_execution(
             last_error = exc
             continue
         if record is not None:
-            finalize_fire_claim_setup(claimed_job)
+            # Keep the exact jobs-store rollback witness until run_one_job has
+            # validated the durable claim and started its renewal monitor.
+            # A fenced ledger row alone does not mean the job actually began:
+            # pre-run heartbeat validation can still fail closed.
             return record
         last_error = RuntimeError("execution row was not claimable")
 
