@@ -75,6 +75,31 @@ def test_discard_unacquired_execution_removes_only_claimed_attempt(monkeypatch, 
     assert executions.latest_execution("running")["status"] == "running"
 
 
+def test_provisional_execution_emits_claimed_only_after_fire_fence(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    emitted = []
+    monkeypatch.setattr(
+        executions,
+        "_emit_execution_state",
+        lambda record, **_kwargs: emitted.append(dict(record)),
+    )
+
+    provisional = executions.create_execution(
+        "external-job", source="external", fire_claim_acquired=False
+    )
+    assert emitted == []
+
+    assert executions.mark_fire_claim_acquired(provisional["id"]) is not None
+    assert [record["status"] for record in emitted] == ["claimed"]
+
+    # Fence confirmation is idempotent and must not duplicate lifecycle
+    # telemetry for retries that only re-read the committed winner.
+    assert executions.mark_fire_claim_acquired(provisional["id"]) is not None
+    assert [record["status"] for record in emitted] == ["claimed"]
+
+
 def test_foreign_lease_observations_are_globally_bounded_and_active_only(
     monkeypatch, tmp_path
 ):

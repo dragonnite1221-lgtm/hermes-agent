@@ -620,7 +620,7 @@ def test_recovery_waits_for_side_effect_fence_while_owner_renews(
     assert "interrupted_retry" not in jobs.get_job(job["id"])
 
 
-def test_same_process_recovery_intent_survives_total_ledger_outage(
+def test_ambiguous_abort_restores_occurrence_during_total_ledger_outage(
     isolated_cron, monkeypatch
 ):
     from cron.scheduler_provider import (
@@ -642,19 +642,17 @@ def test_same_process_recovery_intent_survives_total_ledger_outage(
         claimed,
         "ambiguous dispatch outcome",
         prefer_recovery=True,
-    ) == "closed"
+    ) == "restored"
     monkeypatch.setattr(executions, "_transaction", real_transaction)
 
-    stranded = executions.latest_execution(job["id"])
-    assert stranded["id"] == execution_id
-    assert stranded["process_id"] == executions._PROCESS_ID
-    assert stranded["status"] == "claimed"
-
-    assert executions.recover_interrupted_executions() == 1
+    restored = jobs.get_job(job["id"])
+    assert restored["fire_claim"] is None
+    assert restored["_pre_run_abort_execution_ids"] == [execution_id]
+    assert executions.recover_interrupted_executions() == 0
     recovered = executions.latest_execution(job["id"])
-    assert recovered["status"] == "unknown"
-    retry = jobs.get_job(job["id"])["interrupted_retry"]
-    assert retry["execution_ids"] == [execution_id]
+    assert recovered["status"] == "failed"
+    assert "_pre_run_abort_execution_ids" not in jobs.get_job(job["id"])
+    assert "interrupted_retry" not in jobs.get_job(job["id"])
 
 
 def test_restored_pre_run_abort_tombstone_prevents_late_duplicate_retry(
@@ -731,6 +729,46 @@ def test_clean_pre_run_rollback_releases_exact_oneshot_due_claim(
     clock[0] += timedelta(seconds=1)
     assert [candidate["id"] for candidate in jobs.get_due_jobs()] == [job["id"]]
     assert jobs.get_job(job["id"])["run_claim"]["at"] != due_claim["at"]
+
+
+def test_ambiguous_oneshot_dispatch_is_exactly_rolled_back_before_retry(
+    isolated_cron, monkeypatch
+):
+    from cron.scheduler_provider import abort_fire_claim_execution
+    from plugins.cron_providers.chronos import ChronosCronScheduler
+
+    now = datetime(2026, 8, 30, 3, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    job = jobs.create_job(
+        prompt=None,
+        schedule=(now + timedelta(minutes=1)).isoformat(),
+        script="idempotent-sync.py",
+        no_agent=True,
+        deliver="local",
+    )
+    before = jobs.get_job(job["id"])
+    claimed = ChronosCronScheduler().claim_fire(job["id"])
+    assert isinstance(claimed, dict)
+    assert claimed["_aborted_fire_rearm_delay_seconds"] == 5
+
+    # Model a jobs-store save that committed the finite dispatch increment but
+    # raised before claim_dispatch() could acknowledge it to the caller.
+    assert jobs.claim_dispatch(job["id"]) is True
+    assert jobs.get_job(job["id"])["repeat"]["completed"] == 1
+
+    assert abort_fire_claim_execution(
+        claimed,
+        "ambiguous dispatch outcome",
+        prefer_recovery=True,
+    ) == "restored"
+    restored = jobs.get_job(job["id"])
+    assert restored["fire_claim"] is None
+    assert restored["repeat"] == before["repeat"]
+    assert restored["next_run_at"] == (
+        now + timedelta(minutes=1, microseconds=1)
+    ).isoformat()
+    assert "_pre_run_abort_execution_ids" not in restored
+    assert executions.latest_execution(job["id"])["status"] == "failed"
 
 
 def test_concurrent_recovery_winner_preserves_interrupted_retry(
@@ -1464,7 +1502,7 @@ def test_pre_run_rollback_io_failure_releases_attempt_for_periodic_recovery(
     def _heartbeat_error(*_args, **_kwargs):
         raise OSError("jobs store unavailable")
 
-    def _rollback_error(_claimed):
+    def _rollback_error(_claimed, **_kwargs):
         raise OSError("jobs store still unavailable")
 
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", _heartbeat_error)
@@ -1595,7 +1633,8 @@ def test_ambiguous_oneshot_dispatch_is_recovered_with_its_capacity(
     executions.mark_interrupted_executions_unknown(
         [abandoned["id"]], retry_job_ids={job["id"]}
     )
-    assert jobs.get_job(job["id"])["repeat"]["completed"] == 0
+    before = jobs.get_job(job["id"])
+    assert before["repeat"]["completed"] == 0
     claimed = claim_fire_with_execution(job["id"], source="direct")
     replacement_id = claimed["execution_id"]
     real_claim_dispatch = jobs.claim_dispatch
@@ -1607,9 +1646,11 @@ def test_ambiguous_oneshot_dispatch_is_recovered_with_its_capacity(
     monkeypatch.setattr(scheduler, "claim_dispatch", _ambiguous_dispatch)
 
     assert scheduler.run_one_job(claimed) is False
-    assert jobs.get_job(job["id"])["repeat"]["completed"] == 1
-
-    assert executions.recover_interrupted_executions() == 1
     recovered = jobs.get_job(job["id"])
     assert recovered["repeat"]["completed"] == 0
-    assert recovered["interrupted_retry"]["execution_ids"] == [replacement_id]
+    assert recovered["interrupted_retry"] == before["interrupted_retry"]
+    assert recovered["next_run_at"] == before["next_run_at"]
+    assert recovered["fire_claim"] is None
+    assert executions.latest_execution(job["id"])["id"] == replacement_id
+    assert executions.latest_execution(job["id"])["status"] == "failed"
+    assert executions.recover_interrupted_executions() == 0

@@ -376,7 +376,13 @@ def create_execution(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone()
     record = _record(row)
-    _emit_execution_state(record)
+    # Ledger-first external dispatches are provisional until the jobs-store
+    # fire-claim CAS is durably fenced below.  Emitting here and again from
+    # ``mark_fire_claim_acquired`` produces two indistinguishable ``claimed``
+    # lifecycle events for the winner (and a phantom event for every loser).
+    # Direct/built-in callers already own their claim and still emit now.
+    if fire_claim_acquired:
+        _emit_execution_state(record)
     return record  # type: ignore[return-value]
 
 

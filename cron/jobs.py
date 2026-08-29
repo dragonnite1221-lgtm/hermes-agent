@@ -3571,6 +3571,7 @@ def _claim_job_for_fire_locked(
                 for key in (
                     "next_run_at",
                     "interrupted_retry",
+                    "repeat",
                     "enabled",
                     "state",
                     "paused_at",
@@ -3611,6 +3612,7 @@ def _claim_job_for_fire_locked(
                 if (
                     snapshot["present"] == snapshot["claimed_present"]
                     and snapshot["value"] == snapshot["claimed_value"]
+                    and key not in {"next_run_at", "repeat"}
                 ):
                     rollback.pop(key)
             if "interrupted_retry" in rollback:
@@ -3659,7 +3661,11 @@ class FireClaimRollbackUnavailableError(RuntimeError):
 
 
 def rollback_fire_claim_setup(
-    claimed_job: Dict[str, Any], *, aborted_execution_id: Optional[str] = None
+    claimed_job: Dict[str, Any],
+    *,
+    aborted_execution_id: Optional[str] = None,
+    allow_dispatched_oneshot: bool = False,
+    fresh_retry_delay_seconds: Optional[int] = None,
 ) -> bool:
     """Restore an occurrence whose execution-ledger fence did not commit.
 
@@ -3755,6 +3761,35 @@ def rollback_fire_claim_setup(
                         (key in job) == snapshot.get("claimed_present")
                         and job.get(key) == snapshot.get("claimed_value")
                     )
+                    if (
+                        not current_matches_claim
+                        and allow_dispatched_oneshot
+                        and key == "repeat"
+                        and _job_schedule_kind(job) == "once"
+                        and isinstance(job.get("repeat"), dict)
+                        and isinstance(snapshot.get("claimed_value"), dict)
+                    ):
+                        # ``claim_dispatch`` is the sole jobs-store mutation
+                        # between the external fire CAS and workload start. A
+                        # save can succeed and still raise to its caller, so
+                        # abort recovery must recognize exactly that one-step
+                        # mutation. Compare every field except ``completed``
+                        # and accept only a +1 transition; any operator edit or
+                        # newer dispatch generation remains authoritative.
+                        current_repeat = copy.deepcopy(job["repeat"])
+                        claimed_repeat = copy.deepcopy(
+                            snapshot["claimed_value"]
+                        )
+                        current_completed = current_repeat.pop("completed", 0)
+                        claimed_completed = claimed_repeat.pop("completed", 0)
+                        current_matches_claim = (
+                            current_repeat == claimed_repeat
+                            and isinstance(current_completed, int)
+                            and not isinstance(current_completed, bool)
+                            and isinstance(claimed_completed, int)
+                            and not isinstance(claimed_completed, bool)
+                            and current_completed == claimed_completed + 1
+                        )
                     if not current_matches_claim and not (
                         key == "next_run_at"
                         and isinstance(retry_snapshot, dict)
@@ -3762,7 +3797,27 @@ def rollback_fire_claim_setup(
                     ):
                         continue
                     if snapshot.get("present"):
-                        job[key] = copy.deepcopy(snapshot.get("value"))
+                        restored_value = copy.deepcopy(snapshot.get("value"))
+                        if (
+                            key == "next_run_at"
+                            and fresh_retry_delay_seconds is not None
+                            and restored_value
+                        ):
+                            retry_at = _hermes_now() + timedelta(
+                                seconds=max(1, int(fresh_retry_delay_seconds))
+                            )
+                            try:
+                                original_at = _ensure_aware(
+                                    datetime.fromisoformat(str(restored_value))
+                                )
+                                if retry_at <= original_at:
+                                    retry_at = original_at + timedelta(
+                                        microseconds=1
+                                    )
+                            except (TypeError, ValueError):
+                                pass
+                            restored_value = retry_at.isoformat()
+                        job[key] = restored_value
                     else:
                         job.pop(key, None)
                 expected_run_claim = rollback.get("_run_claim_to_clear")

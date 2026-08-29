@@ -225,6 +225,17 @@ class ChronosCronScheduler(CronScheduler):
 
     # -- fire -------------------------------------------------------------
 
+    def claim_fire(self, job_id: str, *, force: bool = False) -> dict | None:
+        """Tag the claim so a pre-run rollback assigns a fresh NAS key atomically."""
+        from cron.jobs import ABORTED_FIRE_RETRY_DELAY_SECONDS
+
+        claimed = super().claim_fire(job_id, force=force)
+        if isinstance(claimed, dict):
+            claimed["_aborted_fire_rearm_delay_seconds"] = (
+                ABORTED_FIRE_RETRY_DELAY_SECONDS
+            )
+        return claimed
+
     # NOTE: no ``fire_due`` override on purpose. The base implementation
     # virtually dispatches through ``self.claim_fire``/``self.fire_claimed``,
     # and ``provider_supports_split_fire`` treats ANY ``fire_due`` override
@@ -266,9 +277,20 @@ class ChronosCronScheduler(CronScheduler):
 
         if not ran and restored_fire_at:
             try:
-                rearm_aborted_fire(
-                    job_id, expected_next_run_at=restored_fire_at
-                )
+                current = get_job(job_id)
+                if (
+                    current
+                    and not current.get("fire_claim")
+                    and current.get("next_run_at") == restored_fire_at
+                    and not rearm_aborted_fire(
+                        job_id, expected_next_run_at=restored_fire_at
+                    )
+                ):
+                    logger.error(
+                        "Chronos could not persist a fresh retry for restored "
+                        "job %s",
+                        job_id,
+                    )
             except Exception as e:
                 logger.warning(
                     "Chronos failed to persist a fresh retry for job %s: %s",

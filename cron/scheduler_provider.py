@@ -57,12 +57,30 @@ def abort_fire_claim_execution(
     execution_id = str(claimed_job.get("execution_id") or "")
     rollback_errored = False
     restored = False
-    if not prefer_recovery and isinstance(
-        claimed_job.get("_fire_claim_rollback"), dict
-    ):
+    if prefer_recovery:
+        try:
+            if execution_id:
+                release_execution_for_recovery(execution_id, error=error)
+        except Exception:
+            # release_execution_for_recovery records an in-process recovery
+            # witness before its fallible SQLite write. Keep the active row
+            # non-terminal if the jobs-store rollback also cannot commit.
+            logger.warning(
+                "Job '%s': failed to release its unstarted execution for "
+                "periodic recovery",
+                job_id,
+                exc_info=True,
+            )
+
+    if isinstance(claimed_job.get("_fire_claim_rollback"), dict):
         try:
             restored = rollback_fire_claim_setup(
-                claimed_job, aborted_execution_id=execution_id or None
+                claimed_job,
+                aborted_execution_id=execution_id or None,
+                allow_dispatched_oneshot=prefer_recovery,
+                fresh_retry_delay_seconds=claimed_job.get(
+                    "_aborted_fire_rearm_delay_seconds"
+                ),
             )
         except Exception:
             rollback_errored = True
@@ -73,7 +91,7 @@ def abort_fire_claim_execution(
                 exc_info=True,
             )
 
-    if prefer_recovery or rollback_errored:
+    if not prefer_recovery and rollback_errored:
         try:
             if execution_id and release_execution_for_recovery(
                 execution_id, error=error
@@ -86,6 +104,13 @@ def abort_fire_claim_execution(
                 job_id,
                 exc_info=True,
             )
+
+    # An ambiguous dispatch write is recoverable without waiting for the
+    # generic five-minute stale-owner sweep when the exact jobs-store inverse
+    # above succeeds. If it does not, retain the released/local-intent ledger
+    # witness: terminalizing it here would strand the still-owned fire claim.
+    if prefer_recovery and not restored:
+        return "released"
 
     terminalization_confirmed = False
     if execution_id:
