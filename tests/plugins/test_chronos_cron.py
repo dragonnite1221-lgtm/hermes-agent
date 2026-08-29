@@ -206,8 +206,14 @@ def test_fire_due_no_rearm_when_job_gone(chronos, monkeypatch):
     """repeat-N exhausted / one-shot completed → mark_job_run deleted the job →
     get_job None → no re-arm (the schedule stops cleanly)."""
     prov, fake = chronos
-    monkeypatch.setattr("cron.scheduler_provider.CronScheduler.fire_due",
-                        lambda self, jid, **kw: True)
+    monkeypatch.setattr(
+        "cron.scheduler_provider.CronScheduler.claim_fire",
+        lambda self, jid, **kw: {"id": jid},
+    )
+    monkeypatch.setattr(
+        "cron.scheduler_provider.CronScheduler.fire_claimed",
+        lambda self, job, **kw: True,
+    )
     monkeypatch.setattr("cron.jobs.get_job", lambda jid: None)
 
     assert prov.fire_due("j1") is True
@@ -217,8 +223,10 @@ def test_fire_due_no_rearm_when_job_gone(chronos, monkeypatch):
 def test_fire_due_no_rearm_when_claim_lost(chronos, monkeypatch):
     """If the run didn't happen (claim lost), don't re-arm."""
     prov, fake = chronos
-    monkeypatch.setattr("cron.scheduler_provider.CronScheduler.fire_due",
-                        lambda self, jid, **kw: False)
+    monkeypatch.setattr(
+        "cron.scheduler_provider.CronScheduler.claim_fire",
+        lambda self, jid, **kw: None,
+    )
 
     assert prov.fire_due("j1") is False
     assert fake.provisions == []
@@ -243,15 +251,21 @@ def test_chronos_is_split_fire_capable(chronos):
     assert provider_supports_fire_cancel(prov) is True
 
 
-def test_fire_claimed_no_rearm_when_run_failed(chronos, monkeypatch):
+def test_fire_claimed_rearms_persisted_retry_when_run_aborts(chronos, monkeypatch):
     prov, fake = chronos
+    persisted = {
+        "id": "j1",
+        "enabled": True,
+        "next_run_at": "2026-06-18T12:05:00+00:00",
+    }
     monkeypatch.setattr(
         "cron.scheduler_provider.CronScheduler.fire_claimed",
         lambda self, job, **kw: False,
     )
+    monkeypatch.setattr("cron.jobs.get_job", lambda jid: persisted)
 
     assert prov.fire_claimed({"id": "j1"}) is False
-    assert fake.provisions == []
+    assert [provision["job_id"] for provision in fake.provisions] == ["j1"]
 
 
 def test_fire_claimed_no_rearm_when_job_gone(chronos, monkeypatch):
