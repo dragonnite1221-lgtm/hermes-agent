@@ -2291,7 +2291,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             if cancel_interrupted_retry:
                 updated.pop("interrupted_retry", None)
-                if updated.get("schedule", {}).get("kind") == "once":
+                if (
+                    updated.get("schedule", {}).get("kind") == "once"
+                    and not schedule_changed
+                ):
                     repeat = updated.get("repeat")
                     if isinstance(repeat, dict):
                         times = repeat.get("times")
@@ -2310,6 +2313,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                         "Interrupted execution was not retried because the explicit "
                         "retry policy was disabled. Side effects remain unknown."
                     )
+                elif updated.get("schedule", {}).get("kind") == "once":
+                    # A simultaneously supplied schedule is a replacement
+                    # occurrence, not the canceled interrupted attempt. Keep
+                    # the newly computed one-shot runnable exactly once.
+                    if updated.get("state") != "paused":
+                        updated["enabled"] = True
+                        updated["state"] = "scheduled"
+                        updated["next_run_at"] = compute_next_run(updated["schedule"])
                 elif updated.get("state") != "paused":
                     updated["next_run_at"] = compute_next_run(updated["schedule"])
 

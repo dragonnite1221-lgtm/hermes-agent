@@ -112,6 +112,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              PRIMARY KEY (execution_id, observer_boot_id)
            )"""
     )
+    _prune_foreign_lease_observations_unlocked(conn)
 
 
 @contextmanager
@@ -263,15 +264,7 @@ def _foreign_owner_lease_is_stale(row: sqlite3.Row) -> bool:
                      observed_monotonic=excluded.observed_monotonic""",
                 (execution_id, observer_boot_id, generation, observed_now),
             )
-            conn.execute(
-                """DELETE FROM foreign_lease_observations WHERE rowid IN (
-                     SELECT rowid FROM foreign_lease_observations
-                     WHERE observer_boot_id=?
-                     ORDER BY observed_monotonic DESC
-                     LIMIT -1 OFFSET ?
-                   )""",
-                (observer_boot_id, _MAX_FOREIGN_LEASE_OBSERVATIONS),
-            )
+            _prune_foreign_lease_observations_unlocked(conn)
             return False
         return (
             observed_now - float(previous["observed_monotonic"])
@@ -301,6 +294,25 @@ def _owner_lease_is_stale(
     return _foreign_owner_lease_is_stale(row)
 
 
+def _prune_foreign_lease_observations_unlocked(conn: sqlite3.Connection) -> None:
+    """Keep only bounded observations for executions that are still active."""
+    conn.execute(
+        """DELETE FROM foreign_lease_observations
+           WHERE NOT EXISTS (
+             SELECT 1 FROM executions
+             WHERE executions.id = foreign_lease_observations.execution_id
+               AND executions.status IN ('claimed','running')
+           )"""
+    )
+    conn.execute(
+        """DELETE FROM foreign_lease_observations WHERE rowid IN (
+             SELECT rowid FROM foreign_lease_observations
+             ORDER BY rowid DESC LIMIT -1 OFFSET ?
+           )""",
+        (max(0, int(_MAX_FOREIGN_LEASE_OBSERVATIONS)),),
+    )
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
     conn.execute(
@@ -311,6 +323,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
            )""",
         (limit,),
     )
+    _prune_foreign_lease_observations_unlocked(conn)
 
 
 def create_execution(
@@ -733,6 +746,11 @@ def recover_interrupted_executions() -> int:
         )
         recovered_ids = {str(row["id"]) for row in recovered}
         lost_ids = {str(row["id"]) for row in candidates} - recovered_ids
+        # Another replica may have won the identical terminalization CAS after
+        # this process requeued the marker.  Its unknown+ACK transaction proves
+        # the retry handoff succeeded; only an owner renewal should roll it back.
+        _, concurrently_recovered_ids = interrupted_retry_states(lost_ids)
+        lost_ids -= concurrently_recovered_ids
         if lost_ids:
             cancel_interrupted_retry_executions(lost_ids)
         if requeued:

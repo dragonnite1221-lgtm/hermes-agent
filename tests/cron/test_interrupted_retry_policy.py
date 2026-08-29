@@ -407,6 +407,33 @@ def test_recovery_heartbeat_race_cancels_retry_and_restores_schedule(
     assert executions.latest_execution(job["id"])["status"] == "running"
 
 
+def test_concurrent_recovery_winner_preserves_interrupted_retry(
+    isolated_cron, monkeypatch
+):
+    job = _script_job(retry_interrupted=True)
+    execution = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(execution["id"])
+    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-scheduler")
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_args: False)
+    real_mark_unknown = executions.mark_interrupted_executions_unknown
+
+    def concurrent_winner(execution_ids, **kwargs):
+        assert real_mark_unknown(execution_ids, **kwargs)
+        return []
+
+    monkeypatch.setattr(
+        executions, "mark_interrupted_executions_unknown", concurrent_winner
+    )
+
+    assert executions.recover_interrupted_executions() == 0
+    recovered = jobs.get_job(job["id"])
+    assert recovered["interrupted_retry"]["execution_ids"] == [execution["id"]]
+    assert executions.execution_ids_are_terminal(
+        [execution["id"]], job_id=job["id"]
+    ) is True
+    assert executions.latest_execution(job["id"])["status"] == "unknown"
+
+
 def test_recovery_crash_marker_is_reconciled_after_owner_renews(
     isolated_cron,
 ):
@@ -802,6 +829,36 @@ def test_disabling_retry_policy_terminalizes_pending_oneshot(isolated_cron):
     assert updated["last_status"] == "unknown"
     assert updated["next_run_at"] is None
     assert "interrupted_retry" not in updated
+
+
+def test_replacing_pending_oneshot_while_disabling_retry_keeps_new_schedule(
+    isolated_cron,
+):
+    now = datetime.now(timezone.utc)
+    job = jobs.create_job(
+        prompt=None,
+        schedule=(now + timedelta(minutes=1)).isoformat(),
+        script="idempotent-sync.py",
+        no_agent=True,
+        deliver="local",
+        retry_interrupted=True,
+    )
+    jobs.update_job(job["id"], {"repeat": {"times": 1, "completed": 1}})
+    execution = {"id": "exec-once-replaced", "job_id": job["id"]}
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+    replacement = now + timedelta(hours=2)
+
+    updated = jobs.update_job(
+        job["id"],
+        {"schedule": replacement.isoformat(), "retry_interrupted": False},
+    )
+
+    assert updated["retry_interrupted"] is False
+    assert "interrupted_retry" not in updated
+    assert updated["enabled"] is True
+    assert updated["state"] == "scheduled"
+    assert updated["repeat"] == {"times": 1, "completed": 0}
+    assert datetime.fromisoformat(updated["next_run_at"]) == replacement
 
 
 @pytest.mark.parametrize(

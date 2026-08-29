@@ -75,6 +75,38 @@ def test_discard_unacquired_execution_removes_only_claimed_attempt(monkeypatch, 
     assert executions.latest_execution("running")["status"] == "running"
 
 
+def test_foreign_lease_observations_are_globally_bounded_and_active_only(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "_MAX_FOREIGN_LEASE_OBSERVATIONS", 2)
+    active = [
+        executions.create_execution(f"active-{index}", source="external")
+        for index in range(3)
+    ]
+    with executions._transaction() as conn:
+        conn.executemany(
+            """INSERT INTO foreign_lease_observations
+               (execution_id, observer_boot_id, generation, observed_monotonic)
+               VALUES (?, ?, ?, ?)""",
+            [
+                (record["id"], f"old-boot-{index}", "generation", float(index))
+                for index, record in enumerate(active)
+            ]
+            + [("missing-execution", "old-boot-missing", "generation", 99.0)],
+        )
+        executions._prune_foreign_lease_observations_unlocked(conn)
+        rows = conn.execute(
+            "SELECT execution_id, observer_boot_id FROM foreign_lease_observations"
+        ).fetchall()
+
+    assert len(rows) == 2
+    assert {row["execution_id"] for row in rows} <= {
+        record["id"] for record in active
+    }
+    assert len({row["observer_boot_id"] for row in rows}) == 2
+
+
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("immutable", source="builtin")
