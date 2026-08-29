@@ -2193,6 +2193,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            cancel_interrupted_retry = (
+                updates.get("retry_interrupted") is False
+                and isinstance(job.get("interrupted_retry"), dict)
+            )
 
             # Re-check execution-mode invariants on the MERGED record when
             # any participating field changes, so create-time invariants
@@ -2267,6 +2271,30 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                             f"{ONESHOT_GRACE_SECONDS}s in the past and cannot be scheduled."
                         )
                     updated["next_run_at"] = updated_next_run
+
+            if cancel_interrupted_retry:
+                updated.pop("interrupted_retry", None)
+                if updated.get("schedule", {}).get("kind") == "once":
+                    repeat = updated.get("repeat")
+                    if isinstance(repeat, dict):
+                        times = repeat.get("times")
+                        completed = repeat.get("completed", 0)
+                        if (
+                            isinstance(times, int)
+                            and isinstance(completed, int)
+                            and completed < times
+                        ):
+                            repeat["completed"] = completed + 1
+                    updated["enabled"] = False
+                    updated["state"] = "error"
+                    updated["next_run_at"] = None
+                    updated["last_status"] = "unknown"
+                    updated["last_error"] = (
+                        "Interrupted execution was not retried because the explicit "
+                        "retry policy was disabled. Side effects remain unknown."
+                    )
+                elif updated.get("state") != "paused":
+                    updated["next_run_at"] = compute_next_run(updated["schedule"])
 
             if inference_fields_changed:
                 provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
@@ -2396,6 +2424,21 @@ def requeue_interrupted_jobs(executions: Collection[Dict[str, Any]]) -> Set[str]
         for job in jobs:
             job_id = str(job.get("id") or "")
             if job_id not in requested or job.get("retry_interrupted") is not True:
+                continue
+            script = job.get("script")
+            script = str(script).strip() if isinstance(script, str) else None
+            try:
+                _validate_interrupted_retry_mode(
+                    True,
+                    no_agent=job.get("no_agent") is True,
+                    script=script or None,
+                )
+            except ValueError as exc:
+                logger.error(
+                    "Job '%s': refusing invalid interrupted retry policy: %s",
+                    job_id,
+                    exc,
+                )
                 continue
             if not is_job_runnable(job):
                 continue
@@ -3077,7 +3120,9 @@ def _claim_job_for_fire_locked(
                 try:
                     from cron.executions import execution_ids_are_terminal
 
-                    retry_acknowledged = execution_ids_are_terminal(execution_ids or [])
+                    retry_acknowledged = execution_ids_are_terminal(
+                        execution_ids or [], job_id=job_id
+                    )
                 except Exception as exc:
                     logger.warning(
                         "Job '%s': cannot verify interrupted retry ledger handoff: %s",
@@ -3102,6 +3147,20 @@ def _claim_job_for_fire_locked(
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
+            if isinstance(interrupted_retry, dict):
+                try:
+                    from cron.executions import forget_interrupted_retry_acks
+
+                    forget_interrupted_retry_acks(
+                        interrupted_retry.get("execution_ids") or [],
+                        job_id=job_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Job '%s': consumed retry acknowledgement cleanup failed: %s",
+                        job_id,
+                        exc,
+                    )
             return copy.deepcopy(job) if return_job else True
         return False
 

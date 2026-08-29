@@ -180,3 +180,89 @@ def test_retry_cannot_fire_before_execution_ledger_handoff_commits(
     claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
     assert isinstance(claimed, dict)
     assert "interrupted_retry" not in jobs.get_job(job["id"])
+
+
+def test_terminal_retry_ack_survives_execution_pruning(isolated_cron, monkeypatch):
+    now = datetime(2026, 8, 29, 7, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    job = _script_job(retry_interrupted=True)
+    execution = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(execution["id"])
+
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+    recovered = executions.mark_interrupted_executions_unknown(
+        [execution["id"]], retry_job_ids={job["id"]}
+    )
+    assert [row["id"] for row in recovered] == [execution["id"]]
+    assert executions.latest_execution(job["id"]) is None
+    assert executions.execution_ids_are_terminal(
+        [execution["id"]], job_id=job["id"]
+    ) is True
+    assert executions.execution_ids_are_terminal(
+        [execution["id"]], job_id="different-job"
+    ) is False
+    assert isinstance(jobs.claim_job_for_fire(job["id"], return_job=True), dict)
+    assert executions.execution_ids_are_terminal(
+        [execution["id"]], job_id=job["id"]
+    ) is False
+
+
+def test_disabling_retry_policy_cancels_pending_recurring_retry(isolated_cron):
+    job = _script_job(retry_interrupted=True)
+    execution = {"id": "exec-recurring", "job_id": job["id"]}
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+
+    updated = jobs.update_job(job["id"], {"retry_interrupted": False})
+
+    assert updated["retry_interrupted"] is False
+    assert "interrupted_retry" not in updated
+    assert datetime.fromisoformat(updated["next_run_at"]) > datetime.now(timezone.utc)
+
+
+def test_disabling_retry_policy_terminalizes_pending_oneshot(isolated_cron):
+    now = datetime.now(timezone.utc)
+    job = jobs.create_job(
+        prompt=None,
+        schedule=(now + timedelta(minutes=1)).isoformat(),
+        script="idempotent-sync.py",
+        no_agent=True,
+        deliver="local",
+        retry_interrupted=True,
+    )
+    jobs.update_job(job["id"], {"repeat": {"times": 1, "completed": 1}})
+    execution = {"id": "exec-once-cancel", "job_id": job["id"]}
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+
+    updated = jobs.update_job(job["id"], {"retry_interrupted": False})
+
+    assert updated["repeat"] == {"times": 1, "completed": 1}
+    assert updated["enabled"] is False
+    assert updated["state"] == "error"
+    assert updated["last_status"] == "unknown"
+    assert updated["next_run_at"] is None
+    assert "interrupted_retry" not in updated
+
+
+@pytest.mark.parametrize(
+    ("no_agent", "script"),
+    [(False, "unsafe-agent.py"), ("yes", "unsafe-agent.py"), (True, None)],
+)
+def test_recovery_revalidates_hand_edited_retry_policy(
+    isolated_cron, no_agent, script
+):
+    job = _script_job()
+    with jobs._jobs_lock():
+        stored = jobs.load_jobs()
+        stored[0]["retry_interrupted"] = True
+        stored[0]["no_agent"] = no_agent
+        stored[0]["script"] = script
+        jobs.save_jobs(stored)
+
+    before = jobs.get_job(job["id"])["next_run_at"]
+    assert jobs.requeue_interrupted_jobs([
+        {"id": "exec-invalid", "job_id": job["id"]}
+    ]) == set()
+    recovered = jobs.get_job(job["id"])
+    assert recovered["next_run_at"] == before
+    assert "interrupted_retry" not in recovered

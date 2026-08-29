@@ -64,6 +64,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS interrupted_retry_acks (
+             execution_id TEXT PRIMARY KEY,
+             job_id TEXT NOT NULL,
+             terminal_at TEXT NOT NULL
+           )"""
+    )
 
 
 @contextmanager
@@ -219,7 +226,9 @@ def interrupted_execution_candidates() -> List[Dict[str, Any]]:
     return abandoned
 
 
-def execution_ids_are_terminal(execution_ids: Collection[str]) -> bool:
+def execution_ids_are_terminal(
+    execution_ids: Collection[str], *, job_id: str
+) -> bool:
     """Return true only when every requested execution exists and is terminal.
 
     Interrupted-job retry markers are the durable half of a cross-store
@@ -232,14 +241,36 @@ def execution_ids_are_terminal(execution_ids: Collection[str]) -> bool:
     if not ids:
         return False
     placeholders = ",".join("?" for _ in ids)
+    params = tuple(sorted(ids))
     with _transaction() as conn:
         rows = conn.execute(
-            f"SELECT id, status FROM executions WHERE id IN ({placeholders})",
-            tuple(sorted(ids)),
+            f"""SELECT id FROM executions
+                WHERE id IN ({placeholders})
+                  AND job_id = ?
+                  AND status IN ('completed','failed','unknown')
+                UNION
+                SELECT execution_id AS id FROM interrupted_retry_acks
+                WHERE execution_id IN ({placeholders})
+                  AND job_id = ?""",
+            params + (str(job_id),) + params + (str(job_id),),
         ).fetchall()
-    return len(rows) == len(ids) and all(
-        row["status"] in _TERMINAL_STATES for row in rows
-    )
+    return {str(row["id"]) for row in rows} == ids
+
+
+def forget_interrupted_retry_acks(
+    execution_ids: Collection[str], *, job_id: str
+) -> None:
+    """Delete consumed retry acknowledgements after jobs.json commits."""
+    ids = {str(value) for value in execution_ids if value}
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    with _transaction() as conn:
+        conn.execute(
+            f"""DELETE FROM interrupted_retry_acks
+                WHERE execution_id IN ({placeholders}) AND job_id = ?""",
+            tuple(sorted(ids)) + (str(job_id),),
+        )
 
 
 def mark_interrupted_executions_unknown(
@@ -271,6 +302,12 @@ def mark_interrupted_executions_unknown(
                 (now, detail, row["id"]),
             )
             if cur.rowcount:
+                if row["job_id"] in retry_ids:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO interrupted_retry_acks
+                           (execution_id, job_id, terminal_at) VALUES (?, ?, ?)""",
+                        (row["id"], row["job_id"], now),
+                    )
                 record = _record(conn.execute(
                     "SELECT * FROM executions WHERE id=?", (row["id"],)
                 ).fetchone())
