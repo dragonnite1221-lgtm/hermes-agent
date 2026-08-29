@@ -71,14 +71,17 @@ def test_recurring_retry_waits_for_fire_claim_then_survives_due_scan(
     assert recovered["interrupted_retry"]["execution_ids"] == [execution["id"]]
     assert jobs.get_job(default["id"])["next_run_at"] == future
 
-    monkeypatch.setattr(jobs, "_hermes_now", lambda: eligible_at + timedelta(seconds=1))
-    assert jobs.get_due_jobs() == []
+    overdue_retry_at = eligible_at + timedelta(hours=2)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: overdue_retry_at)
+    due_before_handoff = jobs.get_due_jobs()
+    assert opted_in["id"] not in {candidate["id"] for candidate in due_before_handoff}
     executions.mark_interrupted_executions_unknown(
         [execution["id"]], retry_job_ids={opted_in["id"]}
     )
     due = jobs.get_due_jobs()
-    assert [job["id"] for job in due] == [opted_in["id"]]
+    assert opted_in["id"] in {candidate["id"] for candidate in due}
     retry_due_at = jobs.get_job(opted_in["id"])["next_run_at"]
+    assert retry_due_at == eligible_at.isoformat()
     jobs.advance_next_runs([opted_in["id"]])
     assert jobs.get_job(opted_in["id"])["next_run_at"] == retry_due_at
     claimed = jobs.claim_job_for_fire(opted_in["id"], return_job=True)
@@ -526,6 +529,106 @@ def test_recovery_heartbeat_race_cancels_retry_and_restores_schedule(
     assert "interrupted_retry" not in restored
     assert restored["next_run_at"] == before_next_run
     assert executions.latest_execution(job["id"])["status"] == "running"
+
+
+def test_recovery_waits_for_side_effect_fence_while_owner_renews(
+    isolated_cron, monkeypatch
+):
+    import threading
+
+    from cron.scheduler_provider import claim_fire_with_execution
+
+    job = _script_job(retry_interrupted=True)
+    claimed = claim_fire_with_execution(job["id"], source="direct")
+    assert isinstance(claimed, dict)
+    execution_id = claimed["execution_id"]
+    executions.mark_execution_running(execution_id)
+    owner = claimed["fire_claim"]["by"]
+    original_at = claimed["fire_claim"]["at"]
+    candidate = executions.latest_execution(job["id"])
+    candidate["_fire_claim_generation"] = f"{owner}:{original_at}"
+    monkeypatch.setattr(
+        executions, "interrupted_execution_candidates", lambda: [candidate]
+    )
+
+    real_recovery_fence = jobs.fire_recovery_fence
+    recovery_waiting = threading.Event()
+
+    @contextlib.contextmanager
+    def observed_recovery_fence(job_id):
+        recovery_waiting.set()
+        with real_recovery_fence(job_id) as acquired:
+            yield acquired
+
+    monkeypatch.setattr(jobs, "fire_recovery_fence", observed_recovery_fence)
+    bumped = datetime.fromisoformat(original_at) + timedelta(seconds=1)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: bumped)
+    recovery_result = []
+    heartbeat_result = []
+
+    with jobs.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
+        assert owns_claim is True
+        recovery_thread = threading.Thread(
+            target=lambda: recovery_result.append(
+                executions.recover_interrupted_executions()
+            )
+        )
+        recovery_thread.start()
+        assert recovery_waiting.wait(timeout=5)
+
+        heartbeat_thread = threading.Thread(
+            target=lambda: heartbeat_result.append(
+                jobs.heartbeat_fire_claim(job["id"], expected_owner=owner)
+            )
+        )
+        heartbeat_thread.start()
+        heartbeat_thread.join(timeout=2)
+        assert not heartbeat_thread.is_alive()
+        assert heartbeat_result == [True]
+        assert recovery_thread.is_alive()
+
+    recovery_thread.join(timeout=5)
+    assert not recovery_thread.is_alive()
+    assert recovery_result == [0]
+    assert executions.latest_execution(job["id"])["status"] == "running"
+    assert "interrupted_retry" not in jobs.get_job(job["id"])
+
+
+def test_same_process_recovery_intent_survives_total_ledger_outage(
+    isolated_cron, monkeypatch
+):
+    from cron.scheduler_provider import (
+        abort_fire_claim_execution,
+        claim_fire_with_execution,
+    )
+
+    job = _script_job(retry_interrupted=True)
+    claimed = claim_fire_with_execution(job["id"], source="direct")
+    assert isinstance(claimed, dict)
+    execution_id = claimed["execution_id"]
+    real_transaction = executions._transaction
+
+    def ledger_unavailable():
+        raise OSError("executions ledger unavailable")
+
+    monkeypatch.setattr(executions, "_transaction", ledger_unavailable)
+    assert abort_fire_claim_execution(
+        claimed,
+        "ambiguous dispatch outcome",
+        prefer_recovery=True,
+    ) == "closed"
+    monkeypatch.setattr(executions, "_transaction", real_transaction)
+
+    stranded = executions.latest_execution(job["id"])
+    assert stranded["id"] == execution_id
+    assert stranded["process_id"] == executions._PROCESS_ID
+    assert stranded["status"] == "claimed"
+
+    assert executions.recover_interrupted_executions() == 1
+    recovered = executions.latest_execution(job["id"])
+    assert recovered["status"] == "unknown"
+    retry = jobs.get_job(job["id"])["interrupted_retry"]
+    assert retry["execution_ids"] == [execution_id]
 
 
 def test_concurrent_recovery_winner_preserves_interrupted_retry(
@@ -1209,6 +1312,8 @@ def test_pre_run_rollback_lock_failure_releases_attempt_for_periodic_recovery(
     def _heartbeat_error(*_args, **_kwargs):
         raise OSError("jobs store unavailable")
 
+    real_fire_job_lock = cron_jobs._fire_job_lock
+
     @contextlib.contextmanager
     def _unavailable_fire_job_lock(_job_id):
         yield False
@@ -1226,6 +1331,9 @@ def test_pre_run_rollback_lock_failure_releases_attempt_for_periodic_recovery(
     assert replacement["status"] == "claimed"
     assert replacement["pid"] == -1
 
+    # Recovery also fails closed on the same side-effect fence. Once the lock
+    # backend returns, the periodic pass can safely reconstruct the retry.
+    monkeypatch.setattr(cron_jobs, "_fire_job_lock", real_fire_job_lock)
     assert executions.recover_interrupted_executions() == 1
     retry = jobs.get_job(job["id"])["interrupted_retry"]
     assert retry["execution_ids"] == [replacement_id]

@@ -36,6 +36,8 @@ _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 _MAX_FOREIGN_LEASE_OBSERVATIONS = 4096
+_recovery_intent_lock = threading.RLock()
+_recovery_intent_ids: Set[str] = set()
 
 
 def _connect() -> sqlite3.Connection:
@@ -402,6 +404,9 @@ def finish_execution(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone())
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
+    if record is not None:
+        with _recovery_intent_lock:
+            _recovery_intent_ids.discard(str(execution_id))
     return record
 
 
@@ -416,6 +421,13 @@ def release_execution_for_recovery(
     periodic recovery pass classify and requeue it without waiting for the
     still-healthy gateway process to restart.
     """
+    execution_id = str(execution_id)
+    # Record intent before the fallible SQLite write.  If both this update and
+    # the caller's terminal fallback fail during an outage, the same live
+    # process must still be able to distinguish this deliberately relinquished
+    # attempt from its genuinely running executions on the next recovery pass.
+    with _recovery_intent_lock:
+        _recovery_intent_ids.add(execution_id)
     now = _hermes_now().isoformat()
     detail = str(error) if error else "Pre-run setup aborted before execution."
     with _transaction() as conn:
@@ -425,7 +437,7 @@ def release_execution_for_recovery(
                    heartbeat_at=?, error=?
                WHERE id=? AND status IN ('claimed','running')
                  AND fire_claim_acquired=1""",
-            (f"released:{uuid.uuid4().hex}", now, detail, str(execution_id)),
+            (f"released:{uuid.uuid4().hex}", now, detail, execution_id),
         )
     return cur.rowcount == 1
 
@@ -583,9 +595,12 @@ def interrupted_execution_candidates() -> List[Dict[str, Any]]:
                WHERE status IN ('claimed','running') AND fire_claim_acquired=1"""
         ).fetchall()
     for row in rows:
-        if row["process_id"] == _PROCESS_ID:
+        execution_id = str(row["id"])
+        with _recovery_intent_lock:
+            locally_released = execution_id in _recovery_intent_ids
+        if row["process_id"] == _PROCESS_ID and not locally_released:
             continue
-        if not _owner_lease_is_stale(
+        if not locally_released and not _owner_lease_is_stale(
             row,
             local_machine_id=local_machine_id,
             local_boot_id=local_boot_id,
@@ -595,9 +610,7 @@ def interrupted_execution_candidates() -> List[Dict[str, Any]]:
             continue
         record = _record(row)
         if record is not None:
-            record["_fire_claim_generation"] = fire_claim_generations.get(
-                str(row["id"])
-            )
+            record["_fire_claim_generation"] = fire_claim_generations.get(execution_id)
             abandoned.append(record)
     return abandoned
 
@@ -804,47 +817,69 @@ def recover_interrupted_executions() -> int:
         from cron.jobs import (
             _jobs_lock,
             cancel_interrupted_retry_executions,
+            fire_recovery_fence,
             load_jobs,
             requeue_interrupted_jobs,
         )
 
-        # Revalidate the authoritative fire-claim generation and commit the
-        # jobs marker + SQLite terminal CAS while holding the same jobs lock
-        # used by owner heartbeats. This closes the last-observation race: a
-        # live owner cannot renew its claim between our proof and terminalize.
-        with _jobs_lock():
-            current_generations = _fire_claim_generation_map(load_jobs())
-            candidates = [
-                row
-                for row in candidates
-                if current_generations.get(str(row["id"]))
-                == row.get("_fire_claim_generation")
-            ]
-            candidate_heartbeats = {
-                str(row["id"]): row.get("heartbeat_at") for row in candidates
-            }
-            requeued = requeue_interrupted_jobs(
-                candidates, expected_heartbeats=candidate_heartbeats
-            )
-            recovered = mark_interrupted_executions_unknown(
-                [row["id"] for row in candidates],
-                retry_job_ids=requeued,
-                expected_heartbeats=candidate_heartbeats,
-            )
-            recovered_ids = {str(row["id"]) for row in recovered}
-            lost_ids = {str(row["id"]) for row in candidates} - recovered_ids
-            # Another replica may have won the identical terminalization CAS
-            # after this process requeued the marker. Its unknown+ACK
-            # transaction proves the retry handoff succeeded; only an owner
-            # renewal should roll it back.
-            _, concurrently_recovered_ids = interrupted_retry_states(lost_ids)
-            lost_ids -= concurrently_recovered_ids
-            if lost_ids:
-                cancel_interrupted_retry_executions(lost_ids)
-        if requeued:
+        # Serialize each job's recovery with its external side effects before
+        # taking the global jobs lock. Heartbeats use only the jobs CAS, so a
+        # live owner can keep changing its generation while recovery waits on
+        # the fence. Once acquired, revalidate that generation and commit the
+        # jobs marker + SQLite terminal CAS as one fenced recovery operation.
+        candidates_by_job: Dict[str, List[Dict[str, Any]]] = {}
+        for candidate in candidates:
+            candidates_by_job.setdefault(str(candidate["job_id"]), []).append(candidate)
+        all_requeued: Set[str] = set()
+        for job_id, job_candidates in candidates_by_job.items():
+            with fire_recovery_fence(job_id) as fence_acquired:
+                if not fence_acquired:
+                    continue
+                with _jobs_lock():
+                    current_generations = _fire_claim_generation_map(load_jobs())
+                    job_candidates = [
+                        row
+                        for row in job_candidates
+                        if current_generations.get(str(row["id"]))
+                        == row.get("_fire_claim_generation")
+                    ]
+                    if not job_candidates:
+                        continue
+                    candidate_heartbeats = {
+                        str(row["id"]): row.get("heartbeat_at")
+                        for row in job_candidates
+                    }
+                    requeued = requeue_interrupted_jobs(
+                        job_candidates, expected_heartbeats=candidate_heartbeats
+                    )
+                    job_recovered = mark_interrupted_executions_unknown(
+                        [row["id"] for row in job_candidates],
+                        retry_job_ids=requeued,
+                        expected_heartbeats=candidate_heartbeats,
+                    )
+                    recovered.extend(job_recovered)
+                    all_requeued.update(requeued)
+                    recovered_ids = {str(row["id"]) for row in job_recovered}
+                    lost_ids = {
+                        str(row["id"]) for row in job_candidates
+                    } - recovered_ids
+                    # Another replica may have won the identical terminalization
+                    # CAS after this process requeued the marker. Its unknown+ACK
+                    # transaction proves the retry handoff succeeded; only an
+                    # owner renewal should roll it back.
+                    _, concurrently_recovered_ids = interrupted_retry_states(lost_ids)
+                    lost_ids -= concurrently_recovered_ids
+                    if lost_ids:
+                        cancel_interrupted_retry_executions(lost_ids)
+        if recovered:
+            with _recovery_intent_lock:
+                _recovery_intent_ids.difference_update(
+                    str(row["id"]) for row in recovered
+                )
+        if all_requeued:
             logging.getLogger("cron.scheduler_provider").warning(
                 "Durably requeued %d interrupted cron job(s) under explicit at-least-once policy",
-                len(requeued),
+                len(all_requeued),
             )
     try:
         pruned = prune_orphaned_interrupted_retry_acks()

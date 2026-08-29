@@ -453,6 +453,18 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
             )
         yield owns_claim
 
+
+@contextlib.contextmanager
+def fire_recovery_fence(job_id: str):
+    """Serialize interrupted recovery with this job's external side effects.
+
+    Recovery acquires this fence before the global jobs lock, matching the
+    established fire-fence lock order.  Failing to acquire it is a closed
+    recovery outcome: the active attempt remains untouched for a later pass.
+    """
+    with _fire_job_lock(job_id) as acquired:
+        yield acquired
+
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
@@ -3795,13 +3807,16 @@ def _sweep_completed_oneshots(
 
 
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
-    with _fire_job_lock(job_id) as acquired:
-        if not acquired:
-            return False
-        return _heartbeat_fire_claim_locked(
-            job_id,
-            expected_owner=expected_owner,
-        )
+    """Renew ownership without waiting behind the side-effect fence.
+
+    The jobs-store owner CAS is the authoritative fence.  Keeping heartbeat
+    renewal independent of ``_fire_job_lock`` lets a long network side effect
+    retain its lease while recovery waits on that same per-job fence.
+    """
+    return _heartbeat_fire_claim_locked(
+        job_id,
+        expected_owner=expected_owner,
+    )
 
 
 def _heartbeat_fire_claim_locked(job_id: str, *, expected_owner: str) -> bool:
@@ -4168,7 +4183,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # (gateway was down and missed the window). Fast-forward to
                 # the next future occurrence instead of firing a stale run.
                 grace = _compute_grace_seconds(schedule)
-                if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
+                if (
+                    kind in {"cron", "interval"}
+                    and not isinstance(job.get("interrupted_retry"), dict)
+                    and (now - next_run_dt).total_seconds() > grace
+                ):
                     # Job is past its catch-up grace window — skip accumulated
                     # missed runs but still execute once now to avoid deferring
                     # indefinitely (e.g. a long-running job just finished).
