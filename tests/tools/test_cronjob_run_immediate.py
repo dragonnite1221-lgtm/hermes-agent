@@ -51,6 +51,35 @@ class TestCronjobRunExecutesImmediately:
             "job-run-1", source="direct", force=True
         )
 
+    def test_direct_claim_compatibility_forwards_claim_ttl(self):
+        from tools.cronjob_tools import claim_job_for_fire
+
+        with patch(
+            "tools.cronjob_tools._claim_job_for_fire",
+            return_value=True,
+        ) as m_claim:
+            assert claim_job_for_fire(
+                "job-run-1", claim_ttl_seconds=0
+            ) is True
+        m_claim.assert_called_once_with(
+            "job-run-1", force=False, claim_ttl_seconds=0
+        )
+
+        claimed = {**_JOB, "execution_id": "exec-ttl"}
+        with patch(
+            "tools.cronjob_tools.claim_fire_with_execution",
+            return_value=claimed,
+        ) as m_claim:
+            assert claim_job_for_fire(
+                "job-run-1", return_job=True, claim_ttl_seconds=0
+            ) is claimed
+        m_claim.assert_called_once_with(
+            "job-run-1",
+            source="direct",
+            force=False,
+            claim_ttl_seconds=0,
+        )
+
     def test_run_action_claims_and_fires_via_run_one_job(self):
         """action='run' must claim the job then fire it through run_one_job."""
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}

@@ -203,3 +203,28 @@ class TestFireOverdueJobs:
         assert time.monotonic() - start < 1.0  # returned before the run
         assert provider.wait_fired(timeout=10)
         assert provider.fired == [job["id"]]
+
+    def test_thread_start_failure_restores_claimed_occurrence(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A failed background handoff must not consume the due occurrence."""
+        job = create_job(prompt="p", schedule="every 1h")
+        _park_in_past(job["id"], minutes=30)
+        before = get_job(job["id"])
+        assert before is not None
+        provider = RecordingProvider()
+
+        monkeypatch.setattr(
+            threading.Thread,
+            "start",
+            lambda _thread: (_ for _ in ()).throw(
+                RuntimeError("cannot start new thread")
+            ),
+        )
+
+        assert fire_overdue_jobs(provider) == 0
+        restored = get_job(job["id"])
+        assert restored is not None
+        assert restored["next_run_at"] == before["next_run_at"]
+        assert restored["fire_claim"] is None
+        assert provider.fired == []

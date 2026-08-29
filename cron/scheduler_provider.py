@@ -156,7 +156,11 @@ def commit_fire_claim_execution(
 
 
 def claim_fire_with_execution(
-    job_id: str, *, source: str, force: bool = False
+    job_id: str,
+    *,
+    source: str,
+    force: bool = False,
+    claim_ttl_seconds: int | None = None,
 ) -> dict | None:
     """Create the durable attempt before consuming a job fire claim.
 
@@ -177,11 +181,22 @@ def claim_fire_with_execution(
         raise FireClaimNotAcquiredError(
             f"Could not create the durable execution record: {exc}"
         ) from exc
-    claim_kwargs = {"return_job": True, "execution_id": execution["id"]}
-    if force:
-        claim_kwargs["force"] = True
     try:
-        claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
+        if claim_ttl_seconds is None:
+            claimed_job = claim_job_for_fire(
+                job_id,
+                return_job=True,
+                execution_id=execution["id"],
+                force=force,
+            )
+        else:
+            claimed_job = claim_job_for_fire(
+                job_id,
+                return_job=True,
+                execution_id=execution["id"],
+                force=force,
+                claim_ttl_seconds=claim_ttl_seconds,
+            )
     except Exception as exc:
         try:
             discard_unacquired_execution(execution["id"])
@@ -587,13 +602,23 @@ def fire_overdue_jobs(
             claimed = provider.claim_fire(job_id)
             if claimed is None:
                 continue
-            threading.Thread(
+            worker = threading.Thread(
                 target=provider.fire_claimed,
                 args=(claimed,),
                 kwargs={"adapters": adapters, "loop": loop},
                 daemon=True,
                 name=f"cron-misfire-{job_id[:12]}",
-            ).start()
+            )
+            try:
+                worker.start()
+            except Exception as handoff_error:
+                # The durable occurrence was consumed before the background
+                # handoff. Restore that exact occurrence (or release its
+                # ledger witness to periodic recovery if rollback I/O is
+                # unavailable) so thread/resource exhaustion cannot silently
+                # lose an interrupted retry or ordinary scheduled fire.
+                abort_fire_claim_execution(claimed, str(handoff_error))
+                raise
             fired += 1
         except Exception as exc:
             logger.warning(

@@ -56,12 +56,31 @@ from cron.scheduler_provider import FireClaimNotAcquiredError, claim_fire_with_e
 
 
 def claim_job_for_fire(
-    job_id: str, *, return_job: bool = False, force: bool = False
+    job_id: str,
+    *,
+    return_job: bool = False,
+    force: bool = False,
+    claim_ttl_seconds: int | None = None,
 ):
     """Backward-compatible claim export with ledger-first direct snapshots."""
     if return_job:
-        return claim_fire_with_execution(job_id, source="direct", force=force)
-    return _claim_job_for_fire(job_id, force=force)
+        if claim_ttl_seconds is None:
+            return claim_fire_with_execution(
+                job_id, source="direct", force=force
+            )
+        return claim_fire_with_execution(
+            job_id,
+            source="direct",
+            force=force,
+            claim_ttl_seconds=claim_ttl_seconds,
+        )
+    if claim_ttl_seconds is None:
+        return _claim_job_for_fire(job_id, force=force)
+    return _claim_job_for_fire(
+        job_id,
+        force=force,
+        claim_ttl_seconds=claim_ttl_seconds,
+    )
 
 
 def _notify_provider_jobs_changed_safe() -> None:
