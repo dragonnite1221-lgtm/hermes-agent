@@ -12,7 +12,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Collection, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -200,14 +200,12 @@ def finish_execution(
     return record
 
 
-def recover_interrupted_executions() -> int:
-    """Mark provably abandoned attempts unknown without scheduling retries."""
-    now = _hermes_now().isoformat()
-    changed = 0
-    recovered: List[Dict[str, Any]] = []
+def interrupted_execution_candidates() -> List[Dict[str, Any]]:
+    """Return active attempts whose exact owner process is provably gone."""
+    abandoned: List[Dict[str, Any]] = []
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, process_id, pid, process_started_at FROM executions
+            """SELECT * FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
@@ -215,26 +213,73 @@ def recover_interrupted_executions() -> int:
                 continue
             if _owner_is_live(int(row["pid"]), row["process_started_at"]):
                 continue
+            record = _record(row)
+            if record is not None:
+                abandoned.append(record)
+    return abandoned
+
+
+def mark_interrupted_executions_unknown(
+    execution_ids: Collection[str], *, retry_job_ids: Collection[str] = (),
+) -> List[Dict[str, Any]]:
+    """CAS abandoned attempts to unknown after any durable retry requeue."""
+    ids = {str(value) for value in execution_ids if value}
+    retry_ids = {str(value) for value in retry_job_ids if value}
+    if not ids:
+        return []
+    now = _hermes_now().isoformat()
+    recovered: List[Dict[str, Any]] = []
+    with _transaction() as conn:
+        rows = conn.execute(
+            "SELECT id, job_id FROM executions WHERE status IN ('claimed','running')"
+        ).fetchall()
+        for row in rows:
+            if row["id"] not in ids:
+                continue
+            detail = (
+                "Scheduler restarted after this execution's owner exited before a durable "
+                "terminal state; whether side effects ran is unknown."
+            )
+            if row["job_id"] in retry_ids:
+                detail += " A retry was durably scheduled by the job's explicit interrupted-run policy."
             cur = conn.execute(
                 """UPDATE executions SET status='unknown', finished_at=?, error=?
                    WHERE id=? AND status IN ('claimed','running')""",
-                (now,
-                 "Scheduler restarted after this execution's owner exited before a durable "
-                 "terminal state; whether side effects ran is unknown.",
-                 row["id"]),
+                (now, detail, row["id"]),
             )
-            changed += cur.rowcount
             if cur.rowcount:
                 record = _record(conn.execute(
                     "SELECT * FROM executions WHERE id=?", (row["id"],)
                 ).fetchone())
                 if record is not None:
                     recovered.append(record)
-        if changed:
+        if recovered:
             _prune_unlocked(conn)
     for record in recovered:
         _emit_execution_state(record)
-    return changed
+    return recovered
+
+
+def recover_interrupted_executions() -> int:
+    """Classify abandoned attempts after durably applying explicit retry policy."""
+    candidates = interrupted_execution_candidates()
+    if not candidates:
+        return 0
+    from cron.jobs import requeue_interrupted_jobs
+
+    requeued = requeue_interrupted_jobs([row["job_id"] for row in candidates])
+    recovered = mark_interrupted_executions_unknown(
+        [row["id"] for row in candidates],
+        retry_job_ids=requeued,
+    )
+    if requeued:
+        import logging
+
+        logging.getLogger("cron.scheduler_provider").warning(
+            "Durably requeued %d interrupted cron job(s) under explicit at-least-once policy",
+            len(requeued),
+        )
+    return len(recovered)
 
 
 def list_executions(

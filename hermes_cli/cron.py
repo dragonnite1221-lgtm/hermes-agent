@@ -170,6 +170,8 @@ def cron_list(show_all: bool = False):
                 print(f"    Changed:   {mon_state['last_changed_at']}")
         if job.get("no_agent"):
             print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
+        if job.get("retry_interrupted"):
+            print("    Restart:   retry interrupted run (at-least-once)")
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
@@ -397,6 +399,7 @@ def cron_create(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        retry_interrupted=getattr(args, "retry_interrupted", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -415,6 +418,8 @@ def cron_create(args):
         print(f"  Monitor: {job_data['monitor_url']} (agent runs only on output change)")
     if job_data.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
+    if job_data.get("retry_interrupted"):
+        print("  Restart: retry interrupted run (at-least-once)")
     if job_data.get("continuity"):
         print("  Continuity: on (each run sees the previous run's output)")
     if job_data.get("workdir"):
@@ -472,6 +477,7 @@ def cron_edit(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        retry_interrupted=getattr(args, "retry_interrupted", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -493,6 +499,8 @@ def cron_edit(args):
         print(f"  Monitor: {updated['monitor_url']} (agent runs only on output change)")
     if updated.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
+    if updated.get("retry_interrupted"):
+        print("  Restart: retry interrupted run (at-least-once)")
     if updated.get("continuity"):
         print("  Continuity: on (each run sees the previous run's output)")
     if updated.get("workdir"):

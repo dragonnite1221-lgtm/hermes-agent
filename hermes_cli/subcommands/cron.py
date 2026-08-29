@@ -132,6 +132,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "monitors, incremental digests). First run is unchanged."
         ),
     )
+    cron_create.add_argument(
+        "--retry-interrupted",
+        dest="retry_interrupted",
+        action="store_true",
+        default=None,
+        help=(
+            "Retry a no-agent script when its owner process dies before a durable result. "
+            "This is at-least-once execution; enable only for idempotent scripts."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -253,6 +263,22 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "
             "the pin and follow config resolution."
         ),
+    )
+    retry_group = cron_edit.add_mutually_exclusive_group()
+    retry_group.add_argument(
+        "--retry-interrupted",
+        dest="retry_interrupted",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Enable at-least-once restart retry for an idempotent no-agent script.",
+    )
+    retry_group.add_argument(
+        "--no-retry-interrupted",
+        dest="retry_interrupted",
+        action="store_const",
+        const=False,
+        help="Disable restart retry for interrupted executions.",
     )
 
     # lifecycle actions

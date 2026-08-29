@@ -1812,6 +1812,21 @@ def _validate_job_mode_invariants(
         )
 
 
+def _validate_interrupted_retry_mode(
+    retry_interrupted: Any, *, no_agent: bool, script: Optional[str]
+) -> bool:
+    """Validate the explicit at-least-once restart policy for script jobs."""
+    if not isinstance(retry_interrupted, bool):
+        raise ValueError("retry_interrupted must be a boolean")
+    if retry_interrupted and (not no_agent or not script):
+        raise ValueError(
+            "retry_interrupted=True is only supported for no_agent script jobs. "
+            "Enable it only when the script is idempotent because side effects "
+            "from the interrupted attempt may already have occurred."
+        )
+    return retry_interrupted
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1833,6 +1848,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    retry_interrupted: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1900,6 +1916,10 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        retry_interrupted: Explicit at-least-once restart policy for an
+                idempotent no-agent script. If the scheduler proves the prior
+                execution owner died without a durable terminal result, the
+                job is made due once more after its duplicate-fence lease.
 
     Returns:
         The created job dict
@@ -1949,6 +1969,11 @@ def create_job(
         normalized_monitor_url,
         normalized_no_agent,
         normalized_script,
+    )
+    normalized_retry_interrupted = _validate_interrupted_retry_mode(
+        retry_interrupted,
+        no_agent=normalized_no_agent,
+        script=normalized_script,
     )
 
     # Normalize context_from: accept str or list of str, store as list or None
@@ -2008,6 +2033,7 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
+        "retry_interrupted": normalized_retry_interrupted,
         "monitor_script": normalized_monitor_script,
         "monitor_url": normalized_monitor_url,
         # Hash-suppression state for monitor jobs: {"last_output_hash": ...,
@@ -2160,6 +2186,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["reasoning_effort"] = _normalize_reasoning_effort(
                     updates["reasoning_effort"]
                 )
+            if "retry_interrupted" in updates and not isinstance(
+                updates["retry_interrupted"], bool
+            ):
+                raise ValueError("retry_interrupted must be a boolean")
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
@@ -2171,7 +2201,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # monitor: the scheduler's no_agent short-circuit runs before
             # the monitor gate). Scoped to changed fields so legacy records
             # untouched by this update keep loading.
-            if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
+            if {
+                "monitor_script",
+                "monitor_url",
+                "no_agent",
+                "script",
+                "retry_interrupted",
+            }.intersection(updates):
                 _upd_script = updated.get("script")
                 _upd_script = str(_upd_script).strip() if isinstance(_upd_script, str) else None
                 _validate_job_mode_invariants(
@@ -2179,6 +2215,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updated.get("monitor_url") or None,
                     bool(updated.get("no_agent")),
                     _upd_script or None,
+                )
+                updated["retry_interrupted"] = _validate_interrupted_retry_mode(
+                    updated.get("retry_interrupted", False),
+                    no_agent=bool(updated.get("no_agent")),
+                    script=_upd_script or None,
                 )
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
@@ -2309,6 +2350,34 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "next_run_at": _hermes_now().isoformat(),
         },
     )
+
+
+def requeue_interrupted_jobs(job_ids: Collection[str]) -> Set[str]:
+    """Durably make opted-in active jobs due after their owner process died.
+
+    Existing fire claims are retained. Their five-minute lease is the
+    duplicate fence: once it expires, the now-due job can be reclaimed. This
+    gives an explicit at-least-once policy without turning a fast restart into
+    an immediate duplicate delivery.
+    """
+    requested = {str(value) for value in job_ids if value}
+    if not requested:
+        return set()
+    requeued: Set[str] = set()
+    now = _hermes_now().isoformat()
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            job_id = str(job.get("id") or "")
+            if job_id not in requested or job.get("retry_interrupted") is not True:
+                continue
+            if not is_job_runnable(job):
+                continue
+            job["next_run_at"] = now
+            requeued.add(job_id)
+        if requeued:
+            save_jobs(jobs)
+    return requeued
 
 
 def remove_job(job_id: str) -> bool:
