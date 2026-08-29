@@ -2694,6 +2694,7 @@ def _mark_job_run_locked(
                             job_id,
                         )
                         return False
+                interrupted_retry = job.pop("interrupted_retry", None)
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = status or ("ok" if success else "error")
@@ -2766,6 +2767,9 @@ def _mark_job_run_locked(
                         job["state"] = "completed"
                         job["next_run_at"] = None
                         save_jobs(jobs)
+                        _forget_interrupted_retry_best_effort(
+                            job_id, interrupted_retry
+                        )
                         return True
                 
                 # Compute next run
@@ -2801,6 +2805,7 @@ def _mark_job_run_locked(
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
+                _forget_interrupted_retry_best_effort(job_id, interrupted_retry)
                 return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
@@ -3064,6 +3069,53 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _interrupted_retry_ready(job: Dict[str, Any], now: datetime) -> bool:
+    """Validate the jobs.json→execution-ledger handoff for a retry marker."""
+    marker = job.get("interrupted_retry")
+    if not isinstance(marker, dict):
+        return True
+    try:
+        eligible_at = _ensure_aware(datetime.fromisoformat(str(marker["eligible_at"])))
+    except (KeyError, TypeError, ValueError):
+        eligible_at = now
+    if now < eligible_at:
+        return False
+    try:
+        from cron.executions import execution_ids_are_terminal
+
+        return execution_ids_are_terminal(
+            marker.get("execution_ids") or [],
+            job_id=str(job.get("id") or ""),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': cannot verify interrupted retry ledger handoff: %s",
+            job.get("id"),
+            exc,
+        )
+        return False
+
+
+def _forget_interrupted_retry_best_effort(
+    job_id: str, marker: Optional[Dict[str, Any]]
+) -> None:
+    if not isinstance(marker, dict):
+        return
+    try:
+        from cron.executions import forget_interrupted_retry_acks
+
+        forget_interrupted_retry_acks(
+            marker.get("execution_ids") or [],
+            job_id=job_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': consumed retry acknowledgement cleanup failed: %s",
+            job_id,
+            exc,
+        )
+
+
 def claim_job_for_fire(
     job_id: str,
     *,
@@ -3145,31 +3197,8 @@ def _claim_job_for_fire_locked(
                 job["paused_at"] = None
                 job["paused_reason"] = None
             interrupted_retry = job.get("interrupted_retry")
-            if isinstance(interrupted_retry, dict):
-                try:
-                    eligible_at = _ensure_aware(
-                        datetime.fromisoformat(str(interrupted_retry["eligible_at"]))
-                    )
-                except (KeyError, TypeError, ValueError):
-                    eligible_at = now
-                if now < eligible_at:
-                    return False
-                execution_ids = interrupted_retry.get("execution_ids")
-                try:
-                    from cron.executions import execution_ids_are_terminal
-
-                    retry_acknowledged = execution_ids_are_terminal(
-                        execution_ids or [], job_id=job_id
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Job '%s': cannot verify interrupted retry ledger handoff: %s",
-                        job_id,
-                        exc,
-                    )
-                    return False
-                if not retry_acknowledged:
-                    return False
+            if not _interrupted_retry_ready(job, now):
+                return False
             # Per-acquisition token: a process may legitimately reclaim its own
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
@@ -3185,20 +3214,7 @@ def _claim_job_for_fire_locked(
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
-            if isinstance(interrupted_retry, dict):
-                try:
-                    from cron.executions import forget_interrupted_retry_acks
-
-                    forget_interrupted_retry_acks(
-                        interrupted_retry.get("execution_ids") or [],
-                        job_id=job_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Job '%s': consumed retry acknowledgement cleanup failed: %s",
-                        job_id,
-                        exc,
-                    )
+            _forget_interrupted_retry_best_effort(job_id, interrupted_retry)
             return copy.deepcopy(job) if return_job else True
         return False
 
@@ -3460,6 +3476,13 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # state still reaches save_jobs() below.
         try:
             if not job.get("enabled", True):
+                continue
+
+            # The built-in ticker does not take the external fire CAS. Keep a
+            # recovered retry out of its due set until the abandoned attempt's
+            # terminal ledger handoff has committed. The marker remains until
+            # mark_job_run so a crash in the replacement run stays recoverable.
+            if not _interrupted_retry_ready(job, now):
                 continue
 
             # Contradiction self-heal: enabled=true with pause markers means the

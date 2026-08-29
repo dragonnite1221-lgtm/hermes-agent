@@ -210,6 +210,16 @@ def finish_execution(
     return record
 
 
+def discard_unacquired_execution(execution_id: str) -> bool:
+    """Remove a ledger-first row when the corresponding job claim lost."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            "DELETE FROM executions WHERE id=? AND status='claimed'",
+            (str(execution_id),),
+        )
+    return cur.rowcount == 1
+
+
 def interrupted_execution_candidates() -> List[Dict[str, Any]]:
     """Return active attempts whose exact owner process is provably gone."""
     abandoned: List[Dict[str, Any]] = []
@@ -285,30 +295,31 @@ def prune_orphaned_interrupted_retry_acks() -> int:
     SQLite cleanup, the next recovery pass converges the ledger to the actual
     durable retry markers instead of leaking rows forever.
     """
-    from cron.jobs import load_jobs
+    from cron.jobs import _jobs_lock, load_jobs
 
-    active = {
-        (str(execution_id), str(job.get("id") or ""))
-        for job in load_jobs()
-        if isinstance(job, dict)
-        for marker in [job.get("interrupted_retry")]
-        if isinstance(marker, dict)
-        for execution_id in marker.get("execution_ids") or []
-        if execution_id and job.get("id")
-    }
-    with _transaction() as conn:
-        rows = conn.execute(
-            "SELECT execution_id, job_id FROM interrupted_retry_acks"
-        ).fetchall()
-        orphaned = [
-            (str(row["execution_id"]), str(row["job_id"]))
-            for row in rows
-            if (str(row["execution_id"]), str(row["job_id"])) not in active
-        ]
-        conn.executemany(
-            "DELETE FROM interrupted_retry_acks WHERE execution_id=? AND job_id=?",
-            orphaned,
-        )
+    with _jobs_lock():
+        active = {
+            (str(execution_id), str(job.get("id") or ""))
+            for job in load_jobs()
+            if isinstance(job, dict)
+            for marker in [job.get("interrupted_retry")]
+            if isinstance(marker, dict)
+            for execution_id in marker.get("execution_ids") or []
+            if execution_id and job.get("id")
+        }
+        with _transaction() as conn:
+            rows = conn.execute(
+                "SELECT execution_id, job_id FROM interrupted_retry_acks"
+            ).fetchall()
+            orphaned = [
+                (str(row["execution_id"]), str(row["job_id"]))
+                for row in rows
+                if (str(row["execution_id"]), str(row["job_id"])) not in active
+            ]
+            conn.executemany(
+                "DELETE FROM interrupted_retry_acks WHERE execution_id=? AND job_id=?",
+                orphaned,
+            )
     return len(orphaned)
 
 

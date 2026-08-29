@@ -107,14 +107,39 @@ class TestFireOverdueJobs:
         )
         provider = RecordingProvider()
         recovered = []
+        reconciled = []
         monkeypatch.setattr(
             provider,
             "recover_interrupted",
             lambda: recovered.append("recover") or 1,
         )
+        monkeypatch.setattr(
+            provider,
+            "reconcile",
+            lambda: reconciled.append("reconcile"),
+        )
 
         assert fire_overdue_jobs(provider) == 0
         assert recovered == ["recover"]
+        assert reconciled == ["reconcile"]
+
+    def test_external_housekeeping_reconciles_after_prior_remote_failure(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "cron.scheduler_provider._misfire_grace_minutes", lambda: 0.0
+        )
+        provider = RecordingProvider()
+        reconciled = []
+        monkeypatch.setattr(provider, "recover_interrupted", lambda: 0)
+        monkeypatch.setattr(
+            provider,
+            "reconcile",
+            lambda: reconciled.append("reconcile"),
+        )
+
+        assert fire_overdue_jobs(provider) == 0
+        assert reconciled == ["reconcile"]
 
     def test_future_job_not_fired(self, tmp_cron_dir):
         create_job(prompt="p", schedule="every 1h")  # next_run_at in future

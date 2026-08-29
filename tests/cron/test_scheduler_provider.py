@@ -364,6 +364,7 @@ def test_builtin_inherits_hook_defaults():
 
 def test_fire_due_default_claims_then_runs(monkeypatch):
     """The default fire_due runs the exact owner-bearing CAS snapshot."""
+    import cron.executions as executions
     import cron.jobs as jobs
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
@@ -377,6 +378,7 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
         or {"id": jid, "name": "t", "fire_claim": {"by": "exact-owner"}},
         raising=False,
     )
+    monkeypatch.setattr(executions, "create_execution", lambda *_a, **_kw: {"id": "exec-1"})
     monkeypatch.setattr(
         sched,
         "run_one_job",
@@ -423,6 +425,7 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
 
 
 def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
+    import cron.executions as executions
     import cron.jobs as jobs
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
@@ -434,6 +437,7 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
         lambda jid, **kw: claims.append((jid, kw))
         or {"id": jid, "name": "t", "fire_claim": {"by": "manual-owner"}},
     )
+    monkeypatch.setattr(executions, "create_execution", lambda *_a, **_kw: {"id": "exec-1"})
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: True)
 
     assert InProcessCronScheduler().fire_due("j1", force=True) is True
@@ -443,11 +447,19 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
 def test_fire_due_lost_claim_does_not_run(monkeypatch):
     """If the CAS claim is lost (another machine/retry won), fire_due returns
     False and never runs the job."""
+    import cron.executions as executions
     import cron.jobs as jobs
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
+    discarded = []
+    monkeypatch.setattr(executions, "create_execution", lambda *_a, **_kw: {"id": "exec-lost"})
+    monkeypatch.setattr(
+        executions,
+        "discard_unacquired_execution",
+        lambda execution_id: discarded.append(execution_id) or True,
+    )
     monkeypatch.setattr(
         jobs,
         "claim_job_for_fire",
@@ -458,15 +470,24 @@ def test_fire_due_lost_claim_does_not_run(monkeypatch):
 
     assert InProcessCronScheduler().fire_due("j1") is False
     assert ran == []
+    assert discarded == ["exec-lost"]
 
 
 def test_fire_due_missing_job_does_not_run(monkeypatch):
     """If the job vanished before atomic claim, fire_due does not run it."""
+    import cron.executions as executions
     import cron.jobs as jobs
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
+    discarded = []
+    monkeypatch.setattr(executions, "create_execution", lambda *_a, **_kw: {"id": "exec-gone"})
+    monkeypatch.setattr(
+        executions,
+        "discard_unacquired_execution",
+        lambda execution_id: discarded.append(execution_id) or True,
+    )
     monkeypatch.setattr(
         jobs,
         "claim_job_for_fire",
@@ -477,6 +498,7 @@ def test_fire_due_missing_job_does_not_run(monkeypatch):
 
     assert InProcessCronScheduler().fire_due("gone") is False
     assert ran == []
+    assert discarded == ["exec-gone"]
 
 
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──
@@ -638,5 +660,4 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-
 

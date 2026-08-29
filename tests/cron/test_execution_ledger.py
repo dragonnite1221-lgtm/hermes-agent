@@ -57,6 +57,18 @@ def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path
     assert (tmp_path / "worker" / "cron" / "executions.db").is_file()
 
 
+def test_discard_unacquired_execution_removes_only_claimed_attempt(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    unacquired = executions.create_execution("lost-race", source="external")
+    running = executions.create_execution("running", source="external")
+    executions.mark_execution_running(running["id"])
+
+    assert executions.discard_unacquired_execution(unacquired["id"]) is True
+    assert executions.discard_unacquired_execution(running["id"]) is False
+    assert executions.latest_execution("lost-race") is None
+    assert executions.latest_execution("running")["status"] == "running"
+
+
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("immutable", source="builtin")

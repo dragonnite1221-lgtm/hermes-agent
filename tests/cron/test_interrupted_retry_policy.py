@@ -69,10 +69,13 @@ def test_recurring_retry_waits_for_fire_claim_then_survives_due_scan(
     assert jobs.get_job(default["id"])["next_run_at"] == future
 
     monkeypatch.setattr(jobs, "_hermes_now", lambda: eligible_at + timedelta(seconds=1))
+    assert jobs.get_due_jobs() == []
+    executions.mark_interrupted_executions_unknown(
+        [execution["id"]], retry_job_ids={opted_in["id"]}
+    )
     due = jobs.get_due_jobs()
     assert [job["id"] for job in due] == [opted_in["id"]]
     jobs.advance_next_runs([opted_in["id"]])
-    executions.mark_interrupted_executions_unknown([execution["id"]])
     claimed = jobs.claim_job_for_fire(opted_in["id"], return_job=True)
     assert isinstance(claimed, dict)
     assert "interrupted_retry" not in jobs.get_job(opted_in["id"])
@@ -112,9 +115,12 @@ def test_oneshot_retry_restores_one_dispatch_slot_exactly_once(
 
     eligible_at = now + timedelta(seconds=jobs.FIRE_CLAIM_TTL_SECONDS)
     monkeypatch.setattr(jobs, "_hermes_now", lambda: eligible_at + timedelta(seconds=1))
+    assert jobs.get_due_jobs() == []
+    executions.mark_interrupted_executions_unknown(
+        [execution["id"]], retry_job_ids={job["id"]}
+    )
     due = jobs.get_due_jobs()
     assert [candidate["id"] for candidate in due] == [job["id"]]
-    executions.mark_interrupted_executions_unknown([execution["id"]])
     assert isinstance(jobs.claim_job_for_fire(job["id"], return_job=True), dict)
     assert jobs.claim_dispatch(job["id"]) is True
     assert jobs.get_job(job["id"])["repeat"]["completed"] == 1
@@ -180,6 +186,44 @@ def test_retry_cannot_fire_before_execution_ledger_handoff_commits(
     claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
     assert isinstance(claimed, dict)
     assert "interrupted_retry" not in jobs.get_job(job["id"])
+
+
+def test_builtin_due_scan_waits_for_handoff_and_consumes_retry_on_completion(
+    isolated_cron, monkeypatch
+):
+    now = datetime(2026, 8, 29, 7, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    job = _script_job(retry_interrupted=True)
+    abandoned = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(abandoned["id"])
+
+    assert jobs.requeue_interrupted_jobs([abandoned]) == {job["id"]}
+    assert jobs.get_due_jobs() == []
+
+    executions.mark_interrupted_executions_unknown(
+        [abandoned["id"]], retry_job_ids={job["id"]}
+    )
+    due = jobs.get_due_jobs()
+    assert [candidate["id"] for candidate in due] == [job["id"]]
+    assert "interrupted_retry" in jobs.get_job(job["id"])
+
+    assert jobs.mark_job_run(job["id"], success=True) is True
+
+    assert "interrupted_retry" not in jobs.get_job(job["id"])
+    assert executions.execution_ids_are_terminal(
+        [abandoned["id"]], job_id=job["id"]
+    ) is False
+
+
+def test_lost_fire_claim_does_not_create_phantom_failed_execution(isolated_cron):
+    from cron.scheduler_provider import claim_fire_with_execution
+
+    job = _script_job()
+    assert isinstance(jobs.claim_job_for_fire(job["id"], return_job=True), dict)
+
+    assert claim_fire_with_execution(job["id"], source="external") is None
+    assert executions.list_executions(job_id=job["id"]) == []
 
 
 def test_terminal_retry_ack_survives_execution_pruning(isolated_cron, monkeypatch):

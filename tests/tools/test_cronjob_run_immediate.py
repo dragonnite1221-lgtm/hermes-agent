@@ -26,6 +26,16 @@ _JOB = {"id": "job-run-1", "name": "manual run", "prompt": "hi",
 
 
 class TestCronjobRunExecutesImmediately:
+    def test_direct_claim_compatibility_keeps_default_bool_contract(self):
+        from tools.cronjob_tools import claim_job_for_fire
+
+        with patch(
+            "tools.cronjob_tools._claim_job_for_fire",
+            return_value=True,
+        ) as m_claim:
+            assert claim_job_for_fire("job-run-1") is True
+        m_claim.assert_called_once_with("job-run-1", force=False)
+
     def test_direct_claim_compatibility_forwards_force(self):
         from tools.cronjob_tools import claim_job_for_fire
 

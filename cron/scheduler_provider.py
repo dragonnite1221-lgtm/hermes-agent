@@ -36,7 +36,11 @@ def claim_fire_with_execution(
     still leaves a recoverable owner record rather than silently losing the
     owed retry.
     """
-    from cron.executions import create_execution, finish_execution
+    from cron.executions import (
+        create_execution,
+        discard_unacquired_execution,
+        finish_execution,
+    )
     from cron.jobs import claim_job_for_fire
 
     execution = create_execution(job_id, source=source)
@@ -53,11 +57,7 @@ def claim_fire_with_execution(
         )
         raise
     if not isinstance(claimed_job, dict):
-        finish_execution(
-            execution["id"],
-            success=False,
-            error="Fire claim was not acquired",
-        )
+        discard_unacquired_execution(execution["id"])
         return None
     claimed_job["execution_id"] = execution["id"]
     return claimed_job
@@ -399,6 +399,14 @@ def fire_overdue_jobs(
             )
     except Exception as exc:
         logger.warning("External-provider interrupted execution recovery failed: %s", exc)
+
+    # Reconcile every sweep. A previous recovery may have committed its local
+    # retry marker and then failed the remote call; the next sweep must still
+    # arm that durable retry even though there is no owner left to recover.
+    try:
+        provider.reconcile()
+    except Exception as exc:
+        logger.warning("External-provider reconciliation sweep failed: %s", exc)
 
     grace_minutes = _misfire_grace_minutes()
     if grace_minutes <= 0:

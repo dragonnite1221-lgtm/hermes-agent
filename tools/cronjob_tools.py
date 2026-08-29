@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     AmbiguousJobReference,
+    claim_job_for_fire as _claim_job_for_fire,
     effective_job_state,
     get_job,
     is_job_runnable,
@@ -57,15 +58,10 @@ from cron.scheduler_provider import claim_fire_with_execution
 def claim_job_for_fire(
     job_id: str, *, return_job: bool = False, force: bool = False
 ):
-    """Compatibility seam for direct-run tests and older monkeypatches.
-
-    Production direct runs always create their execution ledger row before
-    the job-store claim. ``return_job`` is retained because this module's
-    long-standing tests and integrations patch this local name.
-    """
-    if not return_job:
-        raise ValueError("Direct cron runs require the claimed job snapshot")
-    return claim_fire_with_execution(job_id, source="direct", force=force)
+    """Backward-compatible claim export with ledger-first direct snapshots."""
+    if return_job:
+        return claim_fire_with_execution(job_id, source="direct", force=force)
+    return _claim_job_for_fire(job_id, force=force)
 
 
 def _notify_provider_jobs_changed_safe() -> None:
