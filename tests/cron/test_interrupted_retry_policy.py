@@ -126,6 +126,65 @@ def test_oneshot_retry_restores_one_dispatch_slot_exactly_once(
     assert jobs.get_job(job["id"])["repeat"]["completed"] == 1
 
 
+def test_paused_oneshot_retry_resumes_from_retry_eligibility(
+    isolated_cron, monkeypatch
+):
+    now = datetime(2026, 8, 29, 7, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    job = jobs.create_job(
+        prompt=None,
+        schedule=(now + timedelta(minutes=1)).isoformat(),
+        script="idempotent-sync.py",
+        no_agent=True,
+        deliver="local",
+        retry_interrupted=True,
+    )
+    execution = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(execution["id"])
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+    executions.mark_interrupted_executions_unknown(
+        [execution["id"]], retry_job_ids={job["id"]}
+    )
+    eligible_at = jobs.get_job(job["id"])["interrupted_retry"]["eligible_at"]
+
+    assert jobs.pause_job(job["id"])["state"] == "paused"
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now + timedelta(hours=2))
+    resumed = jobs.resume_job(job["id"])
+
+    assert resumed["enabled"] is True
+    assert resumed["state"] == "scheduled"
+    assert resumed["next_run_at"] == eligible_at
+    assert resumed["interrupted_retry"]["execution_ids"] == [execution["id"]]
+
+
+def test_malformed_schedule_does_not_abort_interrupted_recovery(isolated_cron):
+    malformed = _script_job(retry_interrupted=True)
+    healthy = _script_job(retry_interrupted=True)
+    with jobs._jobs_lock():
+        stored = jobs.load_jobs()
+        for record in stored:
+            if record["id"] == malformed["id"]:
+                record["schedule"] = None
+        jobs.save_jobs(stored)
+
+    malformed_execution = executions.create_execution(
+        malformed["id"], source="builtin"
+    )
+    healthy_execution = executions.create_execution(healthy["id"], source="builtin")
+    executions.mark_execution_running(malformed_execution["id"])
+    executions.mark_execution_running(healthy_execution["id"])
+
+    assert jobs.requeue_interrupted_jobs(
+        [malformed_execution, healthy_execution]
+    ) == {malformed["id"], healthy["id"]}
+    assert jobs.get_job(malformed["id"])["interrupted_retry"]["execution_ids"] == [
+        malformed_execution["id"]
+    ]
+    assert jobs.get_job(healthy["id"])["interrupted_retry"]["execution_ids"] == [
+        healthy_execution["id"]
+    ]
+
+
 def test_provider_recovery_requeues_before_marking_execution_unknown(
     isolated_cron, monkeypatch
 ):

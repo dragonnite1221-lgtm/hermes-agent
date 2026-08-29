@@ -7175,10 +7175,12 @@ def create_job_with_scheduler_registration(**kwargs) -> dict:
 
 # Dead-owner claim reclaim throttle (#86721): recover_interrupted_executions
 # opens the executions ledger, so the per-tick reap is rate-limited rather
-# than run on every idle 60s cycle. Tests may reset _last_dead_owner_reap_at
-# to None to force a reap on the next tick.
+# than run on every idle 60s cycle. The map is profile-local because a
+# multiplex gateway ticks several HERMES_HOME scopes in one process; a single
+# scalar lets the first profile suppress recovery for every later profile.
+# Tests may still replace this with None/a float for backward compatibility.
 _DEAD_OWNER_REAP_INTERVAL_SECONDS = 300.0
-_last_dead_owner_reap_at: Optional[float] = None
+_last_dead_owner_reap_at: dict[str, float] | Optional[float] = {}
 
 
 def tick(
@@ -7280,11 +7282,22 @@ def tick(
         # 60s ticks don't pay a ledger connection every cycle (#33612).
         global _last_dead_owner_reap_at
         _reap_now = time.monotonic()
+        _reap_key = str(_get_hermes_home().resolve())
+        if isinstance(_last_dead_owner_reap_at, dict):
+            _profile_last_reap_at = _last_dead_owner_reap_at.get(_reap_key)
+        else:
+            # Compatibility for tests/extensions that historically reset the
+            # scalar to None or an expired timestamp.
+            _profile_last_reap_at = _last_dead_owner_reap_at
         if (
-            _last_dead_owner_reap_at is None
-            or _reap_now - _last_dead_owner_reap_at >= _DEAD_OWNER_REAP_INTERVAL_SECONDS
+            _profile_last_reap_at is None
+            or _reap_now - _profile_last_reap_at
+            >= _DEAD_OWNER_REAP_INTERVAL_SECONDS
         ):
-            _last_dead_owner_reap_at = _reap_now
+            if isinstance(_last_dead_owner_reap_at, dict):
+                _last_dead_owner_reap_at[_reap_key] = _reap_now
+            else:
+                _last_dead_owner_reap_at = _reap_now
             try:
                 from cron.executions import recover_interrupted_executions
 

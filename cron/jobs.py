@@ -2359,9 +2359,24 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not job:
         return None
 
-    next_run_at = compute_next_run(job["schedule"])
-    if next_run_at is None and job["schedule"].get("kind") == "once":
-        run_at = job["schedule"].get("run_at", "unknown")
+    retry = job.get("interrupted_retry")
+    schedule = job.get("schedule")
+    if isinstance(retry, dict):
+        # A paused interrupted retry is a durable owed attempt. Its original
+        # one-shot run_at may already be in the past, so recomputing from the
+        # original schedule would strand it permanently. Preserve the retry's
+        # independently persisted eligibility instead; the due scan still
+        # fences dispatch on the execution-ledger handoff.
+        try:
+            next_run_at = _ensure_aware(
+                datetime.fromisoformat(str(retry["eligible_at"]))
+            ).isoformat()
+        except (KeyError, TypeError, ValueError):
+            next_run_at = _hermes_now().isoformat()
+    else:
+        next_run_at = compute_next_run(schedule) if isinstance(schedule, dict) else None
+    if next_run_at is None and isinstance(schedule, dict) and schedule.get("kind") == "once":
+        run_at = schedule.get("run_at", "unknown")
         raise ValueError(
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
@@ -2466,7 +2481,8 @@ def requeue_interrupted_jobs(executions: Collection[Dict[str, Any]]) -> Set[str]
             new_ids = requested[job_id] - existing_ids
             if new_ids:
                 eligible_at = _interrupted_retry_eligible_at(job, now)
-                kind = job.get("schedule", {}).get("kind")
+                schedule = job.get("schedule")
+                kind = schedule.get("kind") if isinstance(schedule, dict) else None
                 repeat = job.get("repeat")
                 if kind == "once" and isinstance(repeat, dict):
                     times = repeat.get("times")

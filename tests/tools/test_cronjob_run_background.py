@@ -226,6 +226,27 @@ class TestInFlightDedupe:
         finally:
             sched.release_running_job("job-bg-08")
 
+    def test_immediate_run_does_not_claim_after_ticker_registers(self):
+        """The running-set CAS precedes the ledger/fire claim.
+
+        A ticker worker may own the in-process slot before it has taken its
+        durable fire claim. A manual run must lose here without creating a
+        phantom execution row or consuming an interrupted retry.
+        """
+        from cron import scheduler as sched
+        from tools.cronjob_tools import _execute_job_now
+
+        job = _job("job-bg-race")
+        assert sched.try_register_running_job(job["id"])
+        try:
+            with patch("tools.cronjob_tools.claim_job_for_fire") as m_claim:
+                res = _execute_job_now(job)
+            assert res["claimed"] is False
+            assert "already running" in res["error"]
+            m_claim.assert_not_called()
+        finally:
+            sched.release_running_job(job["id"])
+
     def test_run_claimed_job_registers_and_releases(self):
         """A normal run holds the registration for run_one_job's duration and
         releases it after — visible to get_running_job_ids mid-run."""
