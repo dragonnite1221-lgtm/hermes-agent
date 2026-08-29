@@ -3073,11 +3073,28 @@ def _claim_job_for_fire_locked(
                     eligible_at = now
                 if now < eligible_at:
                     return False
+                execution_ids = interrupted_retry.get("execution_ids")
+                try:
+                    from cron.executions import execution_ids_are_terminal
+
+                    retry_acknowledged = execution_ids_are_terminal(execution_ids or [])
+                except Exception as exc:
+                    logger.warning(
+                        "Job '%s': cannot verify interrupted retry ledger handoff: %s",
+                        job_id,
+                        exc,
+                    )
+                    return False
+                if not retry_acknowledged:
+                    return False
             # Per-acquisition token: a process may legitimately reclaim its own
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
             job["fire_claim"] = {"at": now.isoformat(), "by": owner}
+            # Clearing this marker is the commit point of the cross-store
+            # handoff.  The execution ledger check above proves the abandoned
+            # attempts are terminal before this retry can be acquired.
             job.pop("interrupted_retry", None)
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:

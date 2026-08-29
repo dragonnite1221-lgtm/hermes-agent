@@ -219,6 +219,29 @@ def interrupted_execution_candidates() -> List[Dict[str, Any]]:
     return abandoned
 
 
+def execution_ids_are_terminal(execution_ids: Collection[str]) -> bool:
+    """Return true only when every requested execution exists and is terminal.
+
+    Interrupted-job retry markers are the durable half of a cross-store
+    handoff: jobs.json records that a retry is owed, while this SQLite ledger
+    records that the abandoned owner can no longer finish.  The retry must not
+    be claimed until the ledger half has committed, otherwise a failure between
+    the two writes can execute the same retry again after every restart.
+    """
+    ids = {str(value) for value in execution_ids if value}
+    if not ids:
+        return False
+    placeholders = ",".join("?" for _ in ids)
+    with _transaction() as conn:
+        rows = conn.execute(
+            f"SELECT id, status FROM executions WHERE id IN ({placeholders})",
+            tuple(sorted(ids)),
+        ).fetchall()
+    return len(rows) == len(ids) and all(
+        row["status"] in _TERMINAL_STATES for row in rows
+    )
+
+
 def mark_interrupted_executions_unknown(
     execution_ids: Collection[str], *, retry_job_ids: Collection[str] = (),
 ) -> List[Dict[str, Any]]:
