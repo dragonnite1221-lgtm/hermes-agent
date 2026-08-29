@@ -958,10 +958,16 @@ def _run_claimed_job(
             release_running_job(job_id)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
+        execution_error = refreshed.get("last_error")
+        if not processed and not execution_error:
+            execution_error = (
+                "Execution aborted before the workload started; the scheduled "
+                "occurrence was preserved for retry."
+            )
         return {
             "claimed": True,
             "success": bool(processed and ok),
-            "error": refreshed.get("last_error"),
+            "error": execution_error,
         }
 
     except Exception as e:

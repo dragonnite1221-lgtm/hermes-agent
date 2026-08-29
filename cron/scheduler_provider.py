@@ -355,9 +355,10 @@ class CronScheduler(ABC):
         ``run_one_job`` body. Built-in never calls this (it has its own tick
         loop); an external provider routes its inbound fire here.
 
-        Returns True if THIS caller claimed and processed the attempt, even if
-        the job itself failed. Returns False only if the claim was lost
-        (another machine/retry won it) or the job no longer exists.
+        Returns True if THIS caller claimed the occurrence and the workload
+        started, even if the workload itself failed. Returns False if the
+        claim was lost, the job vanished, or pre-run setup aborted while
+        preserving the occurrence for retry.
         """
         claimed_job = self.claim_fire(job_id, force=force)
         if claimed_job is None:
@@ -390,13 +391,12 @@ class CronScheduler(ABC):
         """
         from cron.scheduler import run_one_job
 
-        run_one_job(
+        return run_one_job(
             claimed_job,
             adapters=adapters,
             loop=loop,
             cancel_event=cancel_event,
         )
-        return True
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):

@@ -168,6 +168,26 @@ class TestCronjobRunExecutesImmediately:
         assert out["job"]["execution_success"] is False
         assert out["job"]["execution_error"] == "provider 500"
 
+    def test_run_reports_pre_run_abort_despite_stale_success_status(self):
+        """A restored occurrence cannot inherit an earlier successful status."""
+        stale = {"id": "job-run-1", "last_status": "ok", "last_error": None}
+        claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
+        with patch(
+            "tools.cronjob_tools.claim_job_for_fire", return_value=claimed
+        ), patch(
+            "cron.scheduler.run_one_job", return_value=False
+        ), patch(
+            "tools.cronjob_tools.get_job", return_value=stale
+        ):
+            result = _execute_job_now(dict(_JOB))
+
+        assert result["claimed"] is True
+        assert result["success"] is False
+        assert result["error"] == (
+            "Execution aborted before the workload started; the scheduled "
+            "occurrence was preserved for retry."
+        )
+
     def test_execute_job_now_bails_without_claim(self):
         """_execute_job_now never calls run_one_job when the claim is lost."""
         with patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \

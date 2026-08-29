@@ -6514,7 +6514,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         _abort_unstarted(
             "Fire claim ownership could not be validated before execution started."
         )
-        return True
+        return False
 
     if owns_fire_claim is False:
         logger.warning(
@@ -6522,7 +6522,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
             job_id,
         )
         _abort_unstarted("Fire claim ownership lost before execution started.")
-        return True
+        return False
     execution_id = str(job.get("execution_id") or "")
     if execution_id:
         try:
@@ -6595,7 +6595,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         _abort_unstarted(
             "Fire claim heartbeat could not be started; execution was not run."
         )
-        return True
+        return False
 
     try:
         return run(lost_ownership)
@@ -6623,8 +6623,9 @@ def run_one_job(
     both the ticker and external providers use the same store CAS before
     calling it. It does keep an acquired claim alive for the full execution.
 
-    Returns True if the job was processed (even if the job itself failed —
-    failure is recorded via ``mark_job_run``), False only if processing raised.
+    Returns True if the workload started and the attempt was processed (even
+    if the workload itself failed — failure is recorded via ``mark_job_run``).
+    Returns False when pre-run setup aborts or processing raises.
 
     ``cancel_event``: optional transport-level cancellation source (dashboard
     webhook drain, API server shutdown). It is OR-combined with the internal
@@ -6756,7 +6757,7 @@ def _run_one_job_body(
                 str(pre_run_error),
                 prefer_recovery=dispatch_outcome_ambiguous,
             )
-            return True
+            return False
 
         # No fallible persistence or thread setup remains between this commit
         # point and invoking the user workload.

@@ -3568,6 +3568,10 @@ def finalize_fire_claim_setup(claimed_job: Dict[str, Any]) -> None:
     _forget_interrupted_retry_best_effort(claimed_job.get("id", ""), interrupted_retry)
 
 
+class FireClaimRollbackUnavailableError(RuntimeError):
+    """The exact claim rollback could not acquire its serialization lock."""
+
+
 def rollback_fire_claim_setup(claimed_job: Dict[str, Any]) -> bool:
     """Restore an occurrence whose execution-ledger fence did not commit.
 
@@ -3584,7 +3588,13 @@ def rollback_fire_claim_setup(claimed_job: Dict[str, Any]) -> bool:
 
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
-            return False
+            # This is not an ownership-CAS loss. The claim may still be ours,
+            # with cadence/retry state consumed, but we could not inspect or
+            # restore it. Force callers onto durable ledger recovery instead
+            # of terminalizing the only remaining retry witness.
+            raise FireClaimRollbackUnavailableError(
+                f"Could not acquire the fire-claim rollback lock for job {job_id}"
+            )
         with _jobs_lock():
             stored_jobs = load_jobs()
             for job in stored_jobs:

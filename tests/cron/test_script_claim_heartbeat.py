@@ -384,7 +384,7 @@ def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", _heartbeat)
     monkeypatch.setattr(scheduler, "run_job", _run_job)
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda job_id: True)
-    monkeypatch.setattr(scheduler, "mark_execution_running", lambda execution_id: None)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda execution_id: True)
     monkeypatch.setattr(scheduler, "finish_execution", lambda *args, **kwargs: None)
     save_output = MagicMock()
     deliver_result = MagicMock()
@@ -418,7 +418,7 @@ def test_initially_lost_fire_claim_finishes_execution_without_running(monkeypatc
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
     monkeypatch.setattr("cron.executions.finish_execution", finish)
 
-    assert scheduler.run_one_job(job) is True
+    assert scheduler.run_one_job(job) is False
 
     run_body.assert_not_called()
     finish.assert_called_once_with(
@@ -446,7 +446,7 @@ def test_initially_lost_claim_does_not_run_when_ledger_write_fails(monkeypatch):
         MagicMock(side_effect=OSError("ledger unavailable")),
     )
 
-    assert scheduler.run_one_job(job) is True
+    assert scheduler.run_one_job(job) is False
     run_body.assert_not_called()
 
 
@@ -469,7 +469,7 @@ def test_initial_heartbeat_exception_does_not_start_execution(monkeypatch):
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
     monkeypatch.setattr("cron.executions.finish_execution", finish)
 
-    assert scheduler.run_one_job(job) is True
+    assert scheduler.run_one_job(job) is False
 
     run_body.assert_not_called()
     finish.assert_called_once_with(
@@ -499,7 +499,7 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
         MagicMock(side_effect=RuntimeError("cannot start thread")),
     )
 
-    assert scheduler.run_one_job(job) is True
+    assert scheduler.run_one_job(job) is False
 
     run_body.assert_not_called()
     finish.assert_called_once_with(

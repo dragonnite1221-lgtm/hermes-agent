@@ -387,9 +387,34 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
 
     assert InProcessCronScheduler().fire_due("j1") is True
     assert claims == [
-        ("j1", {"return_job": True, "execution_id": "exec-1"})
+        ("j1", {"return_job": True, "execution_id": "exec-1", "force": False})
     ]
     assert ran == [("j1", "exact-owner")]
+
+
+def test_fire_due_propagates_pre_run_abort(monkeypatch):
+    """A claimed occurrence is not reported as fired unless its body starts."""
+    import cron.executions as executions
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    monkeypatch.setattr(
+        jobs,
+        "claim_job_for_fire",
+        lambda jid, **kw: {
+            "id": jid,
+            "name": "t",
+            "fire_claim": {"by": "exact-owner"},
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        executions, "create_execution", lambda *_a, **_kw: {"id": "exec-1"}
+    )
+    monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: False)
+
+    assert InProcessCronScheduler().fire_due("j1") is False
 
 
 def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):

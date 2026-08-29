@@ -1,3 +1,4 @@
+import contextlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -1107,7 +1108,7 @@ def test_pre_run_failure_restores_interrupted_retry(
 
         monkeypatch.setattr(scheduler.threading.Thread, "start", _thread_start_error)
 
-    assert scheduler.run_one_job(claimed) is True
+    assert scheduler.run_one_job(claimed) is False
 
     restored = jobs.get_job(job["id"])
     assert restored["fire_claim"] is None
@@ -1151,7 +1152,7 @@ def test_pre_run_rollback_io_failure_releases_attempt_for_periodic_recovery(
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", _heartbeat_error)
     monkeypatch.setattr(cron_jobs, "rollback_fire_claim_setup", _rollback_error)
 
-    assert scheduler.run_one_job(claimed) is True
+    assert scheduler.run_one_job(claimed) is False
 
     replacement = next(
         row
@@ -1163,6 +1164,49 @@ def test_pre_run_rollback_io_failure_releases_attempt_for_periodic_recovery(
 
     # Once jobs-store I/O recovers, the ordinary periodic recovery path sees
     # the explicitly released owner and reconstructs the owed retry.
+    assert executions.recover_interrupted_executions() == 1
+    retry = jobs.get_job(job["id"])["interrupted_retry"]
+    assert retry["execution_ids"] == [replacement_id]
+
+
+def test_pre_run_rollback_lock_failure_releases_attempt_for_periodic_recovery(
+    isolated_cron, monkeypatch
+):
+    import cron.jobs as cron_jobs
+    import cron.scheduler as scheduler
+    from cron.scheduler_provider import claim_fire_with_execution
+
+    job = _script_job(retry_interrupted=True)
+    abandoned = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(abandoned["id"])
+    assert jobs.requeue_interrupted_jobs([abandoned]) == {job["id"]}
+    executions.mark_interrupted_executions_unknown(
+        [abandoned["id"]], retry_job_ids={job["id"]}
+    )
+    claimed = claim_fire_with_execution(job["id"], source="direct")
+    assert isinstance(claimed, dict)
+    replacement_id = claimed["execution_id"]
+
+    def _heartbeat_error(*_args, **_kwargs):
+        raise OSError("jobs store unavailable")
+
+    @contextlib.contextmanager
+    def _unavailable_fire_job_lock(_job_id):
+        yield False
+
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", _heartbeat_error)
+    monkeypatch.setattr(cron_jobs, "_fire_job_lock", _unavailable_fire_job_lock)
+
+    assert scheduler.run_one_job(claimed) is False
+
+    replacement = next(
+        row
+        for row in executions.list_executions(job_id=job["id"])
+        if row["id"] == replacement_id
+    )
+    assert replacement["status"] == "claimed"
+    assert replacement["pid"] == -1
+
     assert executions.recover_interrupted_executions() == 1
     retry = jobs.get_job(job["id"])["interrupted_retry"]
     assert retry["execution_ids"] == [replacement_id]
@@ -1196,7 +1240,7 @@ def test_running_ledger_failure_restores_retry_before_dispatch(
         lambda _job_id: dispatch_calls.append(True) or True,
     )
 
-    assert scheduler.run_one_job(claimed) is True
+    assert scheduler.run_one_job(claimed) is False
 
     restored = jobs.get_job(job["id"])
     assert restored["interrupted_retry"] == before["interrupted_retry"]
@@ -1239,7 +1283,7 @@ def test_ambiguous_oneshot_dispatch_is_recovered_with_its_capacity(
 
     monkeypatch.setattr(scheduler, "claim_dispatch", _ambiguous_dispatch)
 
-    assert scheduler.run_one_job(claimed) is True
+    assert scheduler.run_one_job(claimed) is False
     assert jobs.get_job(job["id"])["repeat"]["completed"] == 1
 
     assert executions.recover_interrupted_executions() == 1
