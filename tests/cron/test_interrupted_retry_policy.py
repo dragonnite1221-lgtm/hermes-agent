@@ -161,6 +161,107 @@ def test_paused_oneshot_retry_resumes_from_retry_eligibility(
     assert resumed["interrupted_retry"]["execution_ids"] == [execution["id"]]
 
 
+def test_resume_and_requeue_commit_under_one_jobs_lock(
+    isolated_cron, monkeypatch
+):
+    import threading
+
+    job = _script_job(retry_interrupted=True)
+    jobs.pause_job(job["id"])
+    execution = {"id": "exec-resume-race", "job_id": job["id"]}
+    resume_loaded = threading.Event()
+    allow_resume = threading.Event()
+    requeue_done = threading.Event()
+    real_load_jobs = jobs.load_jobs
+    resume_thread = None
+
+    def blocking_load_jobs():
+        records = real_load_jobs()
+        if threading.current_thread() is resume_thread and not resume_loaded.is_set():
+            resume_loaded.set()
+            assert allow_resume.wait(timeout=5)
+        return records
+
+    monkeypatch.setattr(jobs, "load_jobs", blocking_load_jobs)
+    resume_thread = threading.Thread(target=jobs.resume_job, args=(job["id"],))
+    resume_thread.start()
+    assert resume_loaded.wait(timeout=5)
+
+    def requeue():
+        jobs.requeue_interrupted_jobs([execution])
+        requeue_done.set()
+
+    requeue_thread = threading.Thread(target=requeue)
+    requeue_thread.start()
+    assert requeue_done.wait(timeout=0.1) is False
+    allow_resume.set()
+    resume_thread.join(timeout=5)
+    requeue_thread.join(timeout=5)
+
+    assert not resume_thread.is_alive()
+    assert not requeue_thread.is_alive()
+    recovered = jobs.get_job(job["id"])
+    assert recovered["interrupted_retry"]["execution_ids"] == [execution["id"]]
+    assert recovered["next_run_at"] == recovered["interrupted_retry"]["eligible_at"]
+
+
+def test_resume_and_retry_cancel_commit_under_one_jobs_lock(
+    isolated_cron, monkeypatch
+):
+    import threading
+
+    now = datetime.now(timezone.utc)
+    job = jobs.create_job(
+        prompt=None,
+        schedule=(now + timedelta(minutes=1)).isoformat(),
+        script="idempotent-sync.py",
+        no_agent=True,
+        deliver="local",
+        retry_interrupted=True,
+    )
+    jobs.update_job(job["id"], {"repeat": {"times": 1, "completed": 1}})
+    execution = {"id": "exec-resume-cancel-race", "job_id": job["id"]}
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+    jobs.pause_job(job["id"])
+    resume_loaded = threading.Event()
+    allow_resume = threading.Event()
+    cancel_done = threading.Event()
+    real_load_jobs = jobs.load_jobs
+    resume_thread = None
+
+    def blocking_load_jobs():
+        records = real_load_jobs()
+        if threading.current_thread() is resume_thread and not resume_loaded.is_set():
+            resume_loaded.set()
+            assert allow_resume.wait(timeout=5)
+        return records
+
+    monkeypatch.setattr(jobs, "load_jobs", blocking_load_jobs)
+    resume_thread = threading.Thread(target=jobs.resume_job, args=(job["id"],))
+    resume_thread.start()
+    assert resume_loaded.wait(timeout=5)
+
+    def cancel_retry():
+        jobs.update_job(job["id"], {"retry_interrupted": False})
+        cancel_done.set()
+
+    cancel_thread = threading.Thread(target=cancel_retry)
+    cancel_thread.start()
+    assert cancel_done.wait(timeout=0.1) is False
+    allow_resume.set()
+    resume_thread.join(timeout=5)
+    cancel_thread.join(timeout=5)
+
+    assert not resume_thread.is_alive()
+    assert not cancel_thread.is_alive()
+    cancelled = jobs.get_job(job["id"])
+    assert "interrupted_retry" not in cancelled
+    assert cancelled["retry_interrupted"] is False
+    assert cancelled["enabled"] is False
+    assert cancelled["state"] == "error"
+    assert cancelled["next_run_at"] is None
+
+
 def test_recovery_records_retry_for_job_paused_before_restart(
     isolated_cron, monkeypatch
 ):

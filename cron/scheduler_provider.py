@@ -653,7 +653,15 @@ class InProcessCronScheduler(CronScheduler):
             return
 
         # ── Single-profile (legacy) path ──────────────────────────────────
-        recovered = self.recover_interrupted()
+        try:
+            recovered = self.recover_interrupted()
+        except Exception as exc:
+            recovered = 0
+            logger.error(
+                "Initial interrupted-execution recovery failed; continuing cron ticker: %s",
+                exc,
+                exc_info=True,
+            )
         if recovered:
             logger.warning(
                 "Marked %d interrupted cron execution(s) unknown after restart",
@@ -752,7 +760,17 @@ class InProcessCronScheduler(CronScheduler):
             home_token = set_hermes_home_override(str(home))
             try:
                 with use_cron_store(home):
-                    recovered = self.recover_interrupted()
+                    try:
+                        recovered = self.recover_interrupted()
+                    except Exception as exc:
+                        recovered = 0
+                        logger.error(
+                            "Initial interrupted-execution recovery failed for "
+                            "profile at %s; continuing multiplex ticker: %s",
+                            home,
+                            exc,
+                            exc_info=True,
+                        )
                     if recovered:
                         logger.warning(
                             "Marked %d interrupted cron execution(s) for profile at %s",

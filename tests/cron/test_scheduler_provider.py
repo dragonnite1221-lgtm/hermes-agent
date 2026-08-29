@@ -667,3 +667,62 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
+
+
+def test_single_profile_recovery_failure_does_not_stop_ticker(monkeypatch):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    stop = threading.Event()
+    ticks = []
+    heartbeats = []
+    provider = InProcessCronScheduler()
+    monkeypatch.setattr(
+        provider,
+        "recover_interrupted",
+        lambda: (_ for _ in ()).throw(OSError("ledger locked")),
+    )
+
+    def tick_once(*_args, **_kwargs):
+        ticks.append(1)
+        stop.set()
+
+    with patch("cron.scheduler.tick", side_effect=tick_once), patch(
+        "cron.jobs.record_ticker_heartbeat",
+        lambda **kwargs: heartbeats.append(kwargs),
+    ):
+        provider.start(stop, interval=0)
+
+    assert ticks == [1]
+    assert heartbeats
+
+
+def test_multiplex_recovery_failure_is_isolated_per_profile(tmp_path, monkeypatch):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    profiles = [("broken", tmp_path / "broken"), ("healthy", tmp_path / "healthy")]
+    for _, home in profiles:
+        (home / "cron").mkdir(parents=True)
+    stop = threading.Event()
+    recovery_calls = []
+    tick_calls = []
+    provider = InProcessCronScheduler()
+
+    def recover():
+        recovery_calls.append(1)
+        if len(recovery_calls) == 1:
+            raise OSError("broken profile ledger")
+        return 0
+
+    def tick(*_args, **_kwargs):
+        tick_calls.append(1)
+        if len(tick_calls) == len(profiles):
+            stop.set()
+
+    monkeypatch.setattr(provider, "recover_interrupted", recover)
+    with patch("cron.scheduler.tick", side_effect=tick), patch(
+        "cron.jobs.record_ticker_heartbeat", lambda **_kwargs: None
+    ):
+        provider.start(stop, interval=0, profile_homes=profiles)
+
+    assert len(recovery_calls) == len(profiles)
+    assert len(tick_calls) == len(profiles)

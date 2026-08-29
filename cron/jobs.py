@@ -2103,29 +2103,40 @@ class AmbiguousJobReference(LookupError):
         )
 
 
-def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
-    """Resolve a job reference (ID or name) to a job record.
-
-    - Exact ID match wins (works even if a different job's name equals this ID).
-    - Otherwise, case-insensitive name match.
-    - If a name matches more than one job, raises AmbiguousJobReference so the
-      caller can surface the matching IDs rather than silently picking one.
-    """
+def _resolve_job_ref_from_records(
+    ref: str, records: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Resolve one ID/name against an already-consistent jobs snapshot."""
     if not ref:
         return None
-    jobs = load_jobs()
-    for job in jobs:
+    for job in records:
         if job["id"] == ref:
-            return _normalize_job_record(job)
+            return job
     ref_lower = ref.lower()
-    name_matches = [j for j in jobs if (j.get("name") or "").lower() == ref_lower]
+    name_matches = [
+        job
+        for job in records
+        if (job.get("name") or "").lower() == ref_lower
+    ]
     if not name_matches:
         return None
     if len(name_matches) > 1:
         raise AmbiguousJobReference(
             ref, [_normalize_job_record(j) for j in name_matches]
         )
-    return _normalize_job_record(name_matches[0])
+    return name_matches[0]
+
+
+def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
+    """Resolve a job reference (ID or name) to a normalized job record.
+
+    - Exact ID match wins (works even if a different job's name equals this ID).
+    - Otherwise, case-insensitive name match.
+    - If a name matches more than one job, raises AmbiguousJobReference so the
+      caller can surface the matching IDs rather than silently picking one.
+    """
+    job = _resolve_job_ref_from_records(ref, load_jobs())
+    return _normalize_job_record(job) if job is not None else None
 
 
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
@@ -2382,42 +2393,51 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
 
 def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Resume a paused job and compute the next future run from now. Accepts a job ID or name."""
-    job = resolve_job_ref(job_id)
-    if not job:
-        return None
+    with _jobs_lock():
+        records = load_jobs()
+        job = _resolve_job_ref_from_records(job_id, records)
+        if job is None:
+            return None
 
-    retry = job.get("interrupted_retry")
-    schedule = job.get("schedule")
-    if isinstance(retry, dict):
-        # A paused interrupted retry is a durable owed attempt. Its original
-        # one-shot run_at may already be in the past, so recomputing from the
-        # original schedule would strand it permanently. Preserve the retry's
-        # independently persisted eligibility instead; the due scan still
-        # fences dispatch on the execution-ledger handoff.
-        try:
-            next_run_at = _ensure_aware(
-                datetime.fromisoformat(str(retry["eligible_at"]))
-            ).isoformat()
-        except (KeyError, TypeError, ValueError):
-            next_run_at = _hermes_now().isoformat()
-    else:
-        next_run_at = compute_next_run(schedule) if isinstance(schedule, dict) else None
-    if next_run_at is None and isinstance(schedule, dict) and schedule.get("kind") == "once":
-        run_at = schedule.get("run_at", "unknown")
-        raise ValueError(
-            f"Cannot resume: one-shot time {run_at} is in the past "
-            f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
+        retry = job.get("interrupted_retry")
+        schedule = job.get("schedule")
+        if isinstance(retry, dict):
+            # A paused interrupted retry is a durable owed attempt. Its original
+            # one-shot run_at may already be in the past, so recomputing from the
+            # original schedule would strand it permanently. Preserve the retry's
+            # independently persisted eligibility instead; the due scan still
+            # fences dispatch on the execution-ledger handoff.
+            try:
+                next_run_at = _ensure_aware(
+                    datetime.fromisoformat(str(retry["eligible_at"]))
+                ).isoformat()
+            except (KeyError, TypeError, ValueError):
+                next_run_at = _hermes_now().isoformat()
+        else:
+            next_run_at = (
+                compute_next_run(schedule) if isinstance(schedule, dict) else None
+            )
+        if (
+            next_run_at is None
+            and isinstance(schedule, dict)
+            and schedule.get("kind") == "once"
+        ):
+            run_at = schedule.get("run_at", "unknown")
+            raise ValueError(
+                f"Cannot resume: one-shot time {run_at} is in the past "
+                f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
+            )
+        job.update(
+            {
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "next_run_at": next_run_at,
+            }
         )
-    return update_job(
-        job["id"],
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": next_run_at,
-        },
-    )
+        save_jobs(records)
+        return _normalize_job_record(job)
 
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
