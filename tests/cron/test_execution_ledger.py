@@ -426,6 +426,45 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     assert "submit-fail" not in scheduler.get_running_job_ids()
 
 
+def test_builtin_claim_failure_discards_provisional_execution(monkeypatch, tmp_path):
+    import concurrent.futures
+
+    import cron.scheduler as scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    class InlinePool:
+        def submit(self, callable_):
+            future = concurrent.futures.Future()
+            try:
+                future.set_result(callable_())
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        executions.create_execution,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "discard_unacquired_execution",
+        executions.discard_unacquired_execution,
+    )
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "claim-fail"}])
+
+    def fail_claim(*_args, **_kwargs):
+        raise OSError("jobs store unavailable")
+
+    monkeypatch.setattr(scheduler, "claim_job_for_fire", fail_claim)
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: InlinePool())
+
+    assert scheduler.tick(verbose=False, sync=True) == 0
+    assert executions.list_executions(job_id="claim-fail") == []
+    assert "claim-fail" not in scheduler.get_running_job_ids()
+
+
 def test_run_one_job_records_running_then_terminal(monkeypatch):
     import cron.scheduler as scheduler
 

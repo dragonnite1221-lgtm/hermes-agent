@@ -7419,11 +7419,27 @@ def tick(
             # Acquire the durable claim only when this worker actually starts,
             # not while it may wait behind other work in an executor queue.
             # This prevents a queued lease from expiring before execution.
-            claimed = claim_job_for_fire(
-                job["id"],
-                return_job=True,
-                execution_id=job["execution_id"],
-            )
+            try:
+                claimed = claim_job_for_fire(
+                    job["id"],
+                    return_job=True,
+                    execution_id=job["execution_id"],
+                )
+            except Exception:
+                # The execution row is provisional until the jobs-store CAS
+                # succeeds.  A transient jobs.json read/write failure must not
+                # leave a live-gateway-owned ``claimed`` row behind: recovery
+                # correctly treats that owner as alive, so repeated failures
+                # would otherwise accumulate until the process exits.
+                try:
+                    discard_unacquired_execution(job["execution_id"])
+                except Exception:
+                    logger.exception(
+                        "Could not discard provisional execution %s after "
+                        "fire-claim setup failed",
+                        job["execution_id"],
+                    )
+                raise
             if not claimed:
                 discard_unacquired_execution(job["execution_id"])
                 return True
