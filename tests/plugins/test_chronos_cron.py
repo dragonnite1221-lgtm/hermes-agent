@@ -146,15 +146,29 @@ def test_fire_due_rearms_after_claimed_job_failure(chronos, monkeypatch):
         "next_run_at": "2026-06-18T12:05:00+00:00",
     }
 
-    monkeypatch.setattr("cron.jobs.claim_job_for_fire", lambda jid, **kw: claimed)
+    claim_calls = []
+    acquired = []
+    monkeypatch.setattr(
+        "cron.jobs.claim_job_for_fire",
+        lambda jid, **kw: claim_calls.append(kw) or claimed,
+    )
     monkeypatch.setattr(
         "cron.executions.create_execution",
-        lambda jid, source: {"id": "exec-1"},
+        lambda jid, source, fire_claim_acquired: {
+            "id": "exec-1",
+            "fire_claim_acquired": int(fire_claim_acquired),
+        },
+    )
+    monkeypatch.setattr(
+        "cron.executions.mark_fire_claim_acquired",
+        lambda execution_id: acquired.append(execution_id) or {"id": execution_id},
     )
     monkeypatch.setattr("cron.scheduler.run_one_job", lambda *args, **kwargs: False)
     monkeypatch.setattr("cron.jobs.get_job", lambda jid: persisted)
 
     assert prov.fire_due("j1") is True
+    assert claim_calls == [{"return_job": True, "execution_id": "exec-1"}]
+    assert acquired == ["exec-1"]
     assert [provision["job_id"] for provision in fake.provisions] == ["j1"]
 
 
@@ -162,17 +176,28 @@ def test_fire_due_forwards_manual_force_to_claim(chronos, monkeypatch):
     """A manual force fire must reach the store claim as force=True."""
     prov, _fake = chronos
     seen = []
+    discarded = []
     monkeypatch.setattr(
         "cron.jobs.claim_job_for_fire",
         lambda jid, **kw: seen.append(kw) or False,
     )
     monkeypatch.setattr(
         "cron.executions.create_execution",
-        lambda jid, source: {"id": "exec-1"},
+        lambda jid, source, fire_claim_acquired: {
+            "id": "exec-1",
+            "fire_claim_acquired": int(fire_claim_acquired),
+        },
+    )
+    monkeypatch.setattr(
+        "cron.executions.discard_unacquired_execution",
+        lambda execution_id: discarded.append(execution_id),
     )
 
     assert prov.fire_due("j1", force=True) is False
-    assert seen == [{"return_job": True, "force": True}]
+    assert seen == [
+        {"return_job": True, "execution_id": "exec-1", "force": True}
+    ]
+    assert discarded == ["exec-1"]
 
 
 def test_fire_due_no_rearm_when_job_gone(chronos, monkeypatch):
