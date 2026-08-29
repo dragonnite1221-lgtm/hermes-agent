@@ -3239,14 +3239,33 @@ def _claim_job_for_fire_locked(
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
+            interrupted_retry = job.get("interrupted_retry")
+            if not _interrupted_retry_ready(job, now):
+                return False
+            # Keep an in-memory undo record for the second half of the
+            # cross-store hand-off.  The jobs-store CAS necessarily commits
+            # before the execution-ledger fence; if that SQLite promotion
+            # cannot be committed, the caller uses this exact snapshot to put
+            # the occurrence back instead of silently consuming it.
+            rollback = {
+                key: {
+                    "present": key in job,
+                    "value": copy.deepcopy(job.get(key)),
+                }
+                for key in (
+                    "next_run_at",
+                    "interrupted_retry",
+                    "enabled",
+                    "state",
+                    "paused_at",
+                    "paused_reason",
+                )
+            }
             if force:
                 job["enabled"] = True
                 job["state"] = "scheduled"
                 job["paused_at"] = None
                 job["paused_reason"] = None
-            interrupted_retry = job.get("interrupted_retry")
-            if not _interrupted_retry_ready(job, now):
-                return False
             # Per-acquisition token: a process may legitimately reclaim its own
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
@@ -3266,9 +3285,76 @@ def _claim_job_for_fire_locked(
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
-            _forget_interrupted_retry_best_effort(job_id, interrupted_retry)
-            return copy.deepcopy(job) if return_job else True
+            claimed_job = copy.deepcopy(job)
+            claimed_job["_fire_claim_rollback"] = rollback
+            # Ledger-first callers finalize the acknowledgement only after
+            # their execution row is fenced as the CAS winner.  Legacy bool
+            # callers have no second phase, so retain the historical cleanup.
+            if not execution_id or not return_job:
+                _forget_interrupted_retry_best_effort(job_id, interrupted_retry)
+            return claimed_job if return_job else True
         return False
+
+
+def finalize_fire_claim_setup(claimed_job: Dict[str, Any]) -> None:
+    """Finish the jobs/ledger hand-off after the execution fence commits."""
+    rollback = claimed_job.pop("_fire_claim_rollback", None)
+    if not isinstance(rollback, dict):
+        return
+    retry_snapshot = rollback.get("interrupted_retry")
+    interrupted_retry = (
+        retry_snapshot.get("value")
+        if isinstance(retry_snapshot, dict) and retry_snapshot.get("present")
+        else None
+    )
+    _forget_interrupted_retry_best_effort(claimed_job.get("id", ""), interrupted_retry)
+
+
+def rollback_fire_claim_setup(claimed_job: Dict[str, Any]) -> bool:
+    """Restore an occurrence whose execution-ledger fence did not commit.
+
+    The rollback is compare-and-set against the exact jobs-store claim owner
+    and execution id.  It therefore cannot undo a later owner's claim.  Retry
+    acknowledgements are deliberately left intact so an interrupted retry is
+    claimable again after restoration.
+    """
+    rollback = claimed_job.get("_fire_claim_rollback")
+    expected_claim = claimed_job.get("fire_claim")
+    job_id = str(claimed_job.get("id") or "")
+    if not job_id or not isinstance(rollback, dict) or not isinstance(expected_claim, dict):
+        return False
+
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            stored_jobs = load_jobs()
+            for job in stored_jobs:
+                if job.get("id") != job_id:
+                    continue
+                current_claim = job.get("fire_claim")
+                if not isinstance(current_claim, dict):
+                    return False
+                if current_claim.get("by") != expected_claim.get("by"):
+                    return False
+                if current_claim.get("execution_id") != expected_claim.get("execution_id"):
+                    return False
+
+                for key, snapshot in rollback.items():
+                    if not isinstance(snapshot, dict):
+                        continue
+                    if snapshot.get("present"):
+                        job[key] = copy.deepcopy(snapshot.get("value"))
+                    else:
+                        job.pop(key, None)
+                # Never reinstate the stale/malformed claim that this CAS
+                # superseded; removing our exact claim makes the restored
+                # occurrence immediately eligible for a clean attempt.
+                job["fire_claim"] = None
+                save_jobs(stored_jobs)
+                claimed_job.pop("_fire_claim_rollback", None)
+                return True
+    return False
 
 
 # Completed one-shot job records are retained in jobs.json (final status +

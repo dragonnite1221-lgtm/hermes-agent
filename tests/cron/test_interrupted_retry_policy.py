@@ -417,6 +417,104 @@ def test_lost_fire_claim_does_not_create_phantom_failed_execution(isolated_cron)
     assert executions.list_executions(job_id=job["id"]) == []
 
 
+def test_post_cas_execution_fence_retries_idempotently(isolated_cron, monkeypatch):
+    import cron.scheduler_provider as provider
+
+    job = _script_job()
+    original_mark = executions.mark_fire_claim_acquired
+    attempts = []
+
+    def flaky_mark(execution_id):
+        attempts.append(execution_id)
+        if len(attempts) < 3:
+            raise OSError("execution ledger temporarily unavailable")
+        return original_mark(execution_id)
+
+    monkeypatch.setattr(executions, "mark_fire_claim_acquired", flaky_mark)
+
+    claimed = provider.claim_fire_with_execution(job["id"], source="external")
+
+    assert claimed is not None
+    assert attempts == [claimed["execution_id"]] * 3
+    assert executions.latest_execution(job["id"])["fire_claim_acquired"] == 1
+    assert jobs.get_job(job["id"])["fire_claim"]["execution_id"] == claimed["execution_id"]
+
+
+def test_post_cas_execution_fence_failure_restores_interrupted_retry(
+    isolated_cron, monkeypatch
+):
+    import cron.scheduler_provider as provider
+
+    job = _script_job(retry_interrupted=True)
+    abandoned = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(abandoned["id"])
+    assert jobs.requeue_interrupted_jobs([abandoned]) == {job["id"]}
+    executions.mark_interrupted_executions_unknown(
+        [abandoned["id"]], retry_job_ids={job["id"]}
+    )
+    before = jobs.get_job(job["id"])
+
+    monkeypatch.setattr(
+        executions,
+        "mark_fire_claim_acquired",
+        lambda _execution_id: (_ for _ in ()).throw(OSError("ledger offline")),
+    )
+
+    with pytest.raises(FireClaimNotAcquiredError, match="occurrence was restored"):
+        provider.claim_fire_with_execution(job["id"], source="external")
+
+    restored = jobs.get_job(job["id"])
+    assert restored["fire_claim"] is None
+    assert restored["next_run_at"] == before["next_run_at"]
+    assert restored["interrupted_retry"] == before["interrupted_retry"]
+    assert executions.execution_ids_are_terminal(
+        [abandoned["id"]], job_id=job["id"]
+    ) is True
+    assert all(
+        row["fire_claim_acquired"] == 1
+        for row in executions.list_executions(job_id=job["id"])
+    )
+
+
+def test_execution_fence_confirmation_is_idempotent(isolated_cron):
+    job = _script_job()
+    execution = executions.create_execution(
+        job["id"], source="external", fire_claim_acquired=False
+    )
+
+    first = executions.mark_fire_claim_acquired(execution["id"])
+    second = executions.mark_fire_claim_acquired(execution["id"])
+
+    assert first is not None
+    assert second is not None
+    assert first["id"] == second["id"] == execution["id"]
+
+
+def test_failed_forced_fire_restores_paused_state(isolated_cron, monkeypatch):
+    import cron.scheduler_provider as provider
+
+    job = _script_job()
+    before = jobs.pause_job(job["id"], reason="operator maintenance")
+    monkeypatch.setattr(
+        executions,
+        "mark_fire_claim_acquired",
+        lambda _execution_id: None,
+    )
+
+    with pytest.raises(FireClaimNotAcquiredError, match="occurrence was restored"):
+        provider.claim_fire_with_execution(
+            job["id"], source="manual", force=True
+        )
+
+    restored = jobs.get_job(job["id"])
+    assert restored["enabled"] == before["enabled"] is False
+    assert restored["state"] == before["state"] == "paused"
+    assert restored["paused_at"] == before["paused_at"]
+    assert restored["paused_reason"] == before["paused_reason"]
+    assert restored["next_run_at"] == before["next_run_at"]
+    assert restored["fire_claim"] is None
+
+
 def test_ledger_create_failure_never_attempts_or_consumes_fire_claim(
     isolated_cron, monkeypatch
 ):

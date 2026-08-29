@@ -7430,7 +7430,17 @@ def tick(
                 discard_unacquired_execution(job["execution_id"])
                 return True
             if job.get("execution_fire_claim_pending") is True:
-                if mark_fire_claim_acquired(job["execution_id"]) is None:
+                if isinstance(claimed, dict) and isinstance(
+                    claimed.get("_fire_claim_rollback"), dict
+                ):
+                    from cron.scheduler_provider import commit_fire_claim_execution
+
+                    commit_fire_claim_execution(claimed, job["execution_id"])
+                elif mark_fire_claim_acquired(job["execution_id"]) is None:
+                    # Compatibility for legacy/test overrides that return the
+                    # historical bool even with return_job=True. Production
+                    # jobs-store calls return the exact dict and take the
+                    # rollback-capable branch above.
                     raise RuntimeError(
                         "Fire claim won but execution ownership fence was not committed"
                     )

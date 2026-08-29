@@ -33,6 +33,62 @@ class FireClaimNotAcquiredError(RuntimeError):
     """Ledger/claim setup failed before this caller acquired fire ownership."""
 
 
+def commit_fire_claim_execution(
+    claimed_job: dict, execution_id: str, *, attempts: int = 3
+) -> dict:
+    """Commit the execution fence or durably restore the consumed fire.
+
+    The execution update is idempotent, so ambiguous SQLite outcomes can be
+    retried safely.  If it still cannot be confirmed, the exact jobs-store CAS
+    is rolled back before the provisional ledger row is discarded.  Callers
+    therefore never return with a cadence or interrupted retry consumed but no
+    runnable execution behind it.
+    """
+    from cron.executions import (
+        discard_unacquired_execution,
+        mark_fire_claim_acquired,
+    )
+    from cron.jobs import finalize_fire_claim_setup, rollback_fire_claim_setup
+
+    last_error: Exception | None = None
+    for _attempt in range(max(1, attempts)):
+        try:
+            record = mark_fire_claim_acquired(execution_id)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if record is not None:
+            finalize_fire_claim_setup(claimed_job)
+            return record
+        last_error = RuntimeError("execution row was not claimable")
+
+    try:
+        rolled_back = rollback_fire_claim_setup(claimed_job)
+    except Exception as exc:
+        raise FireClaimNotAcquiredError(
+            "Fire claim execution fence failed and its durable rollback also failed; "
+            "the jobs-store claim remains as a recovery witness"
+        ) from exc
+    if not rolled_back:
+        raise FireClaimNotAcquiredError(
+            "Fire claim execution fence failed and the exact jobs-store claim "
+            "could not be rolled back; the persisted claim remains as a recovery witness"
+        ) from last_error
+
+    try:
+        discard_unacquired_execution(execution_id)
+    except Exception:
+        logger.warning(
+            "Could not discard rolled-back provisional execution %s; "
+            "reconciliation will remove it",
+            execution_id,
+            exc_info=True,
+        )
+    raise FireClaimNotAcquiredError(
+        "Fire claim execution fence could not be committed; the occurrence was restored"
+    ) from last_error
+
+
 def claim_fire_with_execution(
     job_id: str, *, source: str, force: bool = False
 ) -> dict | None:
@@ -44,11 +100,7 @@ def claim_fire_with_execution(
     still leaves a recoverable owner record rather than silently losing the
     owed retry.
     """
-    from cron.executions import (
-        create_execution,
-        discard_unacquired_execution,
-        mark_fire_claim_acquired,
-    )
+    from cron.executions import create_execution, discard_unacquired_execution
     from cron.jobs import claim_job_for_fire
 
     try:
@@ -78,13 +130,8 @@ def claim_fire_with_execution(
     if not isinstance(claimed_job, dict):
         discard_unacquired_execution(execution["id"])
         return None
-    if (
-        execution.get("fire_claim_acquired") == 0
-        and mark_fire_claim_acquired(execution["id"]) is None
-    ):
-        raise FireClaimNotAcquiredError(
-            "Fire claim was acquired but its execution fence could not be committed"
-        )
+    if execution.get("fire_claim_acquired") == 0:
+        commit_fire_claim_execution(claimed_job, execution["id"])
     claimed_job["execution_id"] = execution["id"]
     return claimed_job
 

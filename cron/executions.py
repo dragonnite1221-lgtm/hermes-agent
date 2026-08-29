@@ -282,20 +282,27 @@ def discard_unacquired_execution(execution_id: str) -> bool:
 
 
 def mark_fire_claim_acquired(execution_id: str) -> Optional[Dict[str, Any]]:
-    """Fence a ledger-first attempt after its jobs-store fire CAS succeeds."""
+    """Idempotently fence an attempt after its jobs-store fire CAS succeeds."""
     now = _hermes_now().isoformat()
+    transitioned = False
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions SET fire_claim_acquired=1, heartbeat_at=?
                WHERE id=? AND status='claimed' AND fire_claim_acquired=0""",
             (now, str(execution_id)),
         )
-        if cur.rowcount != 1:
-            return None
+        transitioned = cur.rowcount == 1
         record = _record(
             conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
         )
-    _emit_execution_state(record)
+        if (
+            record is None
+            or record.get("status") != "claimed"
+            or int(record.get("fire_claim_acquired") or 0) != 1
+        ):
+            return None
+    if transitioned:
+        _emit_execution_state(record)
     return record
 
 
