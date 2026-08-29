@@ -9,6 +9,8 @@ All NAS calls are mocked — ZERO live network. These prove:
     (job gone) stops re-arming.
 """
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 
@@ -266,6 +268,45 @@ def test_fire_claimed_rearms_persisted_retry_when_run_aborts(chronos, monkeypatc
 
     assert prov.fire_claimed({"id": "j1"}) is False
     assert [provision["job_id"] for provision in fake.provisions] == ["j1"]
+
+
+def test_fire_claimed_moves_restored_occurrence_to_fresh_future_time(
+    temp_home, chronos, monkeypatch
+):
+    from cron import jobs
+
+    prov, fake = chronos
+    now = datetime(2026, 8, 30, 1, 0, tzinfo=timezone.utc)
+    restored_fire_at = (now - timedelta(seconds=1)).isoformat()
+    job = jobs.create_job(
+        prompt=None,
+        schedule="every 1h",
+        script="idempotent-sync.py",
+        no_agent=True,
+        deliver="local",
+    )
+    jobs.update_job(
+        job["id"], {"next_run_at": restored_fire_at, "fire_claim": None}
+    )
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    monkeypatch.setattr(
+        "cron.scheduler_provider.CronScheduler.fire_claimed",
+        lambda self, claimed, **kw: False,
+    )
+    claimed = {
+        "id": job["id"],
+        "execution_id": "exec-aborted",
+        "_fire_claim_rollback": {
+            "next_run_at": {"present": True, "value": restored_fire_at}
+        },
+    }
+
+    assert prov.fire_claimed(claimed) is False
+
+    retry_at = (now + timedelta(seconds=jobs.ABORTED_FIRE_RETRY_DELAY_SECONDS)).isoformat()
+    assert jobs.get_job(job["id"])["next_run_at"] == retry_at
+    assert fake.provisions[-1]["fire_at"] == retry_at
+    assert fake.provisions[-1]["dedup_key"] != f"{job['id']}:{restored_fire_at}"
 
 
 def test_fire_claimed_no_rearm_when_job_gone(chronos, monkeypatch):

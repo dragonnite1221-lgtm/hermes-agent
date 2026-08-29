@@ -426,8 +426,7 @@ def release_execution_for_recovery(
     # the caller's terminal fallback fail during an outage, the same live
     # process must still be able to distinguish this deliberately relinquished
     # attempt from its genuinely running executions on the next recovery pass.
-    with _recovery_intent_lock:
-        _recovery_intent_ids.add(execution_id)
+    remember_execution_recovery_intent(execution_id)
     now = _hermes_now().isoformat()
     detail = str(error) if error else "Pre-run setup aborted before execution."
     with _transaction() as conn:
@@ -442,14 +441,31 @@ def release_execution_for_recovery(
     return cur.rowcount == 1
 
 
+def remember_execution_recovery_intent(execution_id: str) -> None:
+    """Keep a process-local witness when durable relinquish is unavailable.
+
+    The ledger-first fire path can lose both its SQLite promotion and the
+    jobs-store rollback acknowledgement during the same outage.  Recording
+    this intent before either fallible cleanup lets this still-live process
+    reconcile its own provisional row instead of waiting for a restart to
+    make the owner lease look abandoned.
+    """
+    with _recovery_intent_lock:
+        _recovery_intent_ids.add(str(execution_id))
+
+
 def discard_unacquired_execution(execution_id: str) -> bool:
     """Remove a ledger-first row when the corresponding job claim lost."""
+    execution_id = str(execution_id)
     with _transaction() as conn:
         cur = conn.execute(
             """DELETE FROM executions
                WHERE id=? AND status='claimed' AND fire_claim_acquired=0""",
-            (str(execution_id),),
+            (execution_id,),
         )
+    if cur.rowcount == 1:
+        with _recovery_intent_lock:
+            _recovery_intent_ids.discard(execution_id)
     return cur.rowcount == 1
 
 
@@ -512,7 +528,10 @@ def reconcile_unacquired_executions() -> tuple[int, int]:
     local_pid_namespace = _pid_namespace_id()
     abandoned: list[sqlite3.Row] = []
     for row in rows:
-        if not _owner_lease_is_stale(
+        execution_id = str(row["id"])
+        with _recovery_intent_lock:
+            locally_released = execution_id in _recovery_intent_ids
+        if not locally_released and not _owner_lease_is_stale(
             row,
             local_machine_id=local_machine_id,
             local_boot_id=local_boot_id,
@@ -523,33 +542,65 @@ def reconcile_unacquired_executions() -> tuple[int, int]:
     if not abandoned:
         return (0, 0)
 
-    from cron.jobs import load_jobs
+    from cron.jobs import _jobs_lock, fire_recovery_fence, load_jobs
 
-    winners = {
-        str(claim.get("execution_id"))
-        for job in load_jobs()
-        if isinstance(job, dict)
-        for claim in [job.get("fire_claim")]
-        if isinstance(claim, dict) and claim.get("execution_id")
-    }
+    abandoned_by_job: Dict[str, List[sqlite3.Row]] = {}
+    for row in abandoned:
+        abandoned_by_job.setdefault(str(row["job_id"]), []).append(row)
+
     promoted = discarded = 0
-    with _transaction() as conn:
-        for row in abandoned:
-            execution_id = str(row["id"])
-            if execution_id in winners:
-                cur = conn.execute(
-                    """UPDATE executions SET fire_claim_acquired=1
-                       WHERE id=? AND status='claimed' AND fire_claim_acquired=0""",
-                    (execution_id,),
+    discarded_intents: Set[str] = set()
+    for job_id, job_rows in abandoned_by_job.items():
+        # The winner lookup and SQLite transition are one per-job fenced
+        # operation. A replacement claim therefore cannot land between a
+        # stale winners snapshot and promotion of the old execution.
+        with fire_recovery_fence(job_id) as fence_acquired:
+            if not fence_acquired:
+                continue
+            with _jobs_lock():
+                current_job = next(
+                    (
+                        job
+                        for job in load_jobs()
+                        if isinstance(job, dict) and str(job.get("id")) == job_id
+                    ),
+                    None,
                 )
-                promoted += cur.rowcount
-            else:
-                cur = conn.execute(
-                    """DELETE FROM executions
-                       WHERE id=? AND status='claimed' AND fire_claim_acquired=0""",
-                    (execution_id,),
+                current_claim = (
+                    current_job.get("fire_claim")
+                    if isinstance(current_job, dict)
+                    else None
                 )
-                discarded += cur.rowcount
+                winner_id = (
+                    str(current_claim.get("execution_id"))
+                    if isinstance(current_claim, dict)
+                    and current_claim.get("execution_id")
+                    else None
+                )
+                with _transaction() as conn:
+                    for row in job_rows:
+                        execution_id = str(row["id"])
+                        if execution_id == winner_id:
+                            cur = conn.execute(
+                                """UPDATE executions SET fire_claim_acquired=1
+                                   WHERE id=? AND job_id=? AND status='claimed'
+                                     AND fire_claim_acquired=0""",
+                                (execution_id, job_id),
+                            )
+                            promoted += cur.rowcount
+                        else:
+                            cur = conn.execute(
+                                """DELETE FROM executions
+                                   WHERE id=? AND job_id=? AND status='claimed'
+                                     AND fire_claim_acquired=0""",
+                                (execution_id, job_id),
+                            )
+                            discarded += cur.rowcount
+                            if cur.rowcount:
+                                discarded_intents.add(execution_id)
+    if discarded_intents:
+        with _recovery_intent_lock:
+            _recovery_intent_ids.difference_update(discarded_intents)
     return promoted, discarded
 
 
@@ -713,7 +764,11 @@ def prune_orphaned_interrupted_retry_acks() -> int:
     SQLite cleanup, the next recovery pass converges the ledger to the actual
     durable retry markers instead of leaking rows forever.
     """
-    from cron.jobs import _jobs_lock, load_jobs
+    from cron.jobs import (
+        _interrupted_retry_execution_ids,
+        _jobs_lock,
+        load_jobs,
+    )
 
     with _jobs_lock():
         active = {
@@ -722,7 +777,7 @@ def prune_orphaned_interrupted_retry_acks() -> int:
             if isinstance(job, dict)
             for marker in [job.get("interrupted_retry")]
             if isinstance(marker, dict)
-            for execution_id in marker.get("execution_ids") or []
+            for execution_id in _interrupted_retry_execution_ids(marker)
             if execution_id and job.get("id")
         }
         with _transaction() as conn:

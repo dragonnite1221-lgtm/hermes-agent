@@ -110,6 +110,7 @@ def commit_fire_claim_execution(
     from cron.executions import (
         discard_unacquired_execution,
         mark_fire_claim_acquired,
+        remember_execution_recovery_intent,
     )
     from cron.jobs import rollback_fire_claim_setup
 
@@ -131,11 +132,17 @@ def commit_fire_claim_execution(
     try:
         rolled_back = rollback_fire_claim_setup(claimed_job)
     except Exception as exc:
+        # Both durable halves are still present but neither transition could
+        # be acknowledged. Mark this live process's provisional row for the
+        # ordinary fenced recovery pass; otherwise its healthy PID would keep
+        # the exact jobs-store winner stranded until process restart.
+        remember_execution_recovery_intent(execution_id)
         raise FireClaimNotAcquiredError(
             "Fire claim execution fence failed and its durable rollback also failed; "
             "the jobs-store claim remains as a recovery witness"
         ) from exc
     if not rolled_back:
+        remember_execution_recovery_intent(execution_id)
         raise FireClaimNotAcquiredError(
             "Fire claim execution fence failed and the exact jobs-store claim "
             "could not be rolled back; the persisted claim remains as a recovery witness"

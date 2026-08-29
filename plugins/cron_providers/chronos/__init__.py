@@ -241,18 +241,44 @@ class ChronosCronScheduler(CronScheduler):
         cancel_event: Any = None,
     ) -> bool:
         job_id = claimed_job["id"]
+        rollback = claimed_job.get("_fire_claim_rollback")
+        next_run_snapshot = (
+            rollback.get("next_run_at") if isinstance(rollback, dict) else None
+        )
+        restored_fire_at = (
+            str(next_run_snapshot.get("value"))
+            if isinstance(next_run_snapshot, dict)
+            and next_run_snapshot.get("present")
+            and next_run_snapshot.get("value")
+            else None
+        )
         ran = super().fire_claimed(
             claimed_job,
             adapters=adapters,
             loop=loop,
             cancel_event=cancel_event,
         )
-        # The shared runner returns False when pre-run setup aborts and leaves
-        # the occurrence durably available for retry.  Chronos must still arm
-        # that persisted retry occurrence; otherwise an external scheduler has
-        # no future callback with which to recover it.  Keep returning ``ran``
-        # so the transport does not acknowledge an aborted dispatch as started.
-        from cron.jobs import get_job
+        # A clean pre-run rollback restores the timestamp whose NAS one-shot
+        # just fired. Re-provisioning that same (job, timestamp) dedup key is a
+        # no-op, so first move the exact restored occurrence to a fresh future
+        # instant. The compare-and-set preserves a newer owner/operator edit.
+        from cron.jobs import get_job, rearm_aborted_fire
+
+        if not ran and restored_fire_at:
+            try:
+                rearm_aborted_fire(
+                    job_id, expected_next_run_at=restored_fire_at
+                )
+            except Exception as e:
+                logger.warning(
+                    "Chronos failed to persist a fresh retry for job %s: %s",
+                    job_id,
+                    e,
+                )
+
+        # Re-arm the persisted desired occurrence after either completion or
+        # abort. Keep returning ``ran`` so the transport never acknowledges an
+        # aborted dispatch as started.
         job = get_job(job_id)
         if job and job.get("enabled") and job.get("next_run_at"):
             try:

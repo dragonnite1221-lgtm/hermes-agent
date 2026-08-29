@@ -347,6 +347,32 @@ def test_malformed_schedule_does_not_block_retry_policy_update(isolated_cron):
     assert updated["next_run_at"] is None
 
 
+def test_malformed_retry_ids_do_not_abort_healthy_marker_reconciliation(
+    isolated_cron,
+):
+    malformed = _script_job(retry_interrupted=True)
+    healthy = _script_job(retry_interrupted=True)
+    malformed_execution = executions.create_execution(
+        malformed["id"], source="builtin"
+    )
+    healthy_execution = executions.create_execution(healthy["id"], source="builtin")
+    assert jobs.requeue_interrupted_jobs(
+        [malformed_execution, healthy_execution]
+    ) == {malformed["id"], healthy["id"]}
+    executions.finish_execution(healthy_execution["id"], success=True)
+
+    with jobs._jobs_lock():
+        stored = jobs.load_jobs()
+        for record in stored:
+            if record["id"] == malformed["id"]:
+                record["interrupted_retry"]["execution_ids"] = 42
+        jobs.save_jobs(stored)
+
+    assert jobs.reconcile_interrupted_retry_markers() == {healthy["id"]}
+    assert "interrupted_retry" in jobs.get_job(malformed["id"])
+    assert "interrupted_retry" not in jobs.get_job(healthy["id"])
+
+
 @pytest.mark.parametrize(
     "repeat",
     [
@@ -774,6 +800,100 @@ def test_post_cas_execution_fence_failure_restores_interrupted_retry(
     assert all(
         row["fire_claim_acquired"] == 1
         for row in executions.list_executions(job_id=job["id"])
+    )
+
+
+def test_total_fence_and_rollback_failure_recovers_provisional_winner_in_process(
+    isolated_cron, monkeypatch
+):
+    import cron.scheduler_provider as provider
+
+    job = _script_job(retry_interrupted=True)
+    real_fire_job_lock = jobs._fire_job_lock
+    lock_calls = 0
+
+    @contextlib.contextmanager
+    def rollback_unavailable_fire_job_lock(job_id):
+        nonlocal lock_calls
+        lock_calls += 1
+        if lock_calls == 1:
+            with real_fire_job_lock(job_id) as acquired:
+                yield acquired
+            return
+        yield False
+
+    monkeypatch.setattr(
+        executions,
+        "mark_fire_claim_acquired",
+        lambda _execution_id: (_ for _ in ()).throw(OSError("ledger offline")),
+    )
+    monkeypatch.setattr(jobs, "_fire_job_lock", rollback_unavailable_fire_job_lock)
+
+    with pytest.raises(FireClaimNotAcquiredError, match="rollback also failed"):
+        provider.claim_fire_with_execution(job["id"], source="external")
+
+    provisional = executions.latest_execution(job["id"])
+    assert provisional["fire_claim_acquired"] == 0
+    assert jobs.get_job(job["id"])["fire_claim"]["execution_id"] == provisional["id"]
+
+    monkeypatch.setattr(jobs, "_fire_job_lock", real_fire_job_lock)
+    assert executions.recover_interrupted_executions() == 1
+    recovered = executions.latest_execution(job["id"])
+    assert recovered["id"] == provisional["id"]
+    assert recovered["status"] == "unknown"
+    assert jobs.get_job(job["id"])["interrupted_retry"]["execution_ids"] == [
+        provisional["id"]
+    ]
+
+
+def test_unacquired_reconciliation_revalidates_winner_under_fire_fence(
+    isolated_cron, monkeypatch
+):
+    job = _script_job()
+    old = executions.create_execution(
+        job["id"], source="external", fire_claim_acquired=False
+    )
+    replacement = executions.create_execution(
+        job["id"], source="external", fire_claim_acquired=False
+    )
+    claimed_at = datetime.now(timezone.utc).isoformat()
+    jobs.update_job(
+        job["id"],
+        {
+            "fire_claim": {
+                "by": "old-owner",
+                "at": claimed_at,
+                "execution_id": old["id"],
+            }
+        },
+    )
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_args: False)
+    real_recovery_fence = jobs.fire_recovery_fence
+
+    @contextlib.contextmanager
+    def replace_before_revalidation(job_id):
+        with real_recovery_fence(job_id) as acquired:
+            if acquired:
+                with jobs._jobs_lock():
+                    stored = jobs.load_jobs()
+                    for record in stored:
+                        if record["id"] == job_id:
+                            record["fire_claim"] = {
+                                "by": "replacement-owner",
+                                "at": claimed_at,
+                                "execution_id": replacement["id"],
+                            }
+                    jobs.save_jobs(stored)
+            yield acquired
+
+    monkeypatch.setattr(jobs, "fire_recovery_fence", replace_before_revalidation)
+
+    assert executions.reconcile_unacquired_executions() == (1, 1)
+    assert executions.latest_execution(job["id"])["id"] == replacement["id"]
+    assert executions.latest_execution(job["id"])["fire_claim_acquired"] == 1
+    assert all(
+        record["id"] != old["id"]
+        for record in executions.list_executions(job_id=job["id"])
     )
 
 

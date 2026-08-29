@@ -2388,7 +2388,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     from cron.executions import forget_interrupted_retry_acks
 
                     forget_interrupted_retry_acks(
-                        cancelled_retry.get("execution_ids") or [],
+                        _interrupted_retry_execution_ids(cancelled_retry),
                         job_id=job_id,
                     )
                 except Exception as exc:
@@ -2484,6 +2484,7 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 FIRE_CLAIM_TTL_SECONDS = 300
+ABORTED_FIRE_RETRY_DELAY_SECONDS = 5
 
 
 def _interrupted_retry_eligible_at(job: Dict[str, Any], now: datetime) -> datetime:
@@ -2558,11 +2559,7 @@ def requeue_interrupted_jobs(
             if not is_job_runnable(job) and effective_job_state(job) != "paused":
                 continue
             existing = job.get("interrupted_retry")
-            existing_ids = {
-                str(value)
-                for value in (existing.get("execution_ids") if isinstance(existing, dict) else []) or []
-                if value
-            }
+            existing_ids = _interrupted_retry_execution_ids(existing)
             new_ids = set(requested[job_id]) - existing_ids
             if new_ids:
                 eligible_at = _interrupted_retry_eligible_at(job, now)
@@ -2696,9 +2693,7 @@ def cancel_interrupted_retry_executions(execution_ids: Collection[str]) -> Set[s
             marker = job.get("interrupted_retry")
             if not isinstance(marker, dict):
                 continue
-            marker_ids = {
-                str(value) for value in marker.get("execution_ids") or [] if value
-            }
+            marker_ids = _interrupted_retry_execution_ids(marker)
             remaining = marker_ids - cancelled_ids
             if remaining == marker_ids:
                 continue
@@ -2733,13 +2728,12 @@ def reconcile_interrupted_retry_markers() -> Set[str]:
     with _jobs_lock():
         stored_jobs = load_jobs()
         marker_ids = {
-            str(execution_id)
+            execution_id
             for job in stored_jobs
             if isinstance(job, dict)
             for marker in [job.get("interrupted_retry")]
             if isinstance(marker, dict)
-            for execution_id in marker.get("execution_ids") or []
-            if execution_id
+            for execution_id in _interrupted_retry_execution_ids(marker)
         }
         if not marker_ids:
             return set()
@@ -2755,9 +2749,7 @@ def reconcile_interrupted_retry_markers() -> Set[str]:
                 continue
             expected = marker.get("expected_heartbeats")
             expected = expected if isinstance(expected, dict) else {}
-            ids = {
-                str(value) for value in marker.get("execution_ids") or [] if value
-            }
+            ids = _interrupted_retry_execution_ids(marker)
             cancel_ids: Set[str] = set()
             recreate_ids: Set[str] = set()
             for execution_id in ids - acked_ids:
@@ -2842,7 +2834,7 @@ def remove_job(job_id: str) -> bool:
                     from cron.executions import forget_interrupted_retry_acks
 
                     forget_interrupted_retry_acks(
-                        removed_retry.get("execution_ids") or [],
+                        _interrupted_retry_execution_ids(removed_retry),
                         job_id=canonical_id,
                     )
                 except Exception as exc:
@@ -3376,6 +3368,21 @@ def _machine_id() -> str:
     return f"{execution_machine_id()}:{os.getpid()}"
 
 
+def _interrupted_retry_execution_ids(marker: Any) -> Set[str]:
+    """Return only a well-formed retry marker's execution identifiers.
+
+    jobs.json is operator-visible durable state and may contain legacy or
+    partially written values.  Every consumer uses this single boundary so a
+    scalar/dict/string cannot raise during recovery or block healthy siblings.
+    """
+    if not isinstance(marker, dict):
+        return set()
+    raw = marker.get("execution_ids")
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return set()
+    return {str(value) for value in raw if value}
+
+
 def _interrupted_retry_ready(job: Dict[str, Any], now: datetime) -> bool:
     """Validate the jobs.json→execution-ledger handoff for a retry marker."""
     marker = job.get("interrupted_retry")
@@ -3391,7 +3398,7 @@ def _interrupted_retry_ready(job: Dict[str, Any], now: datetime) -> bool:
         from cron.executions import execution_ids_are_terminal
 
         return execution_ids_are_terminal(
-            marker.get("execution_ids") or [],
+            _interrupted_retry_execution_ids(marker),
             job_id=str(job.get("id") or ""),
         )
     except Exception as exc:
@@ -3412,7 +3419,7 @@ def _forget_interrupted_retry_best_effort(
         from cron.executions import forget_interrupted_retry_acks
 
         forget_interrupted_retry_acks(
-            marker.get("execution_ids") or [],
+            _interrupted_retry_execution_ids(marker),
             job_id=job_id,
         )
     except Exception as exc:
@@ -3421,6 +3428,52 @@ def _forget_interrupted_retry_best_effort(
             job_id,
             exc,
         )
+
+
+def rearm_aborted_fire(
+    job_id: str,
+    *,
+    expected_next_run_at: str,
+    delay_seconds: int = ABORTED_FIRE_RETRY_DELAY_SECONDS,
+) -> bool:
+    """Move an externally fired but unstarted occurrence to a fresh instant.
+
+    A successful pre-run rollback restores the already-fired ``next_run_at``.
+    External one-shot schedulers deduplicate that exact timestamp, so asking
+    them to arm it again is a no-op.  This per-job CAS preserves concurrent
+    operator edits while durably assigning the owed occurrence a new future
+    time that survives provider restart and reconciliation.
+    """
+    job_id = str(job_id)
+    expected_next_run_at = str(expected_next_run_at)
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            stored_jobs = load_jobs()
+            for job in stored_jobs:
+                if str(job.get("id")) != job_id:
+                    continue
+                if (
+                    str(job.get("next_run_at")) != expected_next_run_at
+                    or job.get("fire_claim")
+                ):
+                    return False
+                retry_at = _hermes_now() + timedelta(
+                    seconds=max(1, int(delay_seconds))
+                )
+                try:
+                    restored_at = _ensure_aware(
+                        datetime.fromisoformat(expected_next_run_at)
+                    )
+                    if retry_at <= restored_at:
+                        retry_at = restored_at + timedelta(microseconds=1)
+                except (TypeError, ValueError):
+                    pass
+                job["next_run_at"] = retry_at.isoformat()
+                save_jobs(stored_jobs)
+                return True
+    return False
 
 
 def claim_job_for_fire(
@@ -3670,7 +3723,7 @@ def rollback_fire_claim_setup(claimed_job: Dict[str, Any]) -> bool:
                         from cron.executions import remember_interrupted_retry_acks
 
                         remember_interrupted_retry_acks(
-                            original_retry.get("execution_ids") or [],
+                            _interrupted_retry_execution_ids(original_retry),
                             job_id=job_id,
                         )
 
