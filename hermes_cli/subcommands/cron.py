@@ -136,7 +136,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--retry-interrupted",
         dest="retry_interrupted",
         action="store_true",
-        default=None,
+        default=False,
         help=(
             "Retry a no-agent script when its owner process dies before a durable result. "
             "This is at-least-once execution; enable only for idempotent scripts."

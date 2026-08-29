@@ -325,6 +325,25 @@ def test_malformed_schedule_does_not_abort_interrupted_recovery(isolated_cron):
     ]
 
 
+def test_malformed_schedule_does_not_block_retry_policy_update(isolated_cron):
+    job = _script_job(retry_interrupted=True)
+    execution = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(execution["id"])
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+
+    with jobs._jobs_lock():
+        stored = jobs.load_jobs()
+        stored[0]["schedule"] = None
+        jobs.save_jobs(stored)
+
+    updated = jobs.update_job(job["id"], {"retry_interrupted": False})
+
+    assert updated["retry_interrupted"] is False
+    assert "interrupted_retry" not in updated
+    assert updated["schedule"] == {}
+    assert updated["next_run_at"] is None
+
+
 @pytest.mark.parametrize(
     "repeat",
     [

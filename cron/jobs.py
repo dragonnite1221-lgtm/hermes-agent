@@ -526,6 +526,12 @@ def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     return "?"
 
 
+def _job_schedule_kind(job: Dict[str, Any]) -> Optional[str]:
+    """Return a job's schedule kind without trusting hand-edited storage."""
+    schedule = job.get("schedule")
+    return schedule.get("kind") if isinstance(schedule, dict) else None
+
+
 def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a read-safe cron job shape for UI/API/tool/scheduler consumers.
 
@@ -2238,6 +2244,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     script=_upd_script or None,
                 )
             schedule_changed = "schedule" in updates
+            if not schedule_changed and not isinstance(updated.get("schedule"), dict):
+                # Match the tick reader's repair contract at the mutation
+                # boundary too. A legacy/hand-edited null schedule must not
+                # prevent operators from disabling retry or repairing other
+                # fields, and the next write should persist a read-safe shape.
+                updated["schedule"] = {}
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
             ) and _normalized_inference_axes(updated) != previous_inference_axes
@@ -2255,6 +2267,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 if isinstance(updated_schedule, str):
                     updated_schedule = parse_schedule(updated_schedule)
                     updated["schedule"] = updated_schedule
+                if not isinstance(updated_schedule, dict):
+                    raise ValueError("schedule must be a schedule string or object")
                 updated["schedule_display"] = updates.get(
                     "schedule_display",
                     updated_schedule.get("display", updated.get("schedule_display")),
@@ -2303,7 +2317,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             if cancel_interrupted_retry:
                 updated.pop("interrupted_retry", None)
                 if (
-                    updated.get("schedule", {}).get("kind") == "once"
+                    _job_schedule_kind(updated) == "once"
                     and not schedule_changed
                 ):
                     repeat = updated.get("repeat")
@@ -2324,7 +2338,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                         "Interrupted execution was not retried because the explicit "
                         "retry policy was disabled. Side effects remain unknown."
                     )
-                elif updated.get("schedule", {}).get("kind") == "once":
+                elif _job_schedule_kind(updated) == "once":
                     # A simultaneously supplied schedule is a replacement
                     # occurrence, not the canceled interrupted attempt. Keep
                     # the newly computed one-shot runnable exactly once.
@@ -3017,7 +3031,7 @@ def _mark_job_run_locked(
                     repeat = job["repeat"]
                     times = repeat.get("times")
                     completed = repeat.get("completed", 0)
-                    kind = job.get("schedule", {}).get("kind")
+                    kind = _job_schedule_kind(job)
                     preclaimed_oneshot = (
                         kind == "once"
                         and times is not None
@@ -3059,7 +3073,7 @@ def _mark_job_run_locked(
                 # missing runtime dep into "job completed" and the user's
                 # schedule quietly goes off. See issue #16265.
                 if job["next_run_at"] is None:
-                    kind = job.get("schedule", {}).get("kind")
+                    kind = _job_schedule_kind(job)
                     if kind in {"cron", "interval"}:
                         job["state"] = "error"
                         if not job.get("last_error"):
@@ -3155,7 +3169,7 @@ def claim_dispatch(job_id: str) -> bool:
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
-            if job.get("schedule", {}).get("kind") != "once":
+            if _job_schedule_kind(job) != "once":
                 return True  # recurring jobs use advance_next_run(), not dispatch claims
             repeat = job.get("repeat")
             if not repeat:
@@ -3236,7 +3250,7 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
         for job in jobs:
             if job.get("id") != job_id:
                 continue
-            if job.get("schedule", {}).get("kind") != "once":
+            if _job_schedule_kind(job) != "once":
                 return False
             claim = job.get("run_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_owner:
@@ -3265,7 +3279,7 @@ def clear_run_claim(job_id: str, *, expected_owner: Optional[str] = None) -> boo
         for job in jobs:
             if job.get("id") != job_id:
                 continue
-            if job.get("schedule", {}).get("kind") != "once":
+            if _job_schedule_kind(job) != "once":
                 return False
             claim = job.get("run_claim")
             if (
@@ -3307,7 +3321,7 @@ def advance_next_runs(job_ids) -> int:
         for job in jobs:
             if job["id"] not in ids:
                 continue
-            kind = job.get("schedule", {}).get("kind")
+            kind = _job_schedule_kind(job)
             if kind not in {"cron", "interval"}:
                 continue
             if isinstance(job.get("interrupted_retry"), dict):
@@ -3515,7 +3529,7 @@ def _claim_job_for_fire_locked(
             # handoff.  The execution ledger check above proves the abandoned
             # attempts are terminal before this retry can be acquired.
             job.pop("interrupted_retry", None)
-            kind = job.get("schedule", {}).get("kind")
+            kind = _job_schedule_kind(job)
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
@@ -3996,7 +4010,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # is treated as stale (the claiming tick died mid-run) and allowed
             # through so the job is recovered rather than wedged forever.
             existing_claim = job.get("run_claim")
-            if existing_claim and job.get("schedule", {}).get("kind") == "once":
+            if existing_claim and _job_schedule_kind(job) == "once":
                 try:
                     claimed_at = _ensure_aware(
                         datetime.fromisoformat(existing_claim["at"])

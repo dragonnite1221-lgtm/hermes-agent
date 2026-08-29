@@ -22,6 +22,33 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 class TestCronCommandLifecycle:
 
+    def test_create_defaults_retry_interrupted_to_false(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+        args = parser.parse_args(["cron", "create", "every 1h", "report"])
+        captured = {}
+
+        def _create(**kwargs):
+            captured.update(kwargs)
+            return {
+                "success": True,
+                "job_id": "job-1",
+                "name": "report",
+                "schedule": "every 60m",
+                "next_run_at": "2026-08-31T00:00:00+00:00",
+                "job": {},
+            }
+
+        monkeypatch.setattr(cron_cli, "_cron_api", _create)
+        monkeypatch.setattr(cron_cli, "_warn_if_gateway_not_running", lambda: None)
+
+        assert args.retry_interrupted is False
+        assert cron_cli.cron_create(args) == 0
+        assert captured["retry_interrupted"] is False
+
     def test_edit_persists_user_owned_inference_pins(self, tmp_cron_dir, capsys):
         job = create_job(prompt="Daily report", schedule="every 1h")
         parser = argparse.ArgumentParser(prog="hermes")

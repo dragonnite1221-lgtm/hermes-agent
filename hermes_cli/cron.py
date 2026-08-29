@@ -399,7 +399,9 @@ def cron_create(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
-        retry_interrupted=getattr(args, "retry_interrupted", None),
+        # Create has a concrete false default. ``None`` is meaningful only on
+        # edit, where it means "leave the stored policy unchanged".
+        retry_interrupted=getattr(args, "retry_interrupted", False) is True,
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
