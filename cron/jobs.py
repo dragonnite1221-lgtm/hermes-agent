@@ -2197,6 +2197,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates.get("retry_interrupted") is False
                 and isinstance(job.get("interrupted_retry"), dict)
             )
+            cancelled_retry = job.get("interrupted_retry") if cancel_interrupted_retry else None
 
             # Re-check execution-mode invariants on the MERGED record when
             # any participating field changes, so create-time invariants
@@ -2318,6 +2319,20 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             jobs[i] = updated
             save_jobs(jobs)
+            if isinstance(cancelled_retry, dict):
+                try:
+                    from cron.executions import forget_interrupted_retry_acks
+
+                    forget_interrupted_retry_acks(
+                        cancelled_retry.get("execution_ids") or [],
+                        job_id=job_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Job '%s': canceled retry acknowledgement cleanup failed: %s",
+                        job_id,
+                        exc,
+                    )
             return _normalize_job_record(jobs[i])
     return None
 
@@ -2483,6 +2498,15 @@ def remove_job(job_id: str) -> bool:
     canonical_id = job["id"]
     with _jobs_lock():
         jobs = load_jobs()
+        current_job = next(
+            (candidate for candidate in jobs if candidate["id"] == canonical_id),
+            None,
+        )
+        removed_retry = (
+            current_job.get("interrupted_retry")
+            if isinstance(current_job, dict)
+            else None
+        )
         original_len = len(jobs)
         jobs = [j for j in jobs if j["id"] != canonical_id]
         if len(jobs) < original_len:
@@ -2510,6 +2534,20 @@ def remove_job(job_id: str) -> bool:
             _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
             with _fire_fence_locks_guard:
                 _fire_fence_locks.pop(_fence_key, None)
+            if isinstance(removed_retry, dict):
+                try:
+                    from cron.executions import forget_interrupted_retry_acks
+
+                    forget_interrupted_retry_acks(
+                        removed_retry.get("execution_ids") or [],
+                        job_id=canonical_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Job '%s': removed retry acknowledgement cleanup failed: %s",
+                        canonical_id,
+                        exc,
+                    )
             return True
     return False
 

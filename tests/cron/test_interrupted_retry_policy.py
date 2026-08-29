@@ -208,16 +208,29 @@ def test_terminal_retry_ack_survives_execution_pruning(isolated_cron, monkeypatc
     ) is False
 
 
-def test_disabling_retry_policy_cancels_pending_recurring_retry(isolated_cron):
+def test_disabling_retry_policy_cancels_pending_recurring_retry(
+    isolated_cron, monkeypatch
+):
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
     job = _script_job(retry_interrupted=True)
-    execution = {"id": "exec-recurring", "job_id": job["id"]}
+    execution = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(execution["id"])
     assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+    executions.mark_interrupted_executions_unknown(
+        [execution["id"]], retry_job_ids={job["id"]}
+    )
+    assert executions.execution_ids_are_terminal(
+        [execution["id"]], job_id=job["id"]
+    ) is True
 
     updated = jobs.update_job(job["id"], {"retry_interrupted": False})
 
     assert updated["retry_interrupted"] is False
     assert "interrupted_retry" not in updated
     assert datetime.fromisoformat(updated["next_run_at"]) > datetime.now(timezone.utc)
+    assert executions.execution_ids_are_terminal(
+        [execution["id"]], job_id=job["id"]
+    ) is False
 
 
 def test_disabling_retry_policy_terminalizes_pending_oneshot(isolated_cron):
@@ -266,3 +279,81 @@ def test_recovery_revalidates_hand_edited_retry_policy(
     recovered = jobs.get_job(job["id"])
     assert recovered["next_run_at"] == before
     assert "interrupted_retry" not in recovered
+
+
+def test_removing_pending_retry_consumes_its_ack(isolated_cron, monkeypatch):
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    job = _script_job(retry_interrupted=True)
+    execution = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(execution["id"])
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+    executions.mark_interrupted_executions_unknown(
+        [execution["id"]], retry_job_ids={job["id"]}
+    )
+    assert executions.execution_ids_are_terminal(
+        [execution["id"]], job_id=job["id"]
+    ) is True
+
+    # resolve_job_ref may race with recovery and return a pre-marker snapshot;
+    # remove_job must capture the current marker only after taking _jobs_lock.
+    monkeypatch.setattr(jobs, "resolve_job_ref", lambda _job_id: job)
+    assert jobs.remove_job(job["id"]) is True
+
+    assert executions.execution_ids_are_terminal(
+        [execution["id"]], job_id=job["id"]
+    ) is False
+
+
+def test_recovery_prunes_ack_created_after_concurrent_policy_cancel(
+    isolated_cron, monkeypatch
+):
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    job = _script_job(retry_interrupted=True)
+    execution = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(execution["id"])
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+
+    # Cancellation wins the jobs.json race before terminalization creates its
+    # SQLite acknowledgement, so eager cancellation cleanup cannot see it.
+    jobs.update_job(job["id"], {"retry_interrupted": False})
+    executions.mark_interrupted_executions_unknown(
+        [execution["id"]], retry_job_ids={job["id"]}
+    )
+    assert executions.execution_ids_are_terminal(
+        [execution["id"]], job_id=job["id"]
+    ) is True
+
+    assert executions.recover_interrupted_executions() == 0
+
+    assert executions.execution_ids_are_terminal(
+        [execution["id"]], job_id=job["id"]
+    ) is False
+
+
+def test_direct_retry_claim_creates_recoverable_attempt_before_consuming_marker(
+    isolated_cron, monkeypatch
+):
+    from cron.scheduler_provider import claim_fire_with_execution
+
+    job = _script_job(retry_interrupted=True)
+    abandoned = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(abandoned["id"])
+    assert jobs.requeue_interrupted_jobs([abandoned]) == {job["id"]}
+    executions.mark_interrupted_executions_unknown(
+        [abandoned["id"]], retry_job_ids={job["id"]}
+    )
+
+    claimed = claim_fire_with_execution(job["id"], source="direct")
+
+    assert isinstance(claimed, dict)
+    replacement_id = claimed["execution_id"]
+    assert executions.latest_execution(job["id"])["id"] == replacement_id
+    assert "interrupted_retry" not in jobs.get_job(job["id"])
+
+    # A crash in the old gap (after marker consumption, before run_one_job)
+    # now leaves this replacement row for the next recovery pass to requeue.
+    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-scheduler")
+    monkeypatch.setattr(executions, "_owner_is_live", lambda _pid, _started_at: False)
+    assert executions.recover_interrupted_executions() == 1
+    retry = jobs.get_job(job["id"])["interrupted_retry"]
+    assert retry["execution_ids"] == [replacement_id]

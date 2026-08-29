@@ -8,6 +8,7 @@ proved gone. Terminal states are immutable.
 from __future__ import annotations
 
 import os
+import logging
 import sqlite3
 import threading
 import uuid
@@ -16,6 +17,8 @@ from typing import Any, Collection, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
+
+logger = logging.getLogger(__name__)
 
 # Optional test override. Production resolves the path at transaction time so
 # dashboard operations that temporarily enter another profile cannot leak that
@@ -273,6 +276,42 @@ def forget_interrupted_retry_acks(
         )
 
 
+def prune_orphaned_interrupted_retry_acks() -> int:
+    """Delete acknowledgements no longer referenced by jobs.json.
+
+    Normal retry claim, policy cancellation, and job removal eagerly consume
+    their acknowledgements. This reconciliation closes the cross-store crash
+    and race windows: if either process dies between the jobs.json commit and
+    SQLite cleanup, the next recovery pass converges the ledger to the actual
+    durable retry markers instead of leaking rows forever.
+    """
+    from cron.jobs import load_jobs
+
+    active = {
+        (str(execution_id), str(job.get("id") or ""))
+        for job in load_jobs()
+        if isinstance(job, dict)
+        for marker in [job.get("interrupted_retry")]
+        if isinstance(marker, dict)
+        for execution_id in marker.get("execution_ids") or []
+        if execution_id and job.get("id")
+    }
+    with _transaction() as conn:
+        rows = conn.execute(
+            "SELECT execution_id, job_id FROM interrupted_retry_acks"
+        ).fetchall()
+        orphaned = [
+            (str(row["execution_id"]), str(row["job_id"]))
+            for row in rows
+            if (str(row["execution_id"]), str(row["job_id"])) not in active
+        ]
+        conn.executemany(
+            "DELETE FROM interrupted_retry_acks WHERE execution_id=? AND job_id=?",
+            orphaned,
+        )
+    return len(orphaned)
+
+
 def mark_interrupted_executions_unknown(
     execution_ids: Collection[str], *, retry_job_ids: Collection[str] = (),
 ) -> List[Dict[str, Any]]:
@@ -323,22 +362,28 @@ def mark_interrupted_executions_unknown(
 def recover_interrupted_executions() -> int:
     """Classify abandoned attempts after durably applying explicit retry policy."""
     candidates = interrupted_execution_candidates()
-    if not candidates:
-        return 0
-    from cron.jobs import requeue_interrupted_jobs
+    recovered: List[Dict[str, Any]] = []
+    if candidates:
+        from cron.jobs import requeue_interrupted_jobs
 
-    requeued = requeue_interrupted_jobs(candidates)
-    recovered = mark_interrupted_executions_unknown(
-        [row["id"] for row in candidates],
-        retry_job_ids=requeued,
-    )
-    if requeued:
-        import logging
-
-        logging.getLogger("cron.scheduler_provider").warning(
-            "Durably requeued %d interrupted cron job(s) under explicit at-least-once policy",
-            len(requeued),
+        requeued = requeue_interrupted_jobs(candidates)
+        recovered = mark_interrupted_executions_unknown(
+            [row["id"] for row in candidates],
+            retry_job_ids=requeued,
         )
+        if requeued:
+            logging.getLogger("cron.scheduler_provider").warning(
+                "Durably requeued %d interrupted cron job(s) under explicit at-least-once policy",
+                len(requeued),
+            )
+    try:
+        pruned = prune_orphaned_interrupted_retry_acks()
+        if pruned:
+            logger.info("Pruned %d orphaned interrupted-retry acknowledgement(s)", pruned)
+    except Exception as exc:
+        # Recovery classification has already committed. Keep that durable
+        # progress and retry this idempotent reconciliation next cycle.
+        logger.warning("Interrupted-retry acknowledgement reconciliation failed: %s", exc)
     return len(recovered)
 
 

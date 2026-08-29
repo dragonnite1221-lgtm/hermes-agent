@@ -338,8 +338,8 @@ def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
     executions.latest_executions(["leak-check"])
     executions.recover_interrupted_executions()
 
-    assert len(opened) == 6
-    assert len(closed) == 6
+    assert len(opened) == 7
+    assert len(closed) == 7
     assert set(opened) == set(closed)
 
 

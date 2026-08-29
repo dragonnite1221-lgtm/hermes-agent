@@ -24,6 +24,44 @@ import threading
 from abc import ABC, abstractmethod
 from typing import Any
 
+
+def claim_fire_with_execution(
+    job_id: str, *, source: str, force: bool = False
+) -> dict | None:
+    """Create the durable attempt before consuming a job fire claim.
+
+    Every dispatch surface must use this ordering. In particular, an
+    interrupted-retry marker may be cleared by the claim; creating the
+    replacement execution first ensures a crash immediately after the claim
+    still leaves a recoverable owner record rather than silently losing the
+    owed retry.
+    """
+    from cron.executions import create_execution, finish_execution
+    from cron.jobs import claim_job_for_fire
+
+    execution = create_execution(job_id, source=source)
+    claim_kwargs = {"return_job": True}
+    if force:
+        claim_kwargs["force"] = True
+    try:
+        claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
+    except BaseException as exc:
+        finish_execution(
+            execution["id"],
+            success=False,
+            error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
+        )
+        raise
+    if not isinstance(claimed_job, dict):
+        finish_execution(
+            execution["id"],
+            success=False,
+            error="Fire claim was not acquired",
+        )
+        return None
+    claimed_job["execution_id"] = execution["id"]
+    return claimed_job
+
 # Cap for the exponential tick backoff applied while consecutive ticks fail
 # with fd exhaustion (EMFILE/ENFILE, #87644).  Base is the tick interval
 # (60s by default); each consecutive EMFILE failure doubles the wait, capped
@@ -179,31 +217,7 @@ class CronScheduler(ABC):
         external scheduler, then pass the exact owner-bearing snapshot to
         ``fire_claimed`` in tracked background work.
         """
-        from cron.executions import create_execution, finish_execution
-        from cron.jobs import claim_job_for_fire
-
-        execution = create_execution(job_id, source=self.name)
-        claim_kwargs = {"return_job": True}
-        if force:
-            claim_kwargs["force"] = True
-        try:
-            claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
-        except BaseException as exc:
-            finish_execution(
-                execution["id"],
-                success=False,
-                error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
-            )
-            raise
-        if not isinstance(claimed_job, dict):
-            finish_execution(
-                execution["id"],
-                success=False,
-                error="Fire claim was not acquired",
-            )
-            return None
-        claimed_job["execution_id"] = execution["id"]
-        return claimed_job
+        return claim_fire_with_execution(job_id, source=self.name, force=force)
 
     def fire_claimed(
         self,
@@ -369,6 +383,22 @@ def fire_overdue_jobs(
 
     if isinstance(provider, InProcessCronScheduler):
         return 0
+
+    # Chronos intentionally has no local tick loop, but a warm gateway still
+    # runs this housekeeping path every five minutes. Recover dead external
+    # owner processes here so an opted-in retry does not wait indefinitely for
+    # the gateway itself to restart. This is independent of misfire catch-up:
+    # operators may disable that grace-based feature without disabling crash
+    # recovery.
+    try:
+        recovered = provider.recover_interrupted()
+        if recovered:
+            logger.warning(
+                "Recovered %d interrupted external-provider execution(s)",
+                recovered,
+            )
+    except Exception as exc:
+        logger.warning("External-provider interrupted execution recovery failed: %s", exc)
 
     grace_minutes = _misfire_grace_minutes()
     if grace_minutes <= 0:

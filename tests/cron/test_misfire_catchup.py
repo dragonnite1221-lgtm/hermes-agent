@@ -99,6 +99,23 @@ class TestFireOverdueJobs:
         _park_in_past(job["id"], minutes=600)
         assert fire_overdue_jobs(RecordingProvider()) == 0
 
+    def test_external_housekeeping_recovers_dead_owners_when_misfire_disabled(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "cron.scheduler_provider._misfire_grace_minutes", lambda: 0.0
+        )
+        provider = RecordingProvider()
+        recovered = []
+        monkeypatch.setattr(
+            provider,
+            "recover_interrupted",
+            lambda: recovered.append("recover") or 1,
+        )
+
+        assert fire_overdue_jobs(provider) == 0
+        assert recovered == ["recover"]
+
     def test_future_job_not_fired(self, tmp_cron_dir):
         create_job(prompt="p", schedule="every 1h")  # next_run_at in future
         provider = RecordingProvider()

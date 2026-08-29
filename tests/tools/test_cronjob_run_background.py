@@ -182,8 +182,13 @@ class TestSyncFallbacks:
 
     def test_pool_at_capacity_runs_inline(self):
         """A rejected dispatch must not strand the already-taken claim."""
+        claimed = {
+            **_job("job-bg-07"),
+            "fire_claim": {"by": "bg-owner"},
+            "execution_id": "exec-bg-07",
+        }
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
                  patch("tools.async_delegation.dispatch_async_delegation",
                        return_value={"status": "rejected", "error": "capacity"}), \
                  patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
@@ -192,7 +197,12 @@ class TestSyncFallbacks:
                 res = _try_dispatch_background_run(_job('job-bg-07'))
         assert res["dispatched"] is False
         assert res["success"] is True
-        m_run.assert_called_once()   # ran inline on this thread
+        m_run.assert_called_once_with(
+            claimed,
+            adapters=None,
+            loop=None,
+            extra_prompt=None,
+        )
 
 
 class TestInFlightDedupe:
