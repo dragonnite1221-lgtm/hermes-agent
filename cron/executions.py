@@ -162,17 +162,20 @@ def _process_start_time(pid: int) -> Optional[int]:
         return None
 
 
-def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
+def _owner_is_live(pid: int, started_at: Optional[int]) -> Optional[bool]:
+    """Return owner liveness, or ``None`` when PID identity is ambiguous."""
     try:
         from gateway.status import _pid_exists
         if not _pid_exists(pid):
             return False
     except Exception:
-        return True  # fail safe: inability to prove death must not rewrite state
+        return None
     if started_at is None:
-        return pid == os.getpid()
+        return True if pid == os.getpid() else None
     current = _process_start_time(pid)
-    return current is not None and current == started_at
+    if current is None:
+        return None
+    return current == started_at
 
 
 def _machine_id() -> str:
@@ -299,7 +302,19 @@ def _owner_lease_is_stale(
         and owner_boot_id == local_boot_id
         and owner_pid_namespace == local_pid_namespace
     ):
-        return not _owner_is_live(int(row["pid"]), row["process_started_at"])
+        owner_is_live = _owner_is_live(
+            int(row["pid"]), row["process_started_at"]
+        )
+        if owner_is_live is not None:
+            return not owner_is_live
+        # A present PID without a verifiable start-time fingerprint is not
+        # proof of either life or death (procfs may be transiently unreadable,
+        # and legacy rows may lack the fingerprint). Measure its unchanged
+        # durable heartbeat/fire-claim generation with the observer-local
+        # lease instead of immediately reaping a potentially live execution.
+        return _foreign_owner_lease_is_stale(
+            row, fire_claim_generation=fire_claim_generation
+        )
     # Missing legacy identities and same-host containers are both foreign PID
     # tables. Their persisted heartbeat generation is the only safe proof.
     return _foreign_owner_lease_is_stale(
@@ -854,10 +869,107 @@ def mark_interrupted_executions_unknown(
     return recovered
 
 
+def reconcile_pre_run_abort_executions() -> int:
+    """Terminalize rollback-restored attempts without creating a retry.
+
+    ``rollback_fire_claim_setup`` restores the owed occurrence and writes an
+    execution-id tombstone in the same jobs.json commit. If executions.db was
+    unavailable when the abort happened, this fenced pass closes the dangling
+    ledger row before generic interrupted recovery can mistake it for work
+    whose side effects may have started.
+    """
+    from cron.jobs import _jobs_lock, fire_recovery_fence, load_jobs, save_jobs
+
+    try:
+        snapshot = load_jobs()
+    except Exception:
+        logger.warning(
+            "Skipping pre-run-abort reconciliation because jobs store "
+            "could not be read",
+            exc_info=True,
+        )
+        return 0
+    job_ids = [
+        str(job.get("id"))
+        for job in snapshot
+        if isinstance(job, dict)
+        and isinstance(job.get("_pre_run_abort_execution_ids"), list)
+        and job.get("_pre_run_abort_execution_ids")
+        and job.get("id")
+    ]
+    terminalized = 0
+    for job_id in job_ids:
+        try:
+            with fire_recovery_fence(job_id) as fence_acquired:
+                if not fence_acquired:
+                    continue
+                with _jobs_lock():
+                    stored_jobs = load_jobs()
+                    job = next(
+                        (
+                            item
+                            for item in stored_jobs
+                            if isinstance(item, dict)
+                            and str(item.get("id")) == job_id
+                        ),
+                        None,
+                    )
+                    if not isinstance(job, dict):
+                        continue
+                    raw_ids = job.get("_pre_run_abort_execution_ids")
+                    execution_ids = (
+                        {str(value) for value in raw_ids if value}
+                        if isinstance(raw_ids, list)
+                        else set()
+                    )
+                    resolved_ids: Set[str] = set()
+                    for execution_id in execution_ids:
+                        try:
+                            # A None result still proves the transaction was
+                            # readable and the row was already terminal/missing.
+                            finish_execution(
+                                execution_id,
+                                success=False,
+                                error="Pre-run setup aborted before execution.",
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Job '%s': pre-run-abort execution %s is still "
+                                "not terminalizable",
+                                job_id,
+                                execution_id,
+                                exc_info=True,
+                            )
+                            continue
+                        resolved_ids.add(execution_id)
+                    if not resolved_ids:
+                        continue
+                    remaining = execution_ids - resolved_ids
+                    if remaining:
+                        job["_pre_run_abort_execution_ids"] = sorted(remaining)
+                    else:
+                        job.pop("_pre_run_abort_execution_ids", None)
+                    save_jobs(stored_jobs)
+                    terminalized += len(resolved_ids)
+        except Exception:
+            logger.warning(
+                "Job '%s': pre-run-abort reconciliation did not commit",
+                job_id,
+                exc_info=True,
+            )
+    return terminalized
+
+
 def recover_interrupted_executions() -> int:
     """Classify abandoned attempts after durably applying explicit retry policy."""
     from cron.jobs import reconcile_interrupted_retry_markers
 
+    pre_run_aborts = reconcile_pre_run_abort_executions()
+    if pre_run_aborts:
+        logger.info(
+            "Terminalized %d rollback-restored pre-run abort(s)",
+            pre_run_aborts,
+        )
     reconcile_interrupted_retry_markers()
     promoted, discarded = reconcile_unacquired_executions()
     if promoted or discarded:

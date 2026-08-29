@@ -657,6 +657,82 @@ def test_same_process_recovery_intent_survives_total_ledger_outage(
     assert retry["execution_ids"] == [execution_id]
 
 
+def test_restored_pre_run_abort_tombstone_prevents_late_duplicate_retry(
+    isolated_cron, monkeypatch
+):
+    from cron.scheduler_provider import (
+        abort_fire_claim_execution,
+        claim_fire_with_execution,
+    )
+
+    job = _script_job(retry_interrupted=True)
+    before = jobs.get_job(job["id"])
+    claimed = claim_fire_with_execution(job["id"], source="direct")
+    assert isinstance(claimed, dict)
+    execution_id = claimed["execution_id"]
+    real_finish_execution = executions.finish_execution
+    finish_attempts = []
+
+    def ledger_unavailable(execution_id, **_kwargs):
+        finish_attempts.append(execution_id)
+        raise OSError("executions ledger unavailable")
+
+    monkeypatch.setattr(executions, "finish_execution", ledger_unavailable)
+    assert abort_fire_claim_execution(claimed, "pre-run validation failed") == "restored"
+    assert finish_attempts == [execution_id] * 3
+    restored = jobs.get_job(job["id"])
+    assert restored["next_run_at"] == before["next_run_at"]
+    assert restored["fire_claim"] is None
+    assert restored["_pre_run_abort_execution_ids"] == [execution_id]
+
+    monkeypatch.setattr(executions, "finish_execution", real_finish_execution)
+    assert executions.recover_interrupted_executions() == 0
+    terminal = executions.latest_execution(job["id"])
+    assert terminal["id"] == execution_id
+    assert terminal["status"] == "failed"
+    recovered_job = jobs.get_job(job["id"])
+    assert "_pre_run_abort_execution_ids" not in recovered_job
+    assert "interrupted_retry" not in recovered_job
+
+    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-process")
+    assert executions.recover_interrupted_executions() == 0
+    assert "interrupted_retry" not in jobs.get_job(job["id"])
+
+
+def test_clean_pre_run_rollback_releases_exact_oneshot_due_claim(
+    isolated_cron, monkeypatch
+):
+    from cron.scheduler_provider import (
+        abort_fire_claim_execution,
+        claim_fire_with_execution,
+    )
+
+    now = datetime(2026, 8, 30, 2, 0, tzinfo=timezone.utc)
+    clock = [now]
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: clock[0])
+    job = jobs.create_job(
+        prompt=None,
+        schedule=(now + timedelta(minutes=1)).isoformat(),
+        script="idempotent-sync.py",
+        no_agent=True,
+        deliver="local",
+    )
+    clock[0] = now + timedelta(minutes=2)
+    assert [candidate["id"] for candidate in jobs.get_due_jobs()] == [job["id"]]
+    due_claim = jobs.get_job(job["id"])["run_claim"]
+    claimed = claim_fire_with_execution(job["id"], source="builtin")
+    assert isinstance(claimed, dict)
+
+    assert abort_fire_claim_execution(claimed, "pre-run validation failed") == "restored"
+    restored = jobs.get_job(job["id"])
+    assert restored["fire_claim"] is None
+    assert restored["run_claim"] is None
+
+    clock[0] += timedelta(seconds=1)
+    assert [candidate["id"] for candidate in jobs.get_due_jobs()] == [job["id"]]
+    assert jobs.get_job(job["id"])["run_claim"]["at"] != due_claim["at"]
+
+
 def test_concurrent_recovery_winner_preserves_interrupted_retry(
     isolated_cron, monkeypatch
 ):

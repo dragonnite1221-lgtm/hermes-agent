@@ -48,7 +48,10 @@ def abort_fire_claim_execution(
     retry marker together, avoiding a partial cross-store rewind.
     """
     from cron.executions import finish_execution, release_execution_for_recovery
-    from cron.jobs import rollback_fire_claim_setup
+    from cron.jobs import (
+        forget_pre_run_abort_execution,
+        rollback_fire_claim_setup,
+    )
 
     job_id = str(claimed_job.get("id") or "")
     execution_id = str(claimed_job.get("execution_id") or "")
@@ -58,7 +61,9 @@ def abort_fire_claim_execution(
         claimed_job.get("_fire_claim_rollback"), dict
     ):
         try:
-            restored = rollback_fire_claim_setup(claimed_job)
+            restored = rollback_fire_claim_setup(
+                claimed_job, aborted_execution_id=execution_id or None
+            )
         except Exception:
             rollback_errored = True
             logger.warning(
@@ -82,15 +87,34 @@ def abort_fire_claim_execution(
                 exc_info=True,
             )
 
+    terminalization_confirmed = False
     if execution_id:
-        try:
-            finish_execution(execution_id, success=False, error=error)
-        except Exception:
+        last_terminalization_error: Exception | None = None
+        for _attempt in range(3):
+            try:
+                finish_execution(execution_id, success=False, error=error)
+                terminalization_confirmed = True
+                break
+            except Exception as exc:
+                last_terminalization_error = exc
+        if not terminalization_confirmed:
             logger.warning(
-                "Job '%s': failed to close unstarted execution ledger row",
+                "Job '%s': failed to close unstarted execution ledger row; "
+                "the durable pre-run-abort tombstone will retry it: %s",
                 job_id,
-                exc_info=True,
+                last_terminalization_error,
             )
+        elif restored:
+            try:
+                forget_pre_run_abort_execution(job_id, execution_id)
+            except Exception:
+                # A leftover tombstone is safe and self-clearing: the periodic
+                # reconciler observes the already-terminal row and removes it.
+                logger.warning(
+                    "Job '%s': failed to clear terminalized pre-run-abort marker",
+                    job_id,
+                    exc_info=True,
+                )
     if restored:
         return "restored"
     return "closed"

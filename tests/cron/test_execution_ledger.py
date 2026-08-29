@@ -215,6 +215,41 @@ def test_recovery_checks_pid_only_for_same_machine(monkeypatch, tmp_path):
     assert executions.latest_execution("legacy-unknown")["status"] == "running"
 
 
+def test_unverifiable_local_pid_identity_falls_back_to_distributed_lease(
+    monkeypatch, tmp_path
+):
+    import gateway.status as gateway_status
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    rows = []
+    for index, started_at in enumerate((None, 12345)):
+        record = executions.create_execution(
+            f"ambiguous-live-{index}", source="builtin"
+        )
+        executions.mark_execution_running(record["id"])
+        with executions._transaction() as conn:
+            conn.execute(
+                """UPDATE executions SET process_id='other-live-process',
+                   pid=?, process_started_at=? WHERE id=?""",
+                (424242 + index, started_at, record["id"]),
+            )
+        rows.append(record)
+
+    monkeypatch.setattr(gateway_status, "_pid_exists", lambda _pid: True)
+    monkeypatch.setattr(executions, "_process_start_time", lambda _pid: None)
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [])
+
+    assert executions._owner_is_live(424242, None) is None
+    assert executions._owner_is_live(424243, 12345) is None
+    # The first observation starts a monotonic distributed lease instead of
+    # treating an unreadable/missing start-time fingerprint as proof of death.
+    assert executions.interrupted_execution_candidates() == []
+    assert all(
+        executions.latest_execution(row["job_id"])["status"] == "running"
+        for row in rows
+    )
+
+
 def test_foreign_owner_is_recovered_only_after_distributed_lease_expires(
     monkeypatch, tmp_path
 ):

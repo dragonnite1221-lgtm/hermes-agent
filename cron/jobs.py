@@ -3562,6 +3562,7 @@ def _claim_job_for_fire_locked(
             # before the execution-ledger fence; if that SQLite promotion
             # cannot be committed, the caller uses this exact snapshot to put
             # the occurrence back instead of silently consuming it.
+            due_run_claim = copy.deepcopy(job.get("run_claim"))
             rollback = {
                 key: {
                     "present": key in job,
@@ -3621,6 +3622,12 @@ def _claim_job_for_fire_locked(
                 rollback["_retry_policy_claimed"] = copy.deepcopy(
                     job.get("retry_interrupted")
                 )
+            if isinstance(due_run_claim, dict):
+                # get_due_jobs() claims a finite one-shot before ledger/fire
+                # setup begins. A clean pre-run abort must release that exact
+                # due-scan owner too; otherwise the restored occurrence stays
+                # hidden until the much longer run-claim TTL expires.
+                rollback["_run_claim_to_clear"] = due_run_claim
             save_jobs(jobs)
             claimed_job = copy.deepcopy(job)
             claimed_job["_fire_claim_rollback"] = rollback
@@ -3651,7 +3658,9 @@ class FireClaimRollbackUnavailableError(RuntimeError):
     """The exact claim rollback could not acquire its serialization lock."""
 
 
-def rollback_fire_claim_setup(claimed_job: Dict[str, Any]) -> bool:
+def rollback_fire_claim_setup(
+    claimed_job: Dict[str, Any], *, aborted_execution_id: Optional[str] = None
+) -> bool:
     """Restore an occurrence whose execution-ledger fence did not commit.
 
     The rollback is compare-and-set against the exact jobs-store claim owner
@@ -3756,6 +3765,23 @@ def rollback_fire_claim_setup(claimed_job: Dict[str, Any]) -> bool:
                         job[key] = copy.deepcopy(snapshot.get("value"))
                     else:
                         job.pop(key, None)
+                expected_run_claim = rollback.get("_run_claim_to_clear")
+                if (
+                    isinstance(expected_run_claim, dict)
+                    and job.get("run_claim") == expected_run_claim
+                ):
+                    job["run_claim"] = None
+                if aborted_execution_id:
+                    pending_aborts = job.get("_pre_run_abort_execution_ids")
+                    pending_abort_ids = {
+                        str(value)
+                        for value in pending_aborts
+                        if value
+                    } if isinstance(pending_aborts, list) else set()
+                    pending_abort_ids.add(str(aborted_execution_id))
+                    job["_pre_run_abort_execution_ids"] = sorted(
+                        pending_abort_ids
+                    )
                 # Never reinstate the stale/malformed claim that this CAS
                 # superseded; removing our exact claim makes the restored
                 # occurrence immediately eligible for a clean attempt.
@@ -3770,6 +3796,33 @@ def rollback_fire_claim_setup(claimed_job: Dict[str, Any]) -> bool:
                     _forget_interrupted_retry_best_effort(job_id, original_retry)
                 claimed_job.pop("_fire_claim_rollback", None)
                 return True
+    return False
+
+
+def forget_pre_run_abort_execution(job_id: str, execution_id: str) -> bool:
+    """Remove a terminalized pre-run abort tombstone from jobs.json."""
+    job_id = str(job_id)
+    execution_id = str(execution_id)
+    with _jobs_lock():
+        stored_jobs = load_jobs()
+        for job in stored_jobs:
+            if str(job.get("id")) != job_id:
+                continue
+            raw_ids = job.get("_pre_run_abort_execution_ids")
+            ids = (
+                {str(value) for value in raw_ids if value}
+                if isinstance(raw_ids, list)
+                else set()
+            )
+            if execution_id not in ids:
+                return False
+            ids.discard(execution_id)
+            if ids:
+                job["_pre_run_abort_execution_ids"] = sorted(ids)
+            else:
+                job.pop("_pre_run_abort_execution_ids", None)
+            save_jobs(stored_jobs)
+            return True
     return False
 
 
