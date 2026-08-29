@@ -386,7 +386,9 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     )
 
     assert InProcessCronScheduler().fire_due("j1") is True
-    assert claims == [("j1", {"return_job": True})]
+    assert claims == [
+        ("j1", {"return_job": True, "execution_id": "exec-1"})
+    ]
     assert ran == [("j1", "exact-owner")]
 
 
@@ -406,7 +408,7 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
     monkeypatch.setattr(
         executions,
         "create_execution",
-        lambda jid, source: events.append("ledger") or {"id": "exec-1"},
+        lambda jid, source, **_kwargs: events.append("ledger") or {"id": "exec-1"},
     )
     monkeypatch.setattr(
         sched,
@@ -441,7 +443,12 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: True)
 
     assert InProcessCronScheduler().fire_due("j1", force=True) is True
-    assert claims == [("j1", {"force": True, "return_job": True})]
+    assert claims == [
+        (
+            "j1",
+            {"force": True, "return_job": True, "execution_id": "exec-1"},
+        )
+    ]
 
 
 def test_fire_due_lost_claim_does_not_run(monkeypatch):
@@ -660,4 +667,3 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-

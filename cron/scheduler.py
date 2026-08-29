@@ -546,7 +546,14 @@ from cron.jobs import (
     save_job_output,
     use_cron_store,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    discard_unacquired_execution,
+    finish_execution,
+    heartbeat_execution,
+    mark_execution_running,
+    mark_fire_claim_acquired,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -6523,6 +6530,16 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         )
         _finish_unstarted("Fire claim ownership lost before execution started.")
         return True
+    execution_id = str(job.get("execution_id") or "")
+    if execution_id:
+        try:
+            heartbeat_execution(execution_id)
+        except Exception:
+            logger.debug(
+                "Job '%s': initial execution-owner heartbeat failed",
+                job_id,
+                exc_info=True,
+            )
 
     def _heartbeat_loop() -> None:
         last_confirmed = time.monotonic()
@@ -6535,6 +6552,8 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                         job_id,
                     )
                     return
+                if execution_id:
+                    heartbeat_execution(execution_id)
                 last_confirmed = time.monotonic()
             except Exception:
                 logger.debug(
@@ -7402,14 +7421,19 @@ def tick(
             # Acquire the durable claim only when this worker actually starts,
             # not while it may wait behind other work in an executor queue.
             # This prevents a queued lease from expiring before execution.
-            claimed = claim_job_for_fire(job["id"], return_job=True)
+            claimed = claim_job_for_fire(
+                job["id"],
+                return_job=True,
+                execution_id=job["execution_id"],
+            )
             if not claimed:
-                finish_execution(
-                    job["execution_id"],
-                    success=False,
-                    error="Fire claim lost; execution was not started.",
-                )
+                discard_unacquired_execution(job["execution_id"])
                 return True
+            if job.get("execution_fire_claim_pending") is True:
+                if mark_fire_claim_acquired(job["execution_id"]) is None:
+                    raise RuntimeError(
+                        "Fire claim won but execution ownership fence was not committed"
+                    )
             # Production CAS returns the exact persisted record with its unique
             # owner. Bool fallback keeps older test doubles/API overrides
             # compatible; real callers using return_job=True never take it.
@@ -7489,8 +7513,18 @@ def tick(
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             try:
-                execution = create_execution(job_id, source="builtin")
-                dispatched_job = dict(job, execution_id=execution["id"])
+                execution = create_execution(
+                    job_id,
+                    source="builtin",
+                    fire_claim_acquired=False,
+                )
+                dispatched_job = dict(
+                    job,
+                    execution_id=execution["id"],
+                    execution_fire_claim_pending=(
+                        execution.get("fire_claim_acquired") == 0
+                    ),
+                )
                 _ctx = contextvars.copy_context()
             except Exception as execution_err:
                 # Init/creation failure between the claim and the submit —
@@ -7518,11 +7552,7 @@ def tick(
             except Exception as submit_err:
                 release_running_job(job_id)
                 _clear_run_claim_best_effort()
-                finish_execution(
-                    execution["id"],
-                    success=False,
-                    error=f"Executor dispatch failed: {submit_err}",
-                )
+                discard_unacquired_execution(execution["id"])
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
                 if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):

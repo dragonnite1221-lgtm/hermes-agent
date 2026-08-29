@@ -8,14 +8,18 @@ proved gone. Terminal states are immutable.
 from __future__ import annotations
 
 import os
+import hashlib
 import logging
 import socket
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Collection, Dict, Iterator, List, Optional
 
+from hermes_cli.sqlite_util import add_column_if_missing
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
@@ -26,6 +30,7 @@ logger = logging.getLogger(__name__)
 # profile's execution records into the import-time home.
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
+EXECUTION_OWNER_LEASE_SECONDS = 300
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
@@ -51,6 +56,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              source TEXT NOT NULL,
              process_id TEXT NOT NULL,
              machine_id TEXT,
+             heartbeat_at TEXT,
+             fire_claim_acquired INTEGER NOT NULL DEFAULT 1,
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
@@ -65,8 +72,16 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         str(row["name"])
         for row in conn.execute("PRAGMA table_info(executions)").fetchall()
     }
-    if "machine_id" not in columns:
-        conn.execute("ALTER TABLE executions ADD COLUMN machine_id TEXT")
+    migrations = (
+        ("machine_id", "machine_id TEXT"),
+        ("heartbeat_at", "heartbeat_at TEXT"),
+        ("fire_claim_acquired", "fire_claim_acquired INTEGER NOT NULL DEFAULT 1"),
+    )
+    for column, ddl in migrations:
+        if column not in columns:
+            # The shared helper catches the duplicate-column race when two
+            # replicas both observe the old schema before either ALTER commits.
+            add_column_if_missing(conn, "executions", column, ddl)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -145,12 +160,36 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
 def _machine_id() -> str:
     """Return the stable host identity used to scope PID liveness checks.
 
-    Shared ledgers spanning hosts must set a unique ``HERMES_MACHINE_ID`` on
-    every replica. A hostname fallback preserves safe single-host behavior;
-    unlike the process UUID and PID, it remains stable across restarts.
+    This is behavioral ownership data, so it must not depend on an undocumented
+    environment escape hatch. Prefer the operating system's persistent machine
+    identity and hash it before storage; fall back to stable host hardware and
+    hostname material on platforms without ``machine-id``.
     """
-    explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
-    return explicit or socket.gethostname().strip()
+    materials: list[str] = []
+    for path in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if value:
+            materials.append(value)
+            break
+    if not materials:
+        materials.extend((socket.gethostname().strip(), f"{uuid.getnode():012x}"))
+    digest = hashlib.sha256("\0".join(materials).encode("utf-8")).hexdigest()
+    return f"hermes-host-{digest[:32]}"
+
+
+def _foreign_owner_lease_is_stale(row: sqlite3.Row, now: datetime) -> bool:
+    raw = row["heartbeat_at"] or row["claimed_at"]
+    try:
+        heartbeat_at = datetime.fromisoformat(str(raw))
+        age = (now - heartbeat_at).total_seconds()
+    except (TypeError, ValueError):
+        return False
+    # Future timestamps can result from clock skew. Fail closed until a later
+    # sweep can establish expiry; never reap a possibly-live remote owner.
+    return age >= EXECUTION_OWNER_LEASE_SECONDS
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
@@ -165,7 +204,9 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     )
 
 
-def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
+def create_execution(
+    job_id: str, *, source: str, fire_claim_acquired: bool = True
+) -> Dict[str, Any]:
     """Persist a claimed attempt before executor/provider dispatch."""
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
@@ -174,10 +215,10 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, machine_id, pid, process_started_at,
-                status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                status, claimed_at, heartbeat_at, fire_claim_acquired)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, _machine_id(), pid,
-             _process_start_time(pid), now),
+             _process_start_time(pid), now, now, int(fire_claim_acquired)),
         )
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
@@ -192,9 +233,9 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     now = _hermes_now().isoformat()
     with _transaction() as conn:
         cur = conn.execute(
-            """UPDATE executions SET status='running', started_at=?
-               WHERE id=? AND status='claimed'""",
-            (now, execution_id),
+            """UPDATE executions SET status='running', started_at=?, heartbeat_at=?
+               WHERE id=? AND status='claimed' AND fire_claim_acquired=1""",
+            (now, now, execution_id),
         )
         if cur.rowcount != 1:
             return None
@@ -233,10 +274,104 @@ def discard_unacquired_execution(execution_id: str) -> bool:
     """Remove a ledger-first row when the corresponding job claim lost."""
     with _transaction() as conn:
         cur = conn.execute(
-            "DELETE FROM executions WHERE id=? AND status='claimed'",
+            """DELETE FROM executions
+               WHERE id=? AND status='claimed' AND fire_claim_acquired=0""",
             (str(execution_id),),
         )
     return cur.rowcount == 1
+
+
+def mark_fire_claim_acquired(execution_id: str) -> Optional[Dict[str, Any]]:
+    """Fence a ledger-first attempt after its jobs-store fire CAS succeeds."""
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET fire_claim_acquired=1, heartbeat_at=?
+               WHERE id=? AND status='claimed' AND fire_claim_acquired=0""",
+            (now, str(execution_id)),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _record(
+            conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
+        )
+    _emit_execution_state(record)
+    return record
+
+
+def heartbeat_execution(execution_id: str) -> bool:
+    """Renew the distributed owner lease for an acquired active attempt."""
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET heartbeat_at=?
+               WHERE id=? AND status IN ('claimed','running')
+                 AND fire_claim_acquired=1""",
+            (now, str(execution_id)),
+        )
+    return cur.rowcount == 1
+
+
+def reconcile_unacquired_executions() -> tuple[int, int]:
+    """Promote dead CAS winners and discard dead CAS losers.
+
+    Ledger-first dispatch intentionally persists an unacquired row before the
+    jobs-store CAS. The winning CAS records the execution id in ``fire_claim``;
+    that durable cross-store witness lets recovery distinguish a winner killed
+    before its SQLite promotion from a loser killed before local cleanup.
+    """
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT * FROM executions
+               WHERE status='claimed' AND fire_claim_acquired=0"""
+        ).fetchall()
+    if not rows:
+        return (0, 0)
+
+    local_machine_id = _machine_id()
+    now = _hermes_now()
+    abandoned: list[sqlite3.Row] = []
+    for row in rows:
+        owner_machine_id = str(row["machine_id"] or "").strip()
+        if not owner_machine_id:
+            continue
+        if owner_machine_id != local_machine_id:
+            if not _foreign_owner_lease_is_stale(row, now):
+                continue
+        elif _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            continue
+        abandoned.append(row)
+    if not abandoned:
+        return (0, 0)
+
+    from cron.jobs import load_jobs
+
+    winners = {
+        str(claim.get("execution_id"))
+        for job in load_jobs()
+        if isinstance(job, dict)
+        for claim in [job.get("fire_claim")]
+        if isinstance(claim, dict) and claim.get("execution_id")
+    }
+    promoted = discarded = 0
+    with _transaction() as conn:
+        for row in abandoned:
+            execution_id = str(row["id"])
+            if execution_id in winners:
+                cur = conn.execute(
+                    """UPDATE executions SET fire_claim_acquired=1
+                       WHERE id=? AND status='claimed' AND fire_claim_acquired=0""",
+                    (execution_id,),
+                )
+                promoted += cur.rowcount
+            else:
+                cur = conn.execute(
+                    """DELETE FROM executions
+                       WHERE id=? AND status='claimed' AND fire_claim_acquired=0""",
+                    (execution_id,),
+                )
+                discarded += cur.rowcount
+    return promoted, discarded
 
 
 def interrupted_execution_candidates() -> List[Dict[str, Any]]:
@@ -247,7 +382,7 @@ def interrupted_execution_candidates() -> List[Dict[str, Any]]:
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT * FROM executions
-               WHERE status IN ('claimed','running')"""
+               WHERE status IN ('claimed','running') AND fire_claim_acquired=1"""
         ).fetchall()
         for row in rows:
             if row["process_id"] == _PROCESS_ID:
@@ -259,8 +394,9 @@ def interrupted_execution_candidates() -> List[Dict[str, Any]]:
                 legacy_rows += 1
                 continue
             if owner_machine_id != local_machine_id:
-                continue
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+                if not _foreign_owner_lease_is_stale(row, _hermes_now()):
+                    continue
+            elif _owner_is_live(int(row["pid"]), row["process_started_at"]):
                 continue
             record = _record(row)
             if record is not None:
@@ -407,6 +543,13 @@ def mark_interrupted_executions_unknown(
 
 def recover_interrupted_executions() -> int:
     """Classify abandoned attempts after durably applying explicit retry policy."""
+    promoted, discarded = reconcile_unacquired_executions()
+    if promoted or discarded:
+        logger.info(
+            "Reconciled abandoned fire-claim setup rows: winners=%d losers=%d",
+            promoted,
+            discarded,
+        )
     candidates = interrupted_execution_candidates()
     recovered: List[Dict[str, Any]] = []
     if candidates:

@@ -101,6 +101,7 @@ class TestRunningJobGuard:
         }
         submitted = []
         claim_calls = []
+        acquired = []
 
         class DeferredPool:
             def submit(self, callback):
@@ -113,7 +114,15 @@ class TestRunningJobGuard:
         monkeypatch.setattr(
             sched,
             "create_execution",
-            lambda *_a, **_kw: {"id": "execution-1"},
+            lambda *_a, **_kw: {
+                "id": "execution-1",
+                "fire_claim_acquired": 0,
+            },
+        )
+        monkeypatch.setattr(
+            sched,
+            "mark_fire_claim_acquired",
+            lambda execution_id: acquired.append(execution_id) or {"id": execution_id},
         )
         monkeypatch.setattr(
             sched,
@@ -131,7 +140,13 @@ class TestRunningJobGuard:
         result = callback()
         future.set_result(result)
 
-        assert claim_calls == [("queued-job", {"return_job": True})]
+        assert claim_calls == [
+            (
+                "queued-job",
+                {"return_job": True, "execution_id": "execution-1"},
+            )
+        ]
+        assert acquired == ["execution-1"]
         assert "queued-job" not in sched._running_job_ids
 
 
@@ -164,7 +179,7 @@ class TestRunningJobGuard:
 
         called = []
 
-        def create_execution_side_effect(job_id, source):
+        def create_execution_side_effect(job_id, source, **_kwargs):
             if job_id == "failing-job":
                 raise RuntimeError("execution ledger unavailable")
             return {"id": f"{job_id}-execution"}

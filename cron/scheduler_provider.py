@@ -47,31 +47,26 @@ def claim_fire_with_execution(
     from cron.executions import (
         create_execution,
         discard_unacquired_execution,
-        finish_execution,
+        mark_fire_claim_acquired,
     )
     from cron.jobs import claim_job_for_fire
 
     try:
-        execution = create_execution(job_id, source=source)
+        execution = create_execution(
+            job_id, source=source, fire_claim_acquired=False
+        )
     except Exception as exc:
         raise FireClaimNotAcquiredError(
             f"Could not create the durable execution record: {exc}"
         ) from exc
-    claim_kwargs = {"return_job": True}
+    claim_kwargs = {"return_job": True, "execution_id": execution["id"]}
     if force:
         claim_kwargs["force"] = True
     try:
         claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
     except Exception as exc:
         try:
-            finish_execution(
-                execution["id"],
-                success=False,
-                error=(
-                    "Fire claim failed before dispatch: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
-            )
+            discard_unacquired_execution(execution["id"])
         except Exception:
             logger.exception(
                 "Could not terminalize execution %s after fire-claim setup failed",
@@ -83,6 +78,13 @@ def claim_fire_with_execution(
     if not isinstance(claimed_job, dict):
         discard_unacquired_execution(execution["id"])
         return None
+    if (
+        execution.get("fire_claim_acquired") == 0
+        and mark_fire_claim_acquired(execution["id"]) is None
+    ):
+        raise FireClaimNotAcquiredError(
+            "Fire claim was acquired but its execution fence could not be committed"
+        )
     claimed_job["execution_id"] = execution["id"]
     return claimed_job
 

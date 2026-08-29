@@ -221,6 +221,102 @@ def test_malformed_schedule_does_not_abort_interrupted_recovery(isolated_cron):
     ]
 
 
+@pytest.mark.parametrize(
+    "repeat",
+    [
+        {"times": "1", "completed": 1},
+        {"times": 1, "completed": None},
+        {"times": 1, "completed": -1},
+    ],
+)
+def test_malformed_repeat_skips_only_that_interrupted_job(isolated_cron, repeat):
+    now = datetime.now(timezone.utc)
+    malformed = jobs.create_job(
+        prompt=None,
+        schedule=(now + timedelta(minutes=1)).isoformat(),
+        script="idempotent-sync.py",
+        no_agent=True,
+        deliver="local",
+        retry_interrupted=True,
+    )
+    healthy = _script_job(retry_interrupted=True)
+    with jobs._jobs_lock():
+        stored = jobs.load_jobs()
+        for record in stored:
+            if record["id"] == malformed["id"]:
+                record["repeat"] = repeat
+        jobs.save_jobs(stored)
+    malformed_execution = executions.create_execution(
+        malformed["id"], source="builtin"
+    )
+    healthy_execution = executions.create_execution(healthy["id"], source="builtin")
+
+    assert jobs.requeue_interrupted_jobs(
+        [malformed_execution, healthy_execution]
+    ) == {healthy["id"]}
+    assert "interrupted_retry" not in jobs.get_job(malformed["id"])
+    assert jobs.get_job(healthy["id"])["interrupted_retry"]["execution_ids"] == [
+        healthy_execution["id"]
+    ]
+
+
+def test_schedule_edit_preserves_pending_retry_eligibility(isolated_cron):
+    job = _script_job(retry_interrupted=True)
+    execution = executions.create_execution(job["id"], source="builtin")
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+    eligible_at = jobs.get_job(job["id"])["interrupted_retry"]["eligible_at"]
+
+    updated = jobs.update_job(job["id"], {"schedule": "every 24h"})
+
+    assert updated["schedule"]["kind"] == "interval"
+    assert updated["next_run_at"] == eligible_at
+    assert updated["interrupted_retry"]["execution_ids"] == [execution["id"]]
+
+
+def test_dead_fire_claim_loser_is_discarded_without_retry(isolated_cron, monkeypatch):
+    job = _script_job(retry_interrupted=True)
+    loser = executions.create_execution(
+        job["id"], source="external", fire_claim_acquired=False
+    )
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET process_id='dead-process' WHERE id=?",
+            (loser["id"],),
+        )
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_args: False)
+
+    assert executions.recover_interrupted_executions() == 0
+    assert executions.latest_execution(job["id"]) is None
+    assert "interrupted_retry" not in jobs.get_job(job["id"])
+
+
+def test_dead_fire_claim_winner_is_promoted_and_recovered(
+    isolated_cron, monkeypatch
+):
+    job = _script_job(retry_interrupted=True)
+    winner = executions.create_execution(
+        job["id"], source="external", fire_claim_acquired=False
+    )
+    assert isinstance(
+        jobs.claim_job_for_fire(
+            job["id"], return_job=True, execution_id=winner["id"]
+        ),
+        dict,
+    )
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET process_id='dead-process' WHERE id=?",
+            (winner["id"],),
+        )
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_args: False)
+
+    assert executions.recover_interrupted_executions() == 1
+    assert executions.latest_execution(job["id"])["status"] == "unknown"
+    assert jobs.get_job(job["id"])["interrupted_retry"]["execution_ids"] == [
+        winner["id"]
+    ]
+
+
 def test_provider_recovery_requeues_before_marking_execution_unknown(
     isolated_cron, monkeypatch
 ):

@@ -2271,7 +2271,23 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                             f"Requested one-shot time {run_at} is more than "
                             f"{ONESHOT_GRACE_SECONDS}s in the past and cannot be scheduled."
                         )
-                    updated["next_run_at"] = updated_next_run
+                    pending_retry = updated.get("interrupted_retry")
+                    if isinstance(pending_retry, dict):
+                        # A schedule edit changes the cadence after the owed
+                        # attempt; it must not postpone that already-persisted
+                        # obligation. The retry claim will compute the next
+                        # occurrence from the newly edited schedule.
+                        try:
+                            retry_eligible_at = _ensure_aware(
+                                datetime.fromisoformat(
+                                    str(pending_retry["eligible_at"])
+                                )
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            retry_eligible_at = _hermes_now()
+                        updated["next_run_at"] = retry_eligible_at.isoformat()
+                    else:
+                        updated["next_run_at"] = updated_next_run
 
             if cancel_interrupted_retry:
                 updated.pop("interrupted_retry", None)
@@ -2491,6 +2507,25 @@ def requeue_interrupted_jobs(executions: Collection[Dict[str, Any]]) -> Set[str]
                 if kind == "once" and isinstance(repeat, dict):
                     times = repeat.get("times")
                     completed = repeat.get("completed", 0)
+                    valid_times = times is None or (
+                        isinstance(times, int)
+                        and not isinstance(times, bool)
+                        and times >= 0
+                    )
+                    valid_completed = (
+                        isinstance(completed, int)
+                        and not isinstance(completed, bool)
+                        and completed >= 0
+                    )
+                    if not valid_times or not valid_completed:
+                        logger.error(
+                            "Job '%s': refusing interrupted retry with malformed "
+                            "repeat metadata times=%r completed=%r",
+                            job_id,
+                            times,
+                            completed,
+                        )
+                        continue
                     if times is not None and times > 0 and completed > 0:
                         repeat["completed"] = completed - 1
                     job["run_claim"] = None
@@ -3073,20 +3108,10 @@ def advance_next_run(job_id: str) -> bool:
 
 
 def _machine_id() -> str:
-    """Stable-ish identifier for claim attribution/debugging (NOT correctness).
+    """Stable host plus process attribution for jobs-store claim diagnostics."""
+    from cron.executions import _machine_id as execution_machine_id
 
-    Uses ``HERMES_MACHINE_ID`` if set, else hostname + pid. The CAS correctness
-    comes from the file lock + the fresh-claim check, not from this value.
-    """
-    explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
-    if explicit:
-        return explicit
-    try:
-        import socket
-        host = socket.gethostname()
-    except Exception:
-        host = "unknown"
-    return f"{host}:{os.getpid()}"
+    return f"{execution_machine_id()}:{os.getpid()}"
 
 
 def _interrupted_retry_ready(job: Dict[str, Any], now: datetime) -> bool:
@@ -3142,6 +3167,7 @@ def claim_job_for_fire(
     claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS,
     force: bool = False,
     return_job: bool = False,
+    execution_id: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -3151,6 +3177,7 @@ def claim_job_for_fire(
             claim_ttl_seconds=claim_ttl_seconds,
             force=force,
             return_job=return_job,
+            execution_id=execution_id,
         )
 
 
@@ -3160,6 +3187,7 @@ def _claim_job_for_fire_locked(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    execution_id: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
@@ -3223,7 +3251,11 @@ def _claim_job_for_fire_locked(
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
-            job["fire_claim"] = {"at": now.isoformat(), "by": owner}
+            job["fire_claim"] = {
+                "at": now.isoformat(),
+                "by": owner,
+                **({"execution_id": str(execution_id)} if execution_id else {}),
+            }
             # Clearing this marker is the commit point of the cross-store
             # handoff.  The execution ledger check above proves the abandoned
             # attempts are terminal before this retry can be acquired.

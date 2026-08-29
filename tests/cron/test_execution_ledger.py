@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -60,7 +61,9 @@ def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path
 
 def test_discard_unacquired_execution_removes_only_claimed_attempt(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
-    unacquired = executions.create_execution("lost-race", source="external")
+    unacquired = executions.create_execution(
+        "lost-race", source="external", fire_claim_acquired=False
+    )
     running = executions.create_execution("running", source="external")
     executions.mark_execution_running(running["id"])
 
@@ -178,6 +181,48 @@ def test_recovery_checks_pid_only_for_same_machine(monkeypatch, tmp_path):
     assert executions.latest_execution("legacy-unknown")["status"] == "running"
 
 
+def test_foreign_owner_is_recovered_only_after_distributed_lease_expires(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(executions, "_hermes_now", lambda: now)
+    record = executions.create_execution("remote-owner", source="external")
+    executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            """UPDATE executions SET process_id='remote-process',
+               machine_id='remote-host', heartbeat_at=? WHERE id=?""",
+            (now.isoformat(), record["id"]),
+        )
+    monkeypatch.setattr(executions, "_machine_id", lambda: "local-host")
+
+    assert executions.interrupted_execution_candidates() == []
+
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET heartbeat_at=? WHERE id=?",
+            (
+                (now - timedelta(seconds=executions.EXECUTION_OWNER_LEASE_SECONDS + 1)).isoformat(),
+                record["id"],
+            ),
+        )
+    assert [row["id"] for row in executions.interrupted_execution_candidates()] == [
+        record["id"]
+    ]
+
+
+def test_machine_identity_does_not_depend_on_hermes_machine_id_env(monkeypatch):
+    import cron.executions as executions
+
+    monkeypatch.setenv("HERMES_MACHINE_ID", "replica-a")
+    first = executions._machine_id()
+    monkeypatch.setenv("HERMES_MACHINE_ID", "replica-b")
+
+    assert executions._machine_id() == first
+    assert first.startswith("hermes-host-")
+
+
 def test_existing_execution_schema_adds_machine_identity_column(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
@@ -265,26 +310,21 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         def submit(self, _callable):
             raise ValueError("executor rejected")
 
-    finished = []
+    discarded = []
     monkeypatch.setattr(
         scheduler, "create_execution",
         lambda *_args, **_kwargs: {"id": "exec-submit-fail"},
     )
     monkeypatch.setattr(
-        scheduler, "finish_execution",
-        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+        scheduler, "discard_unacquired_execution",
+        lambda execution_id: discarded.append(execution_id) or True,
     )
     monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "submit-fail"}])
     monkeypatch.setattr(scheduler, "claim_job_for_fire", lambda _job_id: True)
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
 
     assert scheduler.tick(verbose=False, sync=False) == 0
-    assert finished == [
-        ("exec-submit-fail", {
-            "success": False,
-            "error": "Executor dispatch failed: executor rejected",
-        })
-    ]
+    assert discarded == ["exec-submit-fail"]
     assert "submit-fail" not in scheduler.get_running_job_ids()
 
 
@@ -413,8 +453,8 @@ def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
     executions.latest_executions(["leak-check"])
     executions.recover_interrupted_executions()
 
-    assert len(opened) == 7
-    assert len(closed) == 7
+    assert len(opened) == 8
+    assert len(closed) == 8
     assert set(opened) == set(closed)
 
 
