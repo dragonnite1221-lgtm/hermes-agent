@@ -137,7 +137,7 @@ def test_fire_due_rearms_next_oneshot(chronos, monkeypatch):
 
 
 def test_fire_due_rearms_after_claimed_job_failure(chronos, monkeypatch):
-    """A claimed attempt is consumed even when the job pipeline reports failure."""
+    """A pre-run abort is reported while its persisted retry is re-armed."""
     prov, fake = chronos
     claimed = {"id": "j1", "fire_claim": {"by": "owner-1"}}
     persisted = {
@@ -166,8 +166,10 @@ def test_fire_due_rearms_after_claimed_job_failure(chronos, monkeypatch):
     monkeypatch.setattr("cron.scheduler.run_one_job", lambda *args, **kwargs: False)
     monkeypatch.setattr("cron.jobs.get_job", lambda jid: persisted)
 
-    assert prov.fire_due("j1") is True
-    assert claim_calls == [{"return_job": True, "execution_id": "exec-1"}]
+    assert prov.fire_due("j1") is False
+    assert claim_calls == [
+        {"return_job": True, "execution_id": "exec-1", "force": False}
+    ]
     assert acquired == ["exec-1"]
     assert [provision["job_id"] for provision in fake.provisions] == ["j1"]
 

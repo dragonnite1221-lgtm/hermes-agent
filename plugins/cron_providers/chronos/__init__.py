@@ -247,14 +247,18 @@ class ChronosCronScheduler(CronScheduler):
             loop=loop,
             cancel_event=cancel_event,
         )
-        if ran:
-            from cron.jobs import get_job
-            job = get_job(job_id)
-            if job and job.get("enabled") and job.get("next_run_at"):
-                try:
-                    self._arm_one_shot(job)
-                except Exception as e:
-                    logger.warning("Chronos failed to re-arm job %s after fire: %s", job_id, e)
+        # The shared runner returns False when pre-run setup aborts and leaves
+        # the occurrence durably available for retry.  Chronos must still arm
+        # that persisted retry occurrence; otherwise an external scheduler has
+        # no future callback with which to recover it.  Keep returning ``ran``
+        # so the transport does not acknowledge an aborted dispatch as started.
+        from cron.jobs import get_job
+        job = get_job(job_id)
+        if job and job.get("enabled") and job.get("next_run_at"):
+            try:
+                self._arm_one_shot(job)
+            except Exception as e:
+                logger.warning("Chronos failed to re-arm job %s after fire: %s", job_id, e)
         return ran
 
 
