@@ -2470,7 +2470,11 @@ def requeue_interrupted_jobs(executions: Collection[Dict[str, Any]]) -> Set[str]
                     exc,
                 )
                 continue
-            if not is_job_runnable(job):
+            # Pausing controls dispatch, not whether an already-owed recovery
+            # is recorded. Preserve the marker while paused so resume_job can
+            # restore its eligibility; still reject every other disabled or
+            # terminal state.
+            if not is_job_runnable(job) and effective_job_state(job) != "paused":
                 continue
             existing = job.get("interrupted_retry")
             existing_ids = {

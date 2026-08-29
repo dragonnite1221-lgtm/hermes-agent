@@ -20,9 +20,17 @@ selected via the `cron.provider` config key (empty = built-in).
 from __future__ import annotations
 
 import inspect
+import logging
 import threading
 from abc import ABC, abstractmethod
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
+
+
+class FireClaimNotAcquiredError(RuntimeError):
+    """Ledger/claim setup failed before this caller acquired fire ownership."""
 
 
 def claim_fire_with_execution(
@@ -43,19 +51,35 @@ def claim_fire_with_execution(
     )
     from cron.jobs import claim_job_for_fire
 
-    execution = create_execution(job_id, source=source)
+    try:
+        execution = create_execution(job_id, source=source)
+    except Exception as exc:
+        raise FireClaimNotAcquiredError(
+            f"Could not create the durable execution record: {exc}"
+        ) from exc
     claim_kwargs = {"return_job": True}
     if force:
         claim_kwargs["force"] = True
     try:
         claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
-    except BaseException as exc:
-        finish_execution(
-            execution["id"],
-            success=False,
-            error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
-        )
-        raise
+    except Exception as exc:
+        try:
+            finish_execution(
+                execution["id"],
+                success=False,
+                error=(
+                    "Fire claim failed before dispatch: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Could not terminalize execution %s after fire-claim setup failed",
+                execution["id"],
+            )
+        raise FireClaimNotAcquiredError(
+            f"Could not acquire the cron fire claim: {exc}"
+        ) from exc
     if not isinstance(claimed_job, dict):
         discard_unacquired_execution(execution["id"])
         return None

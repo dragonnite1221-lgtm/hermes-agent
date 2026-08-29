@@ -22,6 +22,7 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
 
     claimed = executions.create_execution("job-1", source="builtin")
     assert claimed["status"] == "claimed"
+    assert claimed["machine_id"] == executions._machine_id()
     assert claimed["claimed_at"]
     assert claimed["started_at"] is None
     assert claimed["finished_at"] is None
@@ -142,6 +143,68 @@ def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_
 
     assert executions.recover_interrupted_executions() == 0
     assert executions.latest_execution("still-live")["status"] == "running"
+
+
+def test_recovery_checks_pid_only_for_same_machine(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    local = executions.create_execution("local-dead", source="builtin")
+    remote = executions.create_execution("remote-live", source="builtin")
+    legacy = executions.create_execution("legacy-unknown", source="builtin")
+    for record in (local, remote, legacy):
+        executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET process_id='previous-process', machine_id='node-a' "
+            "WHERE id=?",
+            (local["id"],),
+        )
+        conn.execute(
+            "UPDATE executions SET process_id='remote-process', machine_id='node-b' "
+            "WHERE id=?",
+            (remote["id"],),
+        )
+        conn.execute(
+            "UPDATE executions SET process_id='legacy-process', machine_id=NULL "
+            "WHERE id=?",
+            (legacy["id"],),
+        )
+    monkeypatch.setattr(executions, "_machine_id", lambda: "node-a")
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_args: False)
+
+    candidates = executions.interrupted_execution_candidates()
+
+    assert [row["id"] for row in candidates] == [local["id"]]
+    assert executions.latest_execution("remote-live")["status"] == "running"
+    assert executions.latest_execution("legacy-unknown")["status"] == "running"
+
+
+def test_existing_execution_schema_adds_machine_identity_column(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL CHECK(status IN
+                   ('claimed','running','completed','failed','unknown')),
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+
+    created = executions.create_execution("migrated", source="builtin")
+
+    assert created["machine_id"] == executions._machine_id()
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
+    assert "machine_id" in columns
 
 
 def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):

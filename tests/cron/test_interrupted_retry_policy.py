@@ -3,8 +3,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from cron import executions, jobs
-from cron.scheduler_provider import InProcessCronScheduler
-from tools.cronjob_tools import CRONJOB_SCHEMA
+from cron.scheduler_provider import FireClaimNotAcquiredError, InProcessCronScheduler
+from tools.cronjob_tools import CRONJOB_SCHEMA, _format_job
 
 
 @pytest.fixture
@@ -32,6 +32,8 @@ def test_retry_policy_is_explicit_and_restricted_to_no_agent_scripts(isolated_cr
 
     assert default["retry_interrupted"] is False
     assert opted_in["retry_interrupted"] is True
+    assert _format_job(default)["retry_interrupted"] is False
+    assert _format_job(opted_in)["retry_interrupted"] is True
     with pytest.raises(ValueError, match="no_agent script jobs"):
         jobs.create_job(
             prompt="do work",
@@ -155,6 +157,40 @@ def test_paused_oneshot_retry_resumes_from_retry_eligibility(
     assert resumed["state"] == "scheduled"
     assert resumed["next_run_at"] == eligible_at
     assert resumed["interrupted_retry"]["execution_ids"] == [execution["id"]]
+
+
+def test_recovery_records_retry_for_job_paused_before_restart(
+    isolated_cron, monkeypatch
+):
+    now = datetime(2026, 8, 29, 7, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    job = jobs.create_job(
+        prompt=None,
+        schedule=(now + timedelta(minutes=1)).isoformat(),
+        script="idempotent-sync.py",
+        no_agent=True,
+        deliver="local",
+        retry_interrupted=True,
+    )
+    execution = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(execution["id"])
+    paused = jobs.pause_job(job["id"], reason="operator maintenance")
+    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-scheduler")
+    monkeypatch.setattr(executions, "_owner_is_live", lambda _pid, _started_at: False)
+
+    assert executions.recover_interrupted_executions() == 1
+
+    recovered = jobs.get_job(job["id"])
+    assert recovered["state"] == "paused"
+    assert recovered["enabled"] is False
+    assert recovered["paused_at"] == paused["paused_at"]
+    assert recovered["interrupted_retry"]["execution_ids"] == [execution["id"]]
+    assert executions.latest_execution(job["id"])["status"] == "unknown"
+    assert jobs.get_due_jobs() == []
+
+    resumed = jobs.resume_job(job["id"])
+    assert resumed["state"] == "scheduled"
+    assert resumed["next_run_at"] == recovered["interrupted_retry"]["eligible_at"]
 
 
 def test_malformed_schedule_does_not_abort_interrupted_recovery(isolated_cron):
@@ -283,6 +319,67 @@ def test_lost_fire_claim_does_not_create_phantom_failed_execution(isolated_cron)
 
     assert claim_fire_with_execution(job["id"], source="external") is None
     assert executions.list_executions(job_id=job["id"]) == []
+
+
+def test_ledger_create_failure_never_attempts_or_consumes_fire_claim(
+    isolated_cron, monkeypatch
+):
+    import cron.scheduler_provider as provider
+
+    attempted_claims = []
+    monkeypatch.setattr(
+        executions,
+        "create_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(
+        jobs,
+        "claim_job_for_fire",
+        lambda *_args, **_kwargs: attempted_claims.append(True),
+    )
+
+    with pytest.raises(FireClaimNotAcquiredError, match="durable execution"):
+        provider.claim_fire_with_execution("job-never-claimed", source="direct")
+    assert attempted_claims == []
+
+
+def test_manual_claim_setup_failure_preserves_interrupted_retry(
+    isolated_cron, monkeypatch
+):
+    import tools.cronjob_tools as cronjob_tools
+
+    job = _script_job(retry_interrupted=True)
+    execution = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(execution["id"])
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+    before = jobs.get_job(job["id"])["interrupted_retry"]
+    marked = []
+
+    def fail_setup(*_args, **_kwargs):
+        raise FireClaimNotAcquiredError("ledger unavailable")
+
+    monkeypatch.setattr(cronjob_tools, "claim_job_for_fire", fail_setup)
+    monkeypatch.setattr(
+        cronjob_tools,
+        "mark_job_run",
+        lambda *_args, **_kwargs: marked.append(True),
+    )
+
+    immediate = cronjob_tools._execute_job_now(job)
+    assert immediate["claimed"] is False
+    assert marked == []
+    assert jobs.get_job(job["id"])["interrupted_retry"] == before
+
+    monkeypatch.setattr(
+        "gateway.session_context.async_delivery_supported", lambda: True
+    )
+    background = cronjob_tools._try_dispatch_background_run(
+        job, session_id="test-session"
+    )
+    assert background["claimed"] is False
+    assert background["dispatched"] is False
+    assert marked == []
+    assert jobs.get_job(job["id"])["interrupted_retry"] == before
 
 
 def test_terminal_retry_ack_survives_execution_pruning(isolated_cron, monkeypatch):

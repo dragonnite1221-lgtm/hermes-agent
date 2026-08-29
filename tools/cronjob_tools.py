@@ -52,7 +52,7 @@ from cron.jobs import (
     resume_job,
     update_job,
 )
-from cron.scheduler_provider import claim_fire_with_execution
+from cron.scheduler_provider import FireClaimNotAcquiredError, claim_fire_with_execution
 
 
 def claim_job_for_fire(
@@ -698,6 +698,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "state": effective_job_state(job),
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
+        "retry_interrupted": job.get("retry_interrupted") is True,
     }
     if job.get("script"):
         result["script"] = job["script"]
@@ -780,14 +781,17 @@ def _execute_job_now(
             else:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}
+    except FireClaimNotAcquiredError as e:
+        release_running_job(job_id)
+        logger.error("Failed to set up cron job %s for immediate run: %s", job_id, e)
+        return {"claimed": False, "success": False, "error": str(e)}
     except Exception as e:
         release_running_job(job_id)
         logger.error("Failed to claim cron job %s for immediate run: %s", job_id, e)
-        try:
-            mark_job_run(job_id, False, str(e))
-        except Exception:
-            pass
-        return {"claimed": True, "success": False, "error": str(e)}
+        # No owner-bearing snapshot was returned, so this caller cannot prove
+        # it acquired the fire. Recording a job failure here could consume an
+        # owed interrupted-retry marker for work that never started.
+        return {"claimed": False, "success": False, "error": str(e)}
 
     return _run_claimed_job(
         claimed_job,
@@ -1121,14 +1125,24 @@ def _try_dispatch_background_run(
             else:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}
+    except FireClaimNotAcquiredError as e:
+        release_running_job(job_id)
+        logger.error("Failed to set up cron job %s for background run: %s", job_id, e)
+        return {
+            "claimed": False,
+            "dispatched": False,
+            "success": False,
+            "error": str(e),
+        }
     except Exception as e:
         release_running_job(job_id)
         logger.error("Failed to claim cron job %s for background run: %s", job_id, e)
-        try:
-            mark_job_run(job_id, False, str(e))
-        except Exception:
-            pass
-        return {"claimed": True, "dispatched": False, "success": False, "error": str(e)}
+        return {
+            "claimed": False,
+            "dispatched": False,
+            "success": False,
+            "error": str(e),
+        }
 
     origin_ui_session_id = ""
     try:

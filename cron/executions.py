@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import logging
+import socket
 import sqlite3
 import threading
 import uuid
@@ -49,6 +50,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              job_id TEXT NOT NULL,
              source TEXT NOT NULL,
              process_id TEXT NOT NULL,
+             machine_id TEXT,
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
@@ -59,6 +61,12 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              error TEXT
            )"""
     )
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(executions)").fetchall()
+    }
+    if "machine_id" not in columns:
+        conn.execute("ALTER TABLE executions ADD COLUMN machine_id TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -134,6 +142,17 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     return current is not None and current == started_at
 
 
+def _machine_id() -> str:
+    """Return the stable host identity used to scope PID liveness checks.
+
+    Shared ledgers spanning hosts must set a unique ``HERMES_MACHINE_ID`` on
+    every replica. A hostname fallback preserves safe single-host behavior;
+    unlike the process UUID and PID, it remains stable across restarts.
+    """
+    explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
+    return explicit or socket.gethostname().strip()
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
     conn.execute(
@@ -154,10 +173,10 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
-               (id, job_id, source, process_id, pid, process_started_at,
+               (id, job_id, source, process_id, machine_id, pid, process_started_at,
                 status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
-            (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+            (execution_id, str(job_id), str(source), _PROCESS_ID, _machine_id(), pid,
              _process_start_time(pid), now),
         )
         row = conn.execute(
@@ -223,6 +242,8 @@ def discard_unacquired_execution(execution_id: str) -> bool:
 def interrupted_execution_candidates() -> List[Dict[str, Any]]:
     """Return active attempts whose exact owner process is provably gone."""
     abandoned: List[Dict[str, Any]] = []
+    legacy_rows = 0
+    local_machine_id = _machine_id()
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT * FROM executions
@@ -231,11 +252,25 @@ def interrupted_execution_candidates() -> List[Dict[str, Any]]:
         for row in rows:
             if row["process_id"] == _PROCESS_ID:
                 continue
+            owner_machine_id = str(row["machine_id"] or "").strip()
+            if not owner_machine_id:
+                # Legacy rows cannot be assigned to this PID namespace with
+                # proof. Fail closed instead of rewriting an active attempt.
+                legacy_rows += 1
+                continue
+            if owner_machine_id != local_machine_id:
+                continue
             if _owner_is_live(int(row["pid"]), row["process_started_at"]):
                 continue
             record = _record(row)
             if record is not None:
                 abandoned.append(record)
+    if legacy_rows:
+        logger.warning(
+            "Skipped %d active legacy cron execution(s) without machine identity; "
+            "ownership cannot be proved",
+            legacy_rows,
+        )
     return abandoned
 
 
