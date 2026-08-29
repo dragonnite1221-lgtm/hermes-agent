@@ -267,7 +267,7 @@ def recover_interrupted_executions() -> int:
         return 0
     from cron.jobs import requeue_interrupted_jobs
 
-    requeued = requeue_interrupted_jobs([row["job_id"] for row in candidates])
+    requeued = requeue_interrupted_jobs(candidates)
     recovered = mark_interrupted_executions_unknown(
         [row["id"] for row in candidates],
         retry_job_ids=requeued,

@@ -2352,19 +2352,45 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
-def requeue_interrupted_jobs(job_ids: Collection[str]) -> Set[str]:
-    """Durably make opted-in active jobs due after their owner process died.
+FIRE_CLAIM_TTL_SECONDS = 300
 
-    Existing fire claims are retained. Their five-minute lease is the
-    duplicate fence: once it expires, the now-due job can be reclaimed. This
-    gives an explicit at-least-once policy without turning a fast restart into
-    an immediate duplicate delivery.
+
+def _interrupted_retry_eligible_at(job: Dict[str, Any], now: datetime) -> datetime:
+    """Return the first instant an abandoned attempt's fire claim is stale."""
+    claim = job.get("fire_claim")
+    if not isinstance(claim, dict):
+        return now
+    try:
+        claimed_at = _ensure_aware(datetime.fromisoformat(str(claim["at"])))
+    except (KeyError, TypeError, ValueError):
+        return now
+    age = (now - claimed_at).total_seconds()
+    if 0 <= age < FIRE_CLAIM_TTL_SECONDS:
+        return claimed_at + timedelta(seconds=FIRE_CLAIM_TTL_SECONDS)
+    return now
+
+
+def requeue_interrupted_jobs(executions: Collection[Dict[str, Any]]) -> Set[str]:
+    """Durably schedule one retry for each opted-in abandoned job.
+
+    A retry waits until the retained fire-claim lease expires, preventing the
+    due scanner from consuming the recovery before it can acquire the claim.
+    Finite one-shots also regain exactly one dispatch slot. The execution IDs
+    persisted in ``interrupted_retry`` make both mutations idempotent if the
+    scheduler dies after this save but before the execution ledger is updated.
     """
-    requested = {str(value) for value in job_ids if value}
+    requested: Dict[str, Set[str]] = {}
+    for execution in executions:
+        if not isinstance(execution, dict):
+            continue
+        job_id = str(execution.get("job_id") or "")
+        execution_id = str(execution.get("id") or "")
+        if job_id and execution_id:
+            requested.setdefault(job_id, set()).add(execution_id)
     if not requested:
         return set()
     requeued: Set[str] = set()
-    now = _hermes_now().isoformat()
+    now = _hermes_now()
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
@@ -2373,7 +2399,33 @@ def requeue_interrupted_jobs(job_ids: Collection[str]) -> Set[str]:
                 continue
             if not is_job_runnable(job):
                 continue
-            job["next_run_at"] = now
+            existing = job.get("interrupted_retry")
+            existing_ids = {
+                str(value)
+                for value in (existing.get("execution_ids") if isinstance(existing, dict) else []) or []
+                if value
+            }
+            new_ids = requested[job_id] - existing_ids
+            if new_ids:
+                eligible_at = _interrupted_retry_eligible_at(job, now)
+                kind = job.get("schedule", {}).get("kind")
+                repeat = job.get("repeat")
+                if kind == "once" and isinstance(repeat, dict):
+                    times = repeat.get("times")
+                    completed = repeat.get("completed", 0)
+                    if times is not None and times > 0 and completed > 0:
+                        repeat["completed"] = completed - 1
+                    job["run_claim"] = None
+                job["interrupted_retry"] = {
+                    "execution_ids": sorted(existing_ids | requested[job_id]),
+                    "eligible_at": eligible_at.isoformat(),
+                }
+            else:
+                try:
+                    eligible_at = _ensure_aware(datetime.fromisoformat(str(existing["eligible_at"])))
+                except (KeyError, TypeError, ValueError):
+                    eligible_at = now
+            job["next_run_at"] = eligible_at.isoformat()
             requeued.add(job_id)
         if requeued:
             save_jobs(jobs)
@@ -2934,7 +2986,7 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str,
     *,
-    claim_ttl_seconds: int = 300,
+    claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS,
     force: bool = False,
     return_job: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
@@ -3011,11 +3063,22 @@ def _claim_job_for_fire_locked(
                 job["state"] = "scheduled"
                 job["paused_at"] = None
                 job["paused_reason"] = None
+            interrupted_retry = job.get("interrupted_retry")
+            if isinstance(interrupted_retry, dict):
+                try:
+                    eligible_at = _ensure_aware(
+                        datetime.fromisoformat(str(interrupted_retry["eligible_at"]))
+                    )
+                except (KeyError, TypeError, ValueError):
+                    eligible_at = now
+                if now < eligible_at:
+                    return False
             # Per-acquisition token: a process may legitimately reclaim its own
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
             job["fire_claim"] = {"at": now.isoformat(), "by": owner}
+            job.pop("interrupted_retry", None)
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())

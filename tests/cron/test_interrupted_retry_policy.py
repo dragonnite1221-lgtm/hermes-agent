@@ -41,21 +41,76 @@ def test_retry_policy_is_explicit_and_restricted_to_no_agent_scripts(isolated_cr
     assert "retry_interrupted" not in CRONJOB_SCHEMA["parameters"]["properties"]
 
 
-def test_requeue_only_makes_opted_in_runnable_jobs_due_and_keeps_duplicate_fence(isolated_cron):
+def test_recurring_retry_waits_for_fire_claim_then_survives_due_scan(isolated_cron, monkeypatch):
+    now = datetime(2026, 8, 29, 7, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
     opted_in = _script_job(retry_interrupted=True)
     default = _script_job()
-    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-    claim = {"at": datetime.now(timezone.utc).isoformat(), "by": "old-owner"}
+    future = (now + timedelta(hours=1)).isoformat()
+    claim = {"at": now.isoformat(), "by": "old-owner"}
     jobs.update_job(opted_in["id"], {"next_run_at": future, "fire_claim": claim})
     jobs.update_job(default["id"], {"next_run_at": future})
 
-    requeued = jobs.requeue_interrupted_jobs([opted_in["id"], default["id"]])
+    requeued = jobs.requeue_interrupted_jobs(
+        [
+            {"id": "exec-opted-in", "job_id": opted_in["id"]},
+            {"id": "exec-default", "job_id": default["id"]},
+        ]
+    )
 
     assert requeued == {opted_in["id"]}
     recovered = jobs.get_job(opted_in["id"])
-    assert datetime.fromisoformat(recovered["next_run_at"]).timestamp() <= datetime.now(timezone.utc).timestamp()
+    eligible_at = now + timedelta(seconds=jobs.FIRE_CLAIM_TTL_SECONDS)
+    assert recovered["next_run_at"] == eligible_at.isoformat()
     assert recovered["fire_claim"] == claim
+    assert recovered["interrupted_retry"]["execution_ids"] == ["exec-opted-in"]
     assert jobs.get_job(default["id"])["next_run_at"] == future
+
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: eligible_at + timedelta(seconds=1))
+    due = jobs.get_due_jobs()
+    assert [job["id"] for job in due] == [opted_in["id"]]
+    jobs.advance_next_runs([opted_in["id"]])
+    claimed = jobs.claim_job_for_fire(opted_in["id"], return_job=True)
+    assert isinstance(claimed, dict)
+    assert "interrupted_retry" not in jobs.get_job(opted_in["id"])
+
+
+def test_oneshot_retry_restores_one_dispatch_slot_exactly_once(isolated_cron, monkeypatch):
+    now = datetime(2026, 8, 29, 7, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    job = jobs.create_job(
+        prompt=None,
+        schedule=(now + timedelta(minutes=1)).isoformat(),
+        script="idempotent-sync.py",
+        no_agent=True,
+        deliver="local",
+        retry_interrupted=True,
+    )
+    claim = {"at": now.isoformat(), "by": "old-owner"}
+    jobs.update_job(
+        job["id"],
+        {
+            "next_run_at": now.isoformat(),
+            "fire_claim": claim,
+            "run_claim": {"at": now.isoformat(), "by": "dead-owner"},
+            "repeat": {"times": 1, "completed": 1},
+        },
+    )
+    execution = {"id": "exec-once", "job_id": job["id"]}
+
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+    recovered = jobs.get_job(job["id"])
+    assert recovered["repeat"] == {"times": 1, "completed": 0}
+    assert recovered["run_claim"] is None
+
+    eligible_at = now + timedelta(seconds=jobs.FIRE_CLAIM_TTL_SECONDS)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: eligible_at + timedelta(seconds=1))
+    due = jobs.get_due_jobs()
+    assert [candidate["id"] for candidate in due] == [job["id"]]
+    assert isinstance(jobs.claim_job_for_fire(job["id"], return_job=True), dict)
+    assert jobs.claim_dispatch(job["id"]) is True
+    assert jobs.get_job(job["id"])["repeat"]["completed"] == 1
 
 
 def test_provider_recovery_requeues_before_marking_execution_unknown(isolated_cron, monkeypatch):
