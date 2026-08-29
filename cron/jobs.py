@@ -3284,6 +3284,28 @@ def _claim_job_for_fire_locked(
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
                     job["next_run_at"] = nxt
+            # Record the exact values produced by this claim.  Rollback is a
+            # three-way merge (before / claimed / current), not an overwrite:
+            # a concurrent operator edit that lands after the jobs-store CAS
+            # must remain authoritative when the execution fence later fails.
+            for key in tuple(rollback):
+                snapshot = rollback[key]
+                snapshot["claimed_present"] = key in job
+                snapshot["claimed_value"] = copy.deepcopy(job.get(key))
+                if (
+                    snapshot["present"] == snapshot["claimed_present"]
+                    and snapshot["value"] == snapshot["claimed_value"]
+                ):
+                    rollback.pop(key)
+            if "interrupted_retry" in rollback:
+                # Restoring an owed retry is valid only while the explicit
+                # at-least-once policy remains enabled.  This guard resolves
+                # the otherwise-ambiguous absent->absent state when an
+                # operator disables the policy after the claim consumed the
+                # marker but before ledger promotion fails.
+                rollback["_retry_policy_claimed"] = copy.deepcopy(
+                    job.get("retry_interrupted")
+                )
             save_jobs(jobs)
             claimed_job = copy.deepcopy(job)
             claimed_job["_fire_claim_rollback"] = rollback
@@ -3340,8 +3362,50 @@ def rollback_fire_claim_setup(claimed_job: Dict[str, Any]) -> bool:
                 if current_claim.get("execution_id") != expected_claim.get("execution_id"):
                     return False
 
+                retry_snapshot = rollback.get("interrupted_retry")
+                retry_policy_changed = isinstance(retry_snapshot, dict) and (
+                    job.get("retry_interrupted")
+                    != rollback.get("_retry_policy_claimed")
+                )
+                force_fields = {
+                    "enabled",
+                    "state",
+                    "paused_at",
+                    "paused_reason",
+                }
+                force_group_changed = any(
+                    key in rollback
+                    and (
+                        (key in job) != rollback[key].get("claimed_present")
+                        or job.get(key) != rollback[key].get("claimed_value")
+                    )
+                    for key in force_fields
+                )
+
                 for key, snapshot in rollback.items():
+                    if key.startswith("_"):
+                        continue
                     if not isinstance(snapshot, dict):
+                        continue
+                    if key in force_fields and force_group_changed:
+                        # Pause/resume state is one logical operator edit.  If
+                        # any member changed after our force-claim, preserve
+                        # the whole newer group instead of mixing generations.
+                        continue
+                    if retry_policy_changed and key in {
+                        "interrupted_retry",
+                        "next_run_at",
+                    }:
+                        continue
+                    current_matches_claim = (
+                        (key in job) == snapshot.get("claimed_present")
+                        and job.get(key) == snapshot.get("claimed_value")
+                    )
+                    if not current_matches_claim and not (
+                        key == "next_run_at"
+                        and isinstance(retry_snapshot, dict)
+                        and not retry_policy_changed
+                    ):
                         continue
                     if snapshot.get("present"):
                         job[key] = copy.deepcopy(snapshot.get("value"))
@@ -3352,6 +3416,13 @@ def rollback_fire_claim_setup(claimed_job: Dict[str, Any]) -> bool:
                 # occurrence immediately eligible for a clean attempt.
                 job["fire_claim"] = None
                 save_jobs(stored_jobs)
+                if retry_policy_changed:
+                    original_retry = (
+                        retry_snapshot.get("value")
+                        if retry_snapshot.get("present")
+                        else None
+                    )
+                    _forget_interrupted_retry_best_effort(job_id, original_retry)
                 claimed_job.pop("_fire_claim_rollback", None)
                 return True
     return False

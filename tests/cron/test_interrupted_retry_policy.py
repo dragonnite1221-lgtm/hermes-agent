@@ -515,6 +515,73 @@ def test_failed_forced_fire_restores_paused_state(isolated_cron, monkeypatch):
     assert restored["fire_claim"] is None
 
 
+def test_fence_rollback_preserves_concurrent_operator_pause(
+    isolated_cron, monkeypatch
+):
+    import cron.scheduler_provider as provider
+
+    job = _script_job()
+    pause_results = []
+
+    def fail_after_pause(_execution_id):
+        if not pause_results:
+            pause_results.append(
+                jobs.pause_job(job["id"], reason="operator won the race")
+            )
+        return None
+
+    monkeypatch.setattr(executions, "mark_fire_claim_acquired", fail_after_pause)
+
+    with pytest.raises(FireClaimNotAcquiredError, match="occurrence was restored"):
+        provider.claim_fire_with_execution(job["id"], source="external")
+
+    stored = jobs.get_job(job["id"])
+    assert stored["enabled"] is False
+    assert stored["state"] == "paused"
+    assert stored["paused_reason"] == "operator won the race"
+    assert stored["paused_at"] == pause_results[0]["paused_at"]
+    assert stored["fire_claim"] is None
+
+
+def test_fence_rollback_does_not_resurrect_concurrently_disabled_retry(
+    isolated_cron, monkeypatch
+):
+    import cron.scheduler_provider as provider
+
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    job = _script_job(retry_interrupted=True)
+    abandoned = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(abandoned["id"])
+    assert jobs.requeue_interrupted_jobs([abandoned]) == {job["id"]}
+    executions.mark_interrupted_executions_unknown(
+        [abandoned["id"]], retry_job_ids={job["id"]}
+    )
+    updates = []
+
+    def fail_after_policy_disable(_execution_id):
+        if not updates:
+            updates.append(
+                jobs.update_job(job["id"], {"retry_interrupted": False})
+            )
+        return None
+
+    monkeypatch.setattr(
+        executions, "mark_fire_claim_acquired", fail_after_policy_disable
+    )
+
+    with pytest.raises(FireClaimNotAcquiredError, match="occurrence was restored"):
+        provider.claim_fire_with_execution(job["id"], source="external")
+
+    stored = jobs.get_job(job["id"])
+    assert stored["retry_interrupted"] is False
+    assert "interrupted_retry" not in stored
+    assert stored["fire_claim"] is None
+    assert stored["next_run_at"] == updates[0]["next_run_at"]
+    assert executions.execution_ids_are_terminal(
+        [abandoned["id"]], job_id=job["id"]
+    ) is False
+
+
 def test_ledger_create_failure_never_attempts_or_consumes_fire_claim(
     isolated_cron, monkeypatch
 ):
