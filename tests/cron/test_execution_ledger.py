@@ -24,6 +24,7 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     claimed = executions.create_execution("job-1", source="builtin")
     assert claimed["status"] == "claimed"
     assert claimed["machine_id"] == executions._machine_id()
+    assert claimed["boot_id"] == executions._boot_id()
     assert claimed["pid_namespace"] == executions._pid_namespace_id()
     assert claimed["claimed_at"]
     assert claimed["started_at"] is None
@@ -190,7 +191,6 @@ def test_foreign_owner_is_recovered_only_after_distributed_lease_expires(
     monotonic_now = [1000.0]
     monkeypatch.setattr(executions, "_hermes_now", lambda: now)
     monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
-    executions._foreign_lease_observations.clear()
     record = executions.create_execution("remote-owner", source="external")
     executions.mark_execution_running(record["id"])
     with executions._transaction() as conn:
@@ -226,7 +226,6 @@ def test_same_machine_different_pid_namespace_uses_distributed_lease(
     executions = _point_ledger(monkeypatch, tmp_path)
     monotonic_now = [700.0]
     monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
-    executions._foreign_lease_observations.clear()
     record = executions.create_execution("container-owner", source="builtin")
     executions.mark_execution_running(record["id"])
     with executions._transaction() as conn:
@@ -251,11 +250,40 @@ def test_same_machine_different_pid_namespace_uses_distributed_lease(
     assert local_pid_checks == []
 
 
+def test_same_machine_and_namespace_different_boot_uses_distributed_lease(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monotonic_now = [900.0]
+    monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
+    record = executions.create_execution("other-host-boot", source="builtin")
+    executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            """UPDATE executions SET process_id='other-process',
+               boot_id='other-host-boot-id' WHERE id=?""",
+            (record["id"],),
+        )
+    local_pid_checks = []
+    monkeypatch.setattr(
+        executions,
+        "_owner_is_live",
+        lambda *_args: local_pid_checks.append(True) or True,
+    )
+
+    assert executions.interrupted_execution_candidates() == []
+    assert local_pid_checks == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS + 1
+    assert [row["id"] for row in executions.interrupted_execution_candidates()] == [
+        record["id"]
+    ]
+    assert local_pid_checks == []
+
+
 def test_foreign_heartbeat_generation_resets_observer_local_lease(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     monotonic_now = [500.0]
     monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
-    executions._foreign_lease_observations.clear()
     record = executions.create_execution("remote-renewing", source="external")
     with executions._transaction() as conn:
         conn.execute(
@@ -313,10 +341,12 @@ def test_existing_execution_schema_adds_machine_identity_column(monkeypatch, tmp
     created = executions.create_execution("migrated", source="builtin")
 
     assert created["machine_id"] == executions._machine_id()
+    assert created["boot_id"] == executions._boot_id()
     assert created["pid_namespace"] == executions._pid_namespace_id()
     with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
     assert "machine_id" in columns
+    assert "boot_id" in columns
     assert "pid_namespace" in columns
 
 

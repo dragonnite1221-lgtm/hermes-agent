@@ -3216,7 +3216,7 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
-def clear_run_claim(job_id: str) -> bool:
+def clear_run_claim(job_id: str, *, expected_owner: Optional[str] = None) -> bool:
     """Clear a one-shot job's ``run_claim`` when its dispatch fails.
 
     ``get_due_jobs`` stamps a ``run_claim`` before returning a one-shot as
@@ -3236,7 +3236,14 @@ def clear_run_claim(job_id: str) -> bool:
                 continue
             if job.get("schedule", {}).get("kind") != "once":
                 return False
-            if job.get("run_claim") is not None:
+            claim = job.get("run_claim")
+            if (
+                isinstance(claim, dict)
+                and expected_owner is not None
+                and claim.get("by") != expected_owner
+            ):
+                return False
+            if claim is not None:
                 job["run_claim"] = None
                 save_jobs(jobs)
                 return True

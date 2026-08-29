@@ -7494,7 +7494,13 @@ def tick(
                 if not (isinstance(_schedule, dict) and _schedule.get("kind") == "once"):
                     return
                 try:
-                    clear_run_claim(job_id)
+                    run_claim = job.get("run_claim")
+                    expected_owner = (
+                        str(run_claim.get("by"))
+                        if isinstance(run_claim, dict) and run_claim.get("by")
+                        else None
+                    )
+                    clear_run_claim(job_id, expected_owner=expected_owner)
                 except Exception as claim_err:
                     logger.warning(
                         "Could not clear run_claim for job '%s' after dispatch "
@@ -7517,6 +7523,7 @@ def tick(
                 return None
             if not try_register_running_job(job_id):
                 logger.info("Job '%s' already running — skipping", job.get("name", job_id))
+                _clear_run_claim_best_effort()
                 return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.

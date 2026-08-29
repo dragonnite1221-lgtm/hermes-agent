@@ -46,6 +46,7 @@ def _make_oneshot(claimed: bool = True) -> dict:
             if j["id"] == job["id"]:
                 j["run_claim"] = {"at": "2026-08-17T10:00:00+00:00", "by": "test:1"}
         jobs_mod.save_jobs(jobs)
+        return next(j for j in jobs if j["id"] == job["id"])
     return job
 
 
@@ -73,6 +74,12 @@ class TestClearRunClaim:
 
     def test_unknown_job_id_returns_false(self, cron_store):
         assert clear_run_claim("no-such-job") is False
+
+    def test_expected_owner_cannot_clear_replacement_claim(self, cron_store):
+        job = _make_oneshot(claimed=True)
+        assert clear_run_claim(job["id"], expected_owner="other-owner") is False
+        reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
+        assert reloaded["run_claim"]["by"] == "test:1"
 
 
 class TestDispatchFailurePathsClearClaim:
@@ -102,6 +109,19 @@ class TestDispatchFailurePathsClearClaim:
         reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
         assert reloaded.get("run_claim") is None
         assert job["id"] not in sched.get_running_job_ids()
+
+    def test_running_guard_skip_clears_only_tick_oneshot_claim(self, cron_store):
+        from cron import scheduler as sched
+
+        job = _make_oneshot(claimed=True)
+        sched._running_job_ids.add(job["id"])
+        try:
+            assert self._tick_one(job) == 0
+        finally:
+            sched._running_job_ids.discard(job["id"])
+            sched._shutdown_parallel_pool()
+        reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
+        assert reloaded.get("run_claim") is None
 
     def test_submit_failure_clears_claim(self, cron_store):
         from cron import scheduler as sched

@@ -35,8 +35,6 @@ EXECUTION_OWNER_LEASE_SECONDS = 300
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
-_foreign_lease_lock = threading.Lock()
-_foreign_lease_observations: dict[str, tuple[str, float]] = {}
 _MAX_FOREIGN_LEASE_OBSERVATIONS = 4096
 
 
@@ -60,6 +58,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              source TEXT NOT NULL,
              process_id TEXT NOT NULL,
              machine_id TEXT,
+             boot_id TEXT,
              pid_namespace TEXT,
              heartbeat_at TEXT,
              fire_claim_acquired INTEGER NOT NULL DEFAULT 1,
@@ -79,6 +78,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     }
     migrations = (
         ("machine_id", "machine_id TEXT"),
+        ("boot_id", "boot_id TEXT"),
         ("pid_namespace", "pid_namespace TEXT"),
         ("heartbeat_at", "heartbeat_at TEXT"),
         ("fire_claim_acquired", "fire_claim_acquired INTEGER NOT NULL DEFAULT 1"),
@@ -101,6 +101,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              execution_id TEXT PRIMARY KEY,
              job_id TEXT NOT NULL,
              terminal_at TEXT NOT NULL
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS foreign_lease_observations (
+             execution_id TEXT NOT NULL,
+             observer_boot_id TEXT NOT NULL,
+             generation TEXT NOT NULL,
+             observed_monotonic REAL NOT NULL,
+             PRIMARY KEY (execution_id, observer_boot_id)
            )"""
     )
 
@@ -201,6 +210,22 @@ def _pid_namespace_id() -> str:
     return f"hermes-pidns-{digest[:32]}"
 
 
+def _boot_id() -> str:
+    """Return the globally random kernel-boot identity for PID attribution."""
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        value = ""
+    if not value:
+        # A process-scoped fallback disables cross-process local PID checks and
+        # durable monotonic observations on platforms without Linux boot IDs.
+        return f"unknown-{_PROCESS_ID}"
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"hermes-boot-{digest[:32]}"
+
+
 def _foreign_owner_lease_is_stale(row: sqlite3.Row) -> bool:
     """Expire a foreign lease only after one observer sees no renewal locally.
 
@@ -216,29 +241,58 @@ def _foreign_owner_lease_is_stale(row: sqlite3.Row) -> bool:
     if not execution_id or not generation:
         return False
     observed_now = time.monotonic()
-    with _foreign_lease_lock:
-        previous = _foreign_lease_observations.get(execution_id)
-        if previous is None or previous[0] != generation:
-            if len(_foreign_lease_observations) >= _MAX_FOREIGN_LEASE_OBSERVATIONS:
-                oldest = sorted(
-                    _foreign_lease_observations,
-                    key=lambda key: _foreign_lease_observations[key][1],
-                )[: _MAX_FOREIGN_LEASE_OBSERVATIONS // 2]
-                for key in oldest:
-                    _foreign_lease_observations.pop(key, None)
-            _foreign_lease_observations[execution_id] = (generation, observed_now)
+    observer_boot_id = _boot_id()
+    with _transaction() as conn:
+        previous = conn.execute(
+            """SELECT generation, observed_monotonic
+               FROM foreign_lease_observations
+               WHERE execution_id=? AND observer_boot_id=?""",
+            (execution_id, observer_boot_id),
+        ).fetchone()
+        if (
+            previous is None
+            or str(previous["generation"]) != generation
+            or observed_now < float(previous["observed_monotonic"])
+        ):
+            conn.execute(
+                """INSERT INTO foreign_lease_observations
+                   (execution_id, observer_boot_id, generation, observed_monotonic)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(execution_id, observer_boot_id) DO UPDATE SET
+                     generation=excluded.generation,
+                     observed_monotonic=excluded.observed_monotonic""",
+                (execution_id, observer_boot_id, generation, observed_now),
+            )
+            conn.execute(
+                """DELETE FROM foreign_lease_observations WHERE rowid IN (
+                     SELECT rowid FROM foreign_lease_observations
+                     WHERE observer_boot_id=?
+                     ORDER BY observed_monotonic DESC
+                     LIMIT -1 OFFSET ?
+                   )""",
+                (observer_boot_id, _MAX_FOREIGN_LEASE_OBSERVATIONS),
+            )
             return False
-        return observed_now - previous[1] >= EXECUTION_OWNER_LEASE_SECONDS
+        return (
+            observed_now - float(previous["observed_monotonic"])
+            >= EXECUTION_OWNER_LEASE_SECONDS
+        )
 
 
 def _owner_lease_is_stale(
-    row: sqlite3.Row, *, local_machine_id: str, local_pid_namespace: str
+    row: sqlite3.Row,
+    *,
+    local_machine_id: str,
+    local_boot_id: str,
+    local_pid_namespace: str,
 ) -> bool:
     """Prove an owner dead using PIDs only inside the same PID namespace."""
     owner_machine_id = str(row["machine_id"] or "").strip()
+    owner_boot_id = str(row["boot_id"] or "").strip()
     owner_pid_namespace = str(row["pid_namespace"] or "").strip()
     if (
         owner_machine_id == local_machine_id
+        and owner_boot_id == local_boot_id
         and owner_pid_namespace == local_pid_namespace
     ):
         return not _owner_is_live(int(row["pid"]), row["process_started_at"])
@@ -269,13 +323,13 @@ def create_execution(
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
-               (id, job_id, source, process_id, machine_id, pid_namespace,
+               (id, job_id, source, process_id, machine_id, boot_id, pid_namespace,
                 pid, process_started_at,
                 status, claimed_at, heartbeat_at, fire_claim_acquired)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, _machine_id(),
-             _pid_namespace_id(), pid, _process_start_time(pid), now, now,
-             int(fire_claim_acquired)),
+             _boot_id(), _pid_namespace_id(), pid, _process_start_time(pid), now,
+             now, int(fire_claim_acquired)),
         )
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
@@ -393,12 +447,14 @@ def reconcile_unacquired_executions() -> tuple[int, int]:
         return (0, 0)
 
     local_machine_id = _machine_id()
+    local_boot_id = _boot_id()
     local_pid_namespace = _pid_namespace_id()
     abandoned: list[sqlite3.Row] = []
     for row in rows:
         if not _owner_lease_is_stale(
             row,
             local_machine_id=local_machine_id,
+            local_boot_id=local_boot_id,
             local_pid_namespace=local_pid_namespace,
         ):
             continue
@@ -440,24 +496,26 @@ def interrupted_execution_candidates() -> List[Dict[str, Any]]:
     """Return active attempts whose exact owner process is provably gone."""
     abandoned: List[Dict[str, Any]] = []
     local_machine_id = _machine_id()
+    local_boot_id = _boot_id()
     local_pid_namespace = _pid_namespace_id()
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT * FROM executions
                WHERE status IN ('claimed','running') AND fire_claim_acquired=1"""
         ).fetchall()
-        for row in rows:
-            if row["process_id"] == _PROCESS_ID:
-                continue
-            if not _owner_lease_is_stale(
-                row,
-                local_machine_id=local_machine_id,
-                local_pid_namespace=local_pid_namespace,
-            ):
-                continue
-            record = _record(row)
-            if record is not None:
-                abandoned.append(record)
+    for row in rows:
+        if row["process_id"] == _PROCESS_ID:
+            continue
+        if not _owner_lease_is_stale(
+            row,
+            local_machine_id=local_machine_id,
+            local_boot_id=local_boot_id,
+            local_pid_namespace=local_pid_namespace,
+        ):
+            continue
+        record = _record(row)
+        if record is not None:
+            abandoned.append(record)
     return abandoned
 
 
