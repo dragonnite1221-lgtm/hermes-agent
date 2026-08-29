@@ -24,6 +24,7 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     claimed = executions.create_execution("job-1", source="builtin")
     assert claimed["status"] == "claimed"
     assert claimed["machine_id"] == executions._machine_id()
+    assert claimed["pid_namespace"] == executions._pid_namespace_id()
     assert claimed["claimed_at"]
     assert claimed["started_at"] is None
     assert claimed["finished_at"] is None
@@ -186,7 +187,10 @@ def test_foreign_owner_is_recovered_only_after_distributed_lease_expires(
 ):
     executions = _point_ledger(monkeypatch, tmp_path)
     now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+    monotonic_now = [1000.0]
     monkeypatch.setattr(executions, "_hermes_now", lambda: now)
+    monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
+    executions._foreign_lease_observations.clear()
     record = executions.create_execution("remote-owner", source="external")
     executions.mark_execution_running(record["id"])
     with executions._transaction() as conn:
@@ -198,7 +202,9 @@ def test_foreign_owner_is_recovered_only_after_distributed_lease_expires(
     monkeypatch.setattr(executions, "_machine_id", lambda: "local-host")
 
     assert executions.interrupted_execution_candidates() == []
-
+    # Remote wall time is deliberately far behind. It remains live because
+    # expiry is measured from this observer's unchanged generation, not by
+    # subtracting clocks from different hosts.
     with executions._transaction() as conn:
         conn.execute(
             "UPDATE executions SET heartbeat_at=? WHERE id=?",
@@ -207,9 +213,69 @@ def test_foreign_owner_is_recovered_only_after_distributed_lease_expires(
                 record["id"],
             ),
         )
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS - 1
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += 2
+    assert [row["id"] for row in executions.interrupted_execution_candidates()] == [record["id"]]
+
+
+def test_same_machine_different_pid_namespace_uses_distributed_lease(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monotonic_now = [700.0]
+    monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
+    executions._foreign_lease_observations.clear()
+    record = executions.create_execution("container-owner", source="builtin")
+    executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            """UPDATE executions SET process_id='other-process',
+               pid_namespace='other-pid-namespace' WHERE id=?""",
+            (record["id"],),
+        )
+    local_pid_checks = []
+    monkeypatch.setattr(
+        executions,
+        "_owner_is_live",
+        lambda *_args: local_pid_checks.append(True) or True,
+    )
+
+    assert executions.interrupted_execution_candidates() == []
+    assert local_pid_checks == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS + 1
     assert [row["id"] for row in executions.interrupted_execution_candidates()] == [
         record["id"]
     ]
+    assert local_pid_checks == []
+
+
+def test_foreign_heartbeat_generation_resets_observer_local_lease(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monotonic_now = [500.0]
+    monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
+    executions._foreign_lease_observations.clear()
+    record = executions.create_execution("remote-renewing", source="external")
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET process_id='remote', machine_id='remote-host' WHERE id=?",
+            (record["id"],),
+        )
+    monkeypatch.setattr(executions, "_machine_id", lambda: "local-host")
+
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS - 1
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET heartbeat_at=? WHERE id=?",
+            ("1900-01-01T00:00:01+00:00", record["id"]),
+        )
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS - 1
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += 2
+    assert [row["id"] for row in executions.interrupted_execution_candidates()] == [record["id"]]
 
 
 def test_machine_identity_does_not_depend_on_hermes_machine_id_env(monkeypatch):
@@ -247,9 +313,11 @@ def test_existing_execution_schema_adds_machine_identity_column(monkeypatch, tmp
     created = executions.create_execution("migrated", source="builtin")
 
     assert created["machine_id"] == executions._machine_id()
+    assert created["pid_namespace"] == executions._pid_namespace_id()
     with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
     assert "machine_id" in columns
+    assert "pid_namespace" in columns
 
 
 def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):

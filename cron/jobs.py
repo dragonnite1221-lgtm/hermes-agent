@@ -2444,7 +2444,11 @@ def _interrupted_retry_eligible_at(job: Dict[str, Any], now: datetime) -> dateti
     return now
 
 
-def requeue_interrupted_jobs(executions: Collection[Dict[str, Any]]) -> Set[str]:
+def requeue_interrupted_jobs(
+    executions: Collection[Dict[str, Any]],
+    *,
+    expected_heartbeats: Optional[Dict[str, Optional[str]]] = None,
+) -> Set[str]:
     """Durably schedule one retry for each opted-in abandoned job.
 
     A retry waits until the retained fire-claim lease expires, preventing the
@@ -2453,14 +2457,18 @@ def requeue_interrupted_jobs(executions: Collection[Dict[str, Any]]) -> Set[str]
     persisted in ``interrupted_retry`` make both mutations idempotent if the
     scheduler dies after this save but before the execution ledger is updated.
     """
-    requested: Dict[str, Set[str]] = {}
+    requested: Dict[str, Dict[str, Optional[str]]] = {}
     for execution in executions:
         if not isinstance(execution, dict):
             continue
         job_id = str(execution.get("job_id") or "")
         execution_id = str(execution.get("id") or "")
         if job_id and execution_id:
-            requested.setdefault(job_id, set()).add(execution_id)
+            requested.setdefault(job_id, {})[execution_id] = (
+                expected_heartbeats.get(execution_id)
+                if expected_heartbeats is not None
+                else None
+            )
     if not requested:
         return set()
     requeued: Set[str] = set()
@@ -2498,13 +2506,25 @@ def requeue_interrupted_jobs(executions: Collection[Dict[str, Any]]) -> Set[str]
                 for value in (existing.get("execution_ids") if isinstance(existing, dict) else []) or []
                 if value
             }
-            new_ids = requested[job_id] - existing_ids
+            new_ids = set(requested[job_id]) - existing_ids
             if new_ids:
                 eligible_at = _interrupted_retry_eligible_at(job, now)
                 schedule = job.get("schedule")
                 kind = schedule.get("kind") if isinstance(schedule, dict) else None
                 repeat = job.get("repeat")
-                if kind == "once" and isinstance(repeat, dict):
+                rollback = (
+                    copy.deepcopy(existing.get("rollback"))
+                    if isinstance(existing, dict)
+                    and isinstance(existing.get("rollback"), dict)
+                    else {
+                        key: {
+                            "present": key in job,
+                            "value": copy.deepcopy(job.get(key)),
+                        }
+                        for key in ("next_run_at", "run_claim", "repeat")
+                    }
+                )
+                if not existing_ids and kind == "once" and isinstance(repeat, dict):
                     times = repeat.get("times")
                     completed = repeat.get("completed", 0)
                     valid_times = times is None or (
@@ -2530,8 +2550,27 @@ def requeue_interrupted_jobs(executions: Collection[Dict[str, Any]]) -> Set[str]
                         repeat["completed"] = completed - 1
                     job["run_claim"] = None
                 job["interrupted_retry"] = {
-                    "execution_ids": sorted(existing_ids | requested[job_id]),
+                    "execution_ids": sorted(existing_ids | set(requested[job_id])),
                     "eligible_at": eligible_at.isoformat(),
+                    "rollback": rollback,
+                    **(
+                        {
+                            "expected_heartbeats": {
+                                **(
+                                    copy.deepcopy(existing.get("expected_heartbeats"))
+                                    if isinstance(existing, dict)
+                                    and isinstance(existing.get("expected_heartbeats"), dict)
+                                    else {}
+                                ),
+                                **{
+                                    execution_id: requested[job_id][execution_id]
+                                    for execution_id in new_ids
+                                },
+                            }
+                        }
+                        if expected_heartbeats is not None
+                        else {}
+                    ),
                 }
             else:
                 try:
@@ -2539,10 +2578,162 @@ def requeue_interrupted_jobs(executions: Collection[Dict[str, Any]]) -> Set[str]
                 except (KeyError, TypeError, ValueError):
                     eligible_at = now
             job["next_run_at"] = eligible_at.isoformat()
+            marker = job.get("interrupted_retry")
+            rollback = marker.get("rollback") if isinstance(marker, dict) else None
+            if isinstance(rollback, dict):
+                for key, snapshot in rollback.items():
+                    if not isinstance(snapshot, dict):
+                        continue
+                    snapshot.setdefault("requeued_present", key in job)
+                    snapshot.setdefault("requeued_value", copy.deepcopy(job.get(key)))
             requeued.add(job_id)
         if requeued:
             save_jobs(jobs)
     return requeued
+
+
+def _restore_interrupted_retry_rollback(
+    job: Dict[str, Any], marker: Dict[str, Any]
+) -> None:
+    rollback = marker.get("rollback")
+    if isinstance(rollback, dict):
+        for key, snapshot in rollback.items():
+            if not isinstance(snapshot, dict):
+                continue
+            if (
+                (key in job) != snapshot.get("requeued_present")
+                or job.get(key) != snapshot.get("requeued_value")
+            ):
+                continue
+            if snapshot.get("present"):
+                job[key] = copy.deepcopy(snapshot.get("value"))
+            else:
+                job.pop(key, None)
+        return
+    # Legacy markers lack an exact inverse. Remove the unsafe retry and fail
+    # closed: recurring cadence resumes at its next legal future occurrence;
+    # a one-shot remains terminal/non-dispatchable.
+    schedule = job.get("schedule")
+    kind = schedule.get("kind") if isinstance(schedule, dict) else None
+    if kind in {"cron", "interval"}:
+        job["next_run_at"] = compute_next_run(schedule, _hermes_now().isoformat())
+    elif kind == "once":
+        job["next_run_at"] = None
+
+
+def cancel_interrupted_retry_executions(execution_ids: Collection[str]) -> Set[str]:
+    """Remove retry markers whose owner-renewal CAS defeated recovery.
+
+    Recovery writes jobs.json before terminalizing SQLite so a crash can never
+    lose an owed retry. If the owner's heartbeat changes between those writes,
+    this inverse operation restores the exact schedule state saved with the
+    marker. The restore is a three-way CAS: later operator edits win.
+    """
+    cancelled_ids = {str(value) for value in execution_ids if value}
+    if not cancelled_ids:
+        return set()
+    changed_jobs: Set[str] = set()
+    with _jobs_lock():
+        stored_jobs = load_jobs()
+        for job in stored_jobs:
+            marker = job.get("interrupted_retry")
+            if not isinstance(marker, dict):
+                continue
+            marker_ids = {
+                str(value) for value in marker.get("execution_ids") or [] if value
+            }
+            remaining = marker_ids - cancelled_ids
+            if remaining == marker_ids:
+                continue
+            job_id = str(job.get("id") or "")
+            changed_jobs.add(job_id)
+            if remaining:
+                marker["execution_ids"] = sorted(remaining)
+                expected = marker.get("expected_heartbeats")
+                if isinstance(expected, dict):
+                    marker["expected_heartbeats"] = {
+                        execution_id: heartbeat
+                        for execution_id, heartbeat in expected.items()
+                        if execution_id in remaining
+                    }
+                continue
+            _restore_interrupted_retry_rollback(job, marker)
+            job.pop("interrupted_retry", None)
+        if changed_jobs:
+            save_jobs(stored_jobs)
+    return changed_jobs
+
+
+def reconcile_interrupted_retry_markers() -> Set[str]:
+    """Repair the crash boundary between jobs-store requeue and ledger CAS.
+
+    A marker without an ACK is kept only while its exact heartbeat generation
+    is still the one recovery observed. A renewed or normally finished owner
+    defeats that stale recovery attempt and the marker is rolled back. Unknown
+    rows recreate a missing ACK, covering a crash after SQLite terminalization.
+    """
+    changed_jobs: Set[str] = set()
+    with _jobs_lock():
+        stored_jobs = load_jobs()
+        marker_ids = {
+            str(execution_id)
+            for job in stored_jobs
+            if isinstance(job, dict)
+            for marker in [job.get("interrupted_retry")]
+            if isinstance(marker, dict)
+            for execution_id in marker.get("execution_ids") or []
+            if execution_id
+        }
+        if not marker_ids:
+            return set()
+        from cron.executions import (
+            interrupted_retry_states,
+            remember_interrupted_retry_acks,
+        )
+
+        states, acked_ids = interrupted_retry_states(marker_ids)
+        for job in stored_jobs:
+            marker = job.get("interrupted_retry")
+            if not isinstance(marker, dict):
+                continue
+            expected = marker.get("expected_heartbeats")
+            expected = expected if isinstance(expected, dict) else {}
+            ids = {
+                str(value) for value in marker.get("execution_ids") or [] if value
+            }
+            cancel_ids: Set[str] = set()
+            recreate_ids: Set[str] = set()
+            for execution_id in ids - acked_ids:
+                state = states.get(execution_id)
+                if state is None or state.get("status") in {"completed", "failed"}:
+                    cancel_ids.add(execution_id)
+                elif state.get("status") == "unknown":
+                    recreate_ids.add(execution_id)
+                elif (
+                    execution_id in expected
+                    and state.get("heartbeat_at") != expected.get(execution_id)
+                ):
+                    cancel_ids.add(execution_id)
+            job_id = str(job.get("id") or "")
+            if recreate_ids:
+                remember_interrupted_retry_acks(recreate_ids, job_id=job_id)
+            if not cancel_ids:
+                continue
+            remaining = ids - cancel_ids
+            changed_jobs.add(job_id)
+            if remaining:
+                marker["execution_ids"] = sorted(remaining)
+                marker["expected_heartbeats"] = {
+                    execution_id: heartbeat
+                    for execution_id, heartbeat in expected.items()
+                    if execution_id in remaining
+                }
+            else:
+                _restore_interrupted_retry_rollback(job, marker)
+                job.pop("interrupted_retry", None)
+        if changed_jobs:
+            save_jobs(stored_jobs)
+    return changed_jobs
 
 
 def remove_job(job_id: str) -> bool:
@@ -3081,6 +3272,13 @@ def advance_next_runs(job_ids) -> int:
             kind = job.get("schedule", {}).get("kind")
             if kind not in {"cron", "interval"}:
                 continue
+            if isinstance(job.get("interrupted_retry"), dict):
+                # This is an already-owed attempt, not an ordinary cadence
+                # fire.  Its claim path advances only after the durable
+                # execution fence exists and carries an exact rollback
+                # snapshot.  Pre-advancing here would strand the retry when
+                # execution creation/submission fails before that claim.
+                continue
             new_next = compute_next_run(job["schedule"], now)
             if new_next and new_next != job.get("next_run_at"):
                 job["next_run_at"] = new_next
@@ -3381,6 +3579,26 @@ def rollback_fire_claim_setup(claimed_job: Dict[str, Any]) -> bool:
                     )
                     for key in force_fields
                 )
+
+                if isinstance(retry_snapshot, dict) and not retry_policy_changed:
+                    original_retry = (
+                        retry_snapshot.get("value")
+                        if retry_snapshot.get("present")
+                        else None
+                    )
+                    if isinstance(original_retry, dict):
+                        # The claim temporarily removes the marker, so the
+                        # serialized orphan pruner may legitimately delete its
+                        # ACK before ledger promotion fails. Recreate the ACK
+                        # while still holding the jobs lock and *before* the
+                        # marker is restored. A crash can therefore leave an
+                        # orphan ACK (self-pruning), never a stranded marker.
+                        from cron.executions import remember_interrupted_retry_acks
+
+                        remember_interrupted_retry_acks(
+                            original_retry.get("execution_ids") or [],
+                            job_id=job_id,
+                        )
 
                 for key, snapshot in rollback.items():
                     if key.startswith("_"):

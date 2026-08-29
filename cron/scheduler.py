@@ -534,7 +534,6 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import (
-    advance_next_runs,
     claim_dispatch,
     claim_job_for_fire,
     fire_claim_fence,
@@ -6552,8 +6551,6 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                         job_id,
                     )
                     return
-                if execution_id:
-                    heartbeat_execution(execution_id)
                 last_confirmed = time.monotonic()
             except Exception:
                 logger.debug(
@@ -6573,6 +6570,19 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                         _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS,
                     )
                     return
+                continue
+            if execution_id:
+                try:
+                    heartbeat_execution(execution_id)
+                except Exception:
+                    # jobs.json fire_claim is the authoritative dispatch
+                    # fence. Ledger telemetry must never turn a successfully
+                    # renewed owner into a false ownership loss.
+                    logger.debug(
+                        "Job '%s': execution-ledger heartbeat failed",
+                        job_id,
+                        exc_info=True,
+                    )
 
     heartbeat_thread = threading.Thread(
         target=heartbeat_context.run,
@@ -7373,18 +7383,6 @@ def tick(
 
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
-
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, the advance keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
-        # Batched: one load + one save for the whole due set, not one per job.
-        # Composes with the claim-time advance in claim_job_for_fire: for
-        # cron-kind jobs both compute the same next occurrence; interval jobs
-        # re-anchor from their own "now" at claim time (harmless for
-        # at-most-once — mark_job_run re-anchors at completion regardless).
-        advance_next_runs([job["id"] for job in due_jobs])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.

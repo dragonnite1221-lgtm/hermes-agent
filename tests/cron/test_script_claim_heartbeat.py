@@ -539,6 +539,44 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     assert calls >= 3
 
 
+def test_ledger_heartbeat_error_cannot_cancel_renewed_fire_claim(monkeypatch):
+    """Audit-ledger failure is isolated from the authoritative jobs-store lease."""
+    import cron.scheduler as scheduler
+
+    renewed = threading.Event()
+    fire_calls = 0
+
+    def heartbeat_fire(*_args, **_kwargs):
+        nonlocal fire_calls
+        fire_calls += 1
+        if fire_calls >= 2:
+            renewed.set()
+        return True
+
+    def run_body(_job, **kwargs):
+        assert renewed.wait(timeout=0.5)
+        assert kwargs["fire_claim_lost"].is_set() is False
+        return True
+
+    job = {
+        "id": "ledger-heartbeat-error",
+        "execution_id": "ledger-heartbeat-execution",
+        "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
+    }
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", heartbeat_fire)
+    monkeypatch.setattr(
+        scheduler,
+        "heartbeat_execution",
+        MagicMock(side_effect=OSError("ledger unavailable")),
+    )
+    monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.02)
+
+    assert scheduler.run_one_job(job) is True
+    assert fire_calls >= 2
+
+
 def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
     """A replacement owner cannot leave the stale ledger recorded as success."""
     import cron.scheduler as scheduler

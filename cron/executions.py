@@ -13,11 +13,12 @@ import logging
 import socket
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Collection, Dict, Iterator, List, Optional
+from typing import Any, Collection, Dict, Iterator, List, Mapping, Optional, Set
 
 from hermes_cli.sqlite_util import add_column_if_missing
 from hermes_constants import get_hermes_home
@@ -34,6 +35,9 @@ EXECUTION_OWNER_LEASE_SECONDS = 300
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+_foreign_lease_lock = threading.Lock()
+_foreign_lease_observations: dict[str, tuple[str, float]] = {}
+_MAX_FOREIGN_LEASE_OBSERVATIONS = 4096
 
 
 def _connect() -> sqlite3.Connection:
@@ -56,6 +60,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              source TEXT NOT NULL,
              process_id TEXT NOT NULL,
              machine_id TEXT,
+             pid_namespace TEXT,
              heartbeat_at TEXT,
              fire_claim_acquired INTEGER NOT NULL DEFAULT 1,
              pid INTEGER NOT NULL,
@@ -74,6 +79,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     }
     migrations = (
         ("machine_id", "machine_id TEXT"),
+        ("pid_namespace", "pid_namespace TEXT"),
         ("heartbeat_at", "heartbeat_at TEXT"),
         ("fire_claim_acquired", "fire_claim_acquired INTEGER NOT NULL DEFAULT 1"),
     )
@@ -180,16 +186,65 @@ def _machine_id() -> str:
     return f"hermes-host-{digest[:32]}"
 
 
-def _foreign_owner_lease_is_stale(row: sqlite3.Row, now: datetime) -> bool:
-    raw = row["heartbeat_at"] or row["claimed_at"]
+def _pid_namespace_id() -> str:
+    """Return the PID table identity that makes a numeric PID meaningful."""
+    if os.name != "posix":
+        return "native-pid-table"
     try:
-        heartbeat_at = datetime.fromisoformat(str(raw))
-        age = (now - heartbeat_at).total_seconds()
-    except (TypeError, ValueError):
+        namespace = os.readlink("/proc/self/ns/pid")
+    except OSError:
+        # Without a namespace identity, never compare another process's PID
+        # locally. A process-scoped value routes ownership through the safer
+        # distributed lease path instead.
+        return f"unknown-{_PROCESS_ID}"
+    digest = hashlib.sha256(namespace.encode("utf-8")).hexdigest()
+    return f"hermes-pidns-{digest[:32]}"
+
+
+def _foreign_owner_lease_is_stale(row: sqlite3.Row) -> bool:
+    """Expire a foreign lease only after one observer sees no renewal locally.
+
+    Persisted heartbeat timestamps are generations, not comparable clocks:
+    two replicas can disagree about wall time by more than the lease.  Each
+    observer therefore measures an unchanged generation with its own monotonic
+    clock. Process restart resets the observation and safely delays recovery
+    by one lease instead of risking a duplicate execution.
+    """
+    raw = row["heartbeat_at"] or row["claimed_at"]
+    execution_id = str(row["id"] or "")
+    generation = str(raw or "")
+    if not execution_id or not generation:
         return False
-    # Future timestamps can result from clock skew. Fail closed until a later
-    # sweep can establish expiry; never reap a possibly-live remote owner.
-    return age >= EXECUTION_OWNER_LEASE_SECONDS
+    observed_now = time.monotonic()
+    with _foreign_lease_lock:
+        previous = _foreign_lease_observations.get(execution_id)
+        if previous is None or previous[0] != generation:
+            if len(_foreign_lease_observations) >= _MAX_FOREIGN_LEASE_OBSERVATIONS:
+                oldest = sorted(
+                    _foreign_lease_observations,
+                    key=lambda key: _foreign_lease_observations[key][1],
+                )[: _MAX_FOREIGN_LEASE_OBSERVATIONS // 2]
+                for key in oldest:
+                    _foreign_lease_observations.pop(key, None)
+            _foreign_lease_observations[execution_id] = (generation, observed_now)
+            return False
+        return observed_now - previous[1] >= EXECUTION_OWNER_LEASE_SECONDS
+
+
+def _owner_lease_is_stale(
+    row: sqlite3.Row, *, local_machine_id: str, local_pid_namespace: str
+) -> bool:
+    """Prove an owner dead using PIDs only inside the same PID namespace."""
+    owner_machine_id = str(row["machine_id"] or "").strip()
+    owner_pid_namespace = str(row["pid_namespace"] or "").strip()
+    if (
+        owner_machine_id == local_machine_id
+        and owner_pid_namespace == local_pid_namespace
+    ):
+        return not _owner_is_live(int(row["pid"]), row["process_started_at"])
+    # Missing legacy identities and same-host containers are both foreign PID
+    # tables. Their persisted heartbeat generation is the only safe proof.
+    return _foreign_owner_lease_is_stale(row)
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
@@ -214,11 +269,13 @@ def create_execution(
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
-               (id, job_id, source, process_id, machine_id, pid, process_started_at,
+               (id, job_id, source, process_id, machine_id, pid_namespace,
+                pid, process_started_at,
                 status, claimed_at, heartbeat_at, fire_claim_acquired)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
-            (execution_id, str(job_id), str(source), _PROCESS_ID, _machine_id(), pid,
-             _process_start_time(pid), now, now, int(fire_claim_acquired)),
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
+            (execution_id, str(job_id), str(source), _PROCESS_ID, _machine_id(),
+             _pid_namespace_id(), pid, _process_start_time(pid), now, now,
+             int(fire_claim_acquired)),
         )
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
@@ -336,16 +393,14 @@ def reconcile_unacquired_executions() -> tuple[int, int]:
         return (0, 0)
 
     local_machine_id = _machine_id()
-    now = _hermes_now()
+    local_pid_namespace = _pid_namespace_id()
     abandoned: list[sqlite3.Row] = []
     for row in rows:
-        owner_machine_id = str(row["machine_id"] or "").strip()
-        if not owner_machine_id:
-            continue
-        if owner_machine_id != local_machine_id:
-            if not _foreign_owner_lease_is_stale(row, now):
-                continue
-        elif _owner_is_live(int(row["pid"]), row["process_started_at"]):
+        if not _owner_lease_is_stale(
+            row,
+            local_machine_id=local_machine_id,
+            local_pid_namespace=local_pid_namespace,
+        ):
             continue
         abandoned.append(row)
     if not abandoned:
@@ -384,8 +439,8 @@ def reconcile_unacquired_executions() -> tuple[int, int]:
 def interrupted_execution_candidates() -> List[Dict[str, Any]]:
     """Return active attempts whose exact owner process is provably gone."""
     abandoned: List[Dict[str, Any]] = []
-    legacy_rows = 0
     local_machine_id = _machine_id()
+    local_pid_namespace = _pid_namespace_id()
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT * FROM executions
@@ -394,37 +449,28 @@ def interrupted_execution_candidates() -> List[Dict[str, Any]]:
         for row in rows:
             if row["process_id"] == _PROCESS_ID:
                 continue
-            owner_machine_id = str(row["machine_id"] or "").strip()
-            if not owner_machine_id:
-                # Legacy rows cannot be assigned to this PID namespace with
-                # proof. Fail closed instead of rewriting an active attempt.
-                legacy_rows += 1
-                continue
-            if owner_machine_id != local_machine_id:
-                if not _foreign_owner_lease_is_stale(row, _hermes_now()):
-                    continue
-            elif _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            if not _owner_lease_is_stale(
+                row,
+                local_machine_id=local_machine_id,
+                local_pid_namespace=local_pid_namespace,
+            ):
                 continue
             record = _record(row)
             if record is not None:
                 abandoned.append(record)
-    if legacy_rows:
-        logger.warning(
-            "Skipped %d active legacy cron execution(s) without machine identity; "
-            "ownership cannot be proved",
-            legacy_rows,
-        )
     return abandoned
 
 
 def execution_ids_are_terminal(
     execution_ids: Collection[str], *, job_id: str
 ) -> bool:
-    """Return true only when every requested execution exists and is terminal.
+    """Return true only when every requested retry handoff has a durable ACK.
 
     Interrupted-job retry markers are the durable half of a cross-store
     handoff: jobs.json records that a retry is owed, while this SQLite ledger
-    records that the abandoned owner can no longer finish.  The retry must not
+    records that recovery terminalized that exact abandoned owner. A generic
+    completed/failed row is deliberately insufficient because the owner may
+    have renewed after the recovery candidate read. The retry must not
     be claimed until the ledger half has committed, otherwise a failure between
     the two writes can execute the same retry again after every restart.
     """
@@ -435,15 +481,10 @@ def execution_ids_are_terminal(
     params = tuple(sorted(ids))
     with _transaction() as conn:
         rows = conn.execute(
-            f"""SELECT id FROM executions
-                WHERE id IN ({placeholders})
-                  AND job_id = ?
-                  AND status IN ('completed','failed','unknown')
-                UNION
-                SELECT execution_id AS id FROM interrupted_retry_acks
+            f"""SELECT execution_id AS id FROM interrupted_retry_acks
                 WHERE execution_id IN ({placeholders})
                   AND job_id = ?""",
-            params + (str(job_id),) + params + (str(job_id),),
+            params + (str(job_id),),
         ).fetchall()
     return {str(row["id"]) for row in rows} == ids
 
@@ -462,6 +503,51 @@ def forget_interrupted_retry_acks(
                 WHERE execution_id IN ({placeholders}) AND job_id = ?""",
             tuple(sorted(ids)) + (str(job_id),),
         )
+
+
+def remember_interrupted_retry_acks(
+    execution_ids: Collection[str], *, job_id: str
+) -> None:
+    """Recreate terminal handoff proof before a jobs-store marker rollback.
+
+    Callers hold the jobs lock, matching the pruner's jobs→SQLite lock order.
+    Inserting before restoring the marker makes every crash boundary safe:
+    an orphan ACK is prunable, while a restored marker always has its proof.
+    """
+    ids = {str(value) for value in execution_ids if value}
+    if not ids:
+        return
+    terminal_at = _hermes_now().isoformat()
+    with _transaction() as conn:
+        conn.executemany(
+            """INSERT OR IGNORE INTO interrupted_retry_acks
+               (execution_id, job_id, terminal_at) VALUES (?, ?, ?)""",
+            [(execution_id, str(job_id), terminal_at) for execution_id in sorted(ids)],
+        )
+
+
+def interrupted_retry_states(
+    execution_ids: Collection[str],
+) -> tuple[Dict[str, Dict[str, Any]], Set[str]]:
+    """Return ledger rows and durable retry ACKs for jobs-store reconciliation."""
+    ids = {str(value) for value in execution_ids if value}
+    if not ids:
+        return {}, set()
+    placeholders = ",".join("?" for _ in ids)
+    params = tuple(sorted(ids))
+    with _transaction() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM executions WHERE id IN ({placeholders})", params
+        ).fetchall()
+        ack_rows = conn.execute(
+            f"""SELECT execution_id FROM interrupted_retry_acks
+                WHERE execution_id IN ({placeholders})""",
+            params,
+        ).fetchall()
+    return (
+        {str(row["id"]): dict(row) for row in rows},
+        {str(row["execution_id"]) for row in ack_rows},
+    )
 
 
 def prune_orphaned_interrupted_retry_acks() -> int:
@@ -503,6 +589,7 @@ def prune_orphaned_interrupted_retry_acks() -> int:
 
 def mark_interrupted_executions_unknown(
     execution_ids: Collection[str], *, retry_job_ids: Collection[str] = (),
+    expected_heartbeats: Optional[Mapping[str, Optional[str]]] = None,
 ) -> List[Dict[str, Any]]:
     """CAS abandoned attempts to unknown after any durable retry requeue."""
     ids = {str(value) for value in execution_ids if value}
@@ -524,10 +611,20 @@ def mark_interrupted_executions_unknown(
             )
             if row["job_id"] in retry_ids:
                 detail += " A retry was durably scheduled by the job's explicit interrupted-run policy."
+            expected_heartbeat = (
+                expected_heartbeats.get(str(row["id"]))
+                if expected_heartbeats is not None
+                else None
+            )
+            heartbeat_fence = (
+                " AND heartbeat_at IS ?" if expected_heartbeats is not None else ""
+            )
             cur = conn.execute(
-                """UPDATE executions SET status='unknown', finished_at=?, error=?
-                   WHERE id=? AND status IN ('claimed','running')""",
-                (now, detail, row["id"]),
+                f"""UPDATE executions SET status='unknown', finished_at=?, error=?
+                    WHERE id=? AND status IN ('claimed','running'){heartbeat_fence}""",
+                (now, detail, row["id"], expected_heartbeat)
+                if expected_heartbeats is not None
+                else (now, detail, row["id"]),
             )
             if cur.rowcount:
                 if row["job_id"] in retry_ids:
@@ -550,6 +647,9 @@ def mark_interrupted_executions_unknown(
 
 def recover_interrupted_executions() -> int:
     """Classify abandoned attempts after durably applying explicit retry policy."""
+    from cron.jobs import reconcile_interrupted_retry_markers
+
+    reconcile_interrupted_retry_markers()
     promoted, discarded = reconcile_unacquired_executions()
     if promoted or discarded:
         logger.info(
@@ -560,13 +660,23 @@ def recover_interrupted_executions() -> int:
     candidates = interrupted_execution_candidates()
     recovered: List[Dict[str, Any]] = []
     if candidates:
-        from cron.jobs import requeue_interrupted_jobs
+        from cron.jobs import cancel_interrupted_retry_executions, requeue_interrupted_jobs
 
-        requeued = requeue_interrupted_jobs(candidates)
+        candidate_heartbeats = {
+            str(row["id"]): row.get("heartbeat_at") for row in candidates
+        }
+        requeued = requeue_interrupted_jobs(
+            candidates, expected_heartbeats=candidate_heartbeats
+        )
         recovered = mark_interrupted_executions_unknown(
             [row["id"] for row in candidates],
             retry_job_ids=requeued,
+            expected_heartbeats=candidate_heartbeats,
         )
+        recovered_ids = {str(row["id"]) for row in recovered}
+        lost_ids = {str(row["id"]) for row in candidates} - recovered_ids
+        if lost_ids:
+            cancel_interrupted_retry_executions(lost_ids)
         if requeued:
             logging.getLogger("cron.scheduler_provider").warning(
                 "Durably requeued %d interrupted cron job(s) under explicit at-least-once policy",

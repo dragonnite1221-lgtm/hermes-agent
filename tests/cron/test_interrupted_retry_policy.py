@@ -77,7 +77,9 @@ def test_recurring_retry_waits_for_fire_claim_then_survives_due_scan(
     )
     due = jobs.get_due_jobs()
     assert [job["id"] for job in due] == [opted_in["id"]]
+    retry_due_at = jobs.get_job(opted_in["id"])["next_run_at"]
     jobs.advance_next_runs([opted_in["id"]])
+    assert jobs.get_job(opted_in["id"])["next_run_at"] == retry_due_at
     claimed = jobs.claim_job_for_fire(opted_in["id"], return_job=True)
     assert isinstance(claimed, dict)
     assert "interrupted_retry" not in jobs.get_job(opted_in["id"])
@@ -350,7 +352,7 @@ def test_requeue_persistence_failure_leaves_execution_recoverable(
     monkeypatch.setattr(
         jobs,
         "requeue_interrupted_jobs",
-        lambda _job_ids: (_ for _ in ()).throw(OSError("disk unavailable")),
+        lambda _job_ids, **_kwargs: (_ for _ in ()).throw(OSError("disk unavailable")),
     )
 
     with pytest.raises(OSError, match="disk unavailable"):
@@ -373,9 +375,57 @@ def test_retry_cannot_fire_before_execution_ledger_handoff_commits(
     pending = jobs.get_job(job["id"])
     assert pending["interrupted_retry"]["execution_ids"] == [execution["id"]]
 
-    executions.mark_interrupted_executions_unknown([execution["id"]])
+    executions.mark_interrupted_executions_unknown(
+        [execution["id"]], retry_job_ids={job["id"]}
+    )
     claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
     assert isinstance(claimed, dict)
+
+
+def test_recovery_heartbeat_race_cancels_retry_and_restores_schedule(
+    isolated_cron, monkeypatch
+):
+    job = _script_job(retry_interrupted=True)
+    before_next_run = jobs.get_job(job["id"])["next_run_at"]
+    execution = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(execution["id"])
+    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-scheduler")
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_args: False)
+    real_requeue = jobs.requeue_interrupted_jobs
+
+    def renew_after_requeue(candidates, **kwargs):
+        result = real_requeue(candidates, **kwargs)
+        assert executions.heartbeat_execution(execution["id"]) is True
+        return result
+
+    monkeypatch.setattr(jobs, "requeue_interrupted_jobs", renew_after_requeue)
+
+    assert executions.recover_interrupted_executions() == 0
+    restored = jobs.get_job(job["id"])
+    assert "interrupted_retry" not in restored
+    assert restored["next_run_at"] == before_next_run
+    assert executions.latest_execution(job["id"])["status"] == "running"
+
+
+def test_recovery_crash_marker_is_reconciled_after_owner_renews(
+    isolated_cron,
+):
+    job = _script_job(retry_interrupted=True)
+    before_next_run = jobs.get_job(job["id"])["next_run_at"]
+    execution = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(execution["id"])
+
+    # Simulate recovery dying after jobs.json requeue but before its SQLite CAS.
+    candidate = executions.latest_execution(job["id"])
+    assert jobs.requeue_interrupted_jobs(
+        [candidate], expected_heartbeats={candidate["id"]: candidate["heartbeat_at"]}
+    ) == {job["id"]}
+    assert executions.heartbeat_execution(execution["id"]) is True
+
+    assert jobs.reconcile_interrupted_retry_markers() == {job["id"]}
+    restored = jobs.get_job(job["id"])
+    assert "interrupted_retry" not in restored
+    assert restored["next_run_at"] == before_next_run
     assert "interrupted_retry" not in jobs.get_job(job["id"])
 
 
@@ -580,6 +630,42 @@ def test_fence_rollback_does_not_resurrect_concurrently_disabled_retry(
     assert executions.execution_ids_are_terminal(
         [abandoned["id"]], job_id=job["id"]
     ) is False
+
+
+def test_fence_rollback_recreates_ack_pruned_during_claim_gap(
+    isolated_cron, monkeypatch
+):
+    import cron.scheduler_provider as provider
+
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    job = _script_job(retry_interrupted=True)
+    abandoned = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(abandoned["id"])
+    assert jobs.requeue_interrupted_jobs([abandoned]) == {job["id"]}
+    executions.mark_interrupted_executions_unknown(
+        [abandoned["id"]], retry_job_ids={job["id"]}
+    )
+    assert executions.execution_ids_are_terminal(
+        [abandoned["id"]], job_id=job["id"]
+    ) is True
+    pruned = []
+
+    def fail_after_orphan_prune(_execution_id):
+        if not pruned:
+            pruned.append(executions.prune_orphaned_interrupted_retry_acks())
+        return None
+
+    monkeypatch.setattr(executions, "mark_fire_claim_acquired", fail_after_orphan_prune)
+
+    with pytest.raises(FireClaimNotAcquiredError, match="occurrence was restored"):
+        provider.claim_fire_with_execution(job["id"], source="external")
+
+    restored = jobs.get_job(job["id"])
+    assert pruned == [1]
+    assert restored["interrupted_retry"]["execution_ids"] == [abandoned["id"]]
+    assert executions.execution_ids_are_terminal(
+        [abandoned["id"]], job_id=job["id"]
+    ) is True
 
 
 def test_ledger_create_failure_never_attempts_or_consumes_fire_claim(
