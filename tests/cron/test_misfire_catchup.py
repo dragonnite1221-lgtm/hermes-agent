@@ -213,6 +213,12 @@ class TestFireOverdueJobs:
         before = get_job(job["id"])
         assert before is not None
         provider = RecordingProvider()
+        rearmed = []
+        monkeypatch.setattr(
+            provider,
+            "rearm_aborted_claim",
+            lambda claimed: rearmed.append(claimed["id"]),
+        )
 
         monkeypatch.setattr(
             threading.Thread,
@@ -228,3 +234,4 @@ class TestFireOverdueJobs:
         assert restored["next_run_at"] == before["next_run_at"]
         assert restored["fire_claim"] is None
         assert provider.fired == []
+        assert rearmed == [job["id"]]

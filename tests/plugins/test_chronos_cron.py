@@ -100,6 +100,31 @@ def test_register_job_propagates_provision_failure(chronos):
         )
 
 
+def test_rearm_aborted_claim_provisions_persisted_fresh_occurrence(
+    chronos, monkeypatch
+):
+    prov, fake = chronos
+    retry = {
+        "id": "j1",
+        "enabled": True,
+        "state": "scheduled",
+        "next_run_at": "2026-06-18T12:00:05+00:00",
+        "fire_claim": None,
+    }
+    monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: retry)
+
+    prov.rearm_aborted_claim({"id": "j1"})
+
+    assert fake.provisions == [
+        {
+            "job_id": "j1",
+            "fire_at": retry["next_run_at"],
+            "agent_callback_url": "https://agent.example/",
+            "dedup_key": f"j1:{retry['next_run_at']}",
+        }
+    ]
+
+
 # -- reconcile ----------------------------------------------------------------
 
 def test_reconcile_arms_all_enabled(temp_home, chronos, monkeypatch):

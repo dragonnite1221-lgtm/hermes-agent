@@ -2322,6 +2322,23 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                             )
                         except (KeyError, TypeError, ValueError):
                             retry_eligible_at = _hermes_now()
+                        rollback = pending_retry.get("rollback")
+                        next_run_snapshot = (
+                            rollback.get("next_run_at")
+                            if isinstance(rollback, dict)
+                            else None
+                        )
+                        if isinstance(next_run_snapshot, dict):
+                            # The marker's inverse must follow an operator's
+                            # schedule edit. If the old owner renews and wins
+                            # cancellation, restore the edited cadence rather
+                            # than the cadence captured before the edit.
+                            next_run_snapshot["present"] = (
+                                updated_next_run is not None
+                            )
+                            next_run_snapshot["value"] = copy.deepcopy(
+                                updated_next_run
+                            )
                         updated["next_run_at"] = retry_eligible_at.isoformat()
                     else:
                         updated["next_run_at"] = updated_next_run
@@ -3265,7 +3282,12 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
-def clear_run_claim(job_id: str, *, expected_owner: Optional[str] = None) -> bool:
+def clear_run_claim(
+    job_id: str,
+    *,
+    expected_owner: Optional[str] = None,
+    expected_claim: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Clear a one-shot job's ``run_claim`` when its dispatch fails.
 
     ``get_due_jobs`` stamps a ``run_claim`` before returning a one-shot as
@@ -3286,6 +3308,8 @@ def clear_run_claim(job_id: str, *, expected_owner: Optional[str] = None) -> boo
             if _job_schedule_kind(job) != "once":
                 return False
             claim = job.get("run_claim")
+            if expected_claim is not None and claim != expected_claim:
+                return False
             if (
                 isinstance(claim, dict)
                 and expected_owner is not None

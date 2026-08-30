@@ -572,6 +572,7 @@ def reconcile_unacquired_executions() -> tuple[int, int]:
     promoted = discarded = 0
     discarded_intents: Set[str] = set()
     for job_id, job_rows in abandoned_by_job.items():
+        promoted_records: List[Dict[str, Any]] = []
         # The winner lookup and SQLite transition are one per-job fenced
         # operation. A replacement claim therefore cannot land between a
         # stale winners snapshot and promotion of the old execution.
@@ -609,6 +610,10 @@ def reconcile_unacquired_executions() -> tuple[int, int]:
                                 (execution_id, job_id),
                             )
                             promoted += cur.rowcount
+                            if cur.rowcount:
+                                promoted_records.append(
+                                    {**dict(row), "fire_claim_acquired": 1}
+                                )
                         else:
                             cur = conn.execute(
                                 """DELETE FROM executions
@@ -619,6 +624,11 @@ def reconcile_unacquired_executions() -> tuple[int, int]:
                             discarded += cur.rowcount
                             if cur.rowcount:
                                 discarded_intents.add(execution_id)
+            # Project each committed promotion before moving to another job.
+            # A later per-job recovery error must not suppress telemetry for
+            # an earlier transaction that already committed successfully.
+            for record in promoted_records:
+                _emit_execution_state(record)
     if discarded_intents:
         with _recovery_intent_lock:
             _recovery_intent_ids.difference_update(discarded_intents)

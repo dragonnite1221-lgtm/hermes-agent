@@ -380,6 +380,15 @@ class CronScheduler(ABC):
         """
         return None
 
+    def rearm_aborted_claim(self, claimed_job: dict[str, Any]) -> None:
+        """Restore an external trigger after a claimed fire was not handed off.
+
+        The built-in provider re-reads the local store on its next tick. An
+        external scale-to-zero provider must override this hook because there
+        may be no future warm process to reconcile the restored occurrence.
+        """
+        return None
+
     def recover_interrupted(self) -> int:
         """Run profile-local attempt recovery for every provider lifecycle."""
         from cron.executions import recover_interrupted_executions
@@ -673,7 +682,11 @@ def fire_overdue_jobs(
                 # ledger witness to periodic recovery if rollback I/O is
                 # unavailable) so thread/resource exhaustion cannot silently
                 # lose an interrupted retry or ordinary scheduled fire.
-                abort_fire_claim_execution(claimed, str(handoff_error))
+                abort_outcome = abort_fire_claim_execution(
+                    claimed, str(handoff_error)
+                )
+                if abort_outcome == "restored":
+                    provider.rearm_aborted_claim(claimed)
                 raise
             fired += 1
         except Exception as exc:

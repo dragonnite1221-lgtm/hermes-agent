@@ -425,6 +425,28 @@ def test_schedule_edit_preserves_pending_retry_eligibility(isolated_cron):
     assert updated["interrupted_retry"]["execution_ids"] == [execution["id"]]
 
 
+def test_schedule_edit_updates_pending_retry_rollback_cadence(
+    isolated_cron, monkeypatch
+):
+    now = datetime(2026, 8, 30, 1, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    job = _script_job(retry_interrupted=True)
+    execution = executions.create_execution(job["id"], source="builtin")
+    assert jobs.requeue_interrupted_jobs([execution]) == {job["id"]}
+
+    updated = jobs.update_job(job["id"], {"schedule": "every 24h"})
+    edited_next_run = jobs.compute_next_run(updated["schedule"])
+    marker = updated["interrupted_retry"]
+    assert marker["rollback"]["next_run_at"]["value"] == edited_next_run
+
+    assert jobs.cancel_interrupted_retry_executions([execution["id"]]) == {
+        job["id"]
+    }
+    restored = jobs.get_job(job["id"])
+    assert "interrupted_retry" not in restored
+    assert restored["next_run_at"] == edited_next_run
+
+
 def test_dead_fire_claim_loser_is_discarded_without_retry(isolated_cron, monkeypatch):
     job = _script_job(retry_interrupted=True)
     loser = executions.create_execution(
@@ -1002,6 +1024,13 @@ def test_unacquired_reconciliation_revalidates_winner_under_fire_fence(
 
     monkeypatch.setattr(jobs, "fire_recovery_fence", replace_before_revalidation)
 
+    emitted = []
+    monkeypatch.setattr(
+        executions,
+        "_emit_execution_state",
+        lambda record, **_kwargs: emitted.append(dict(record)),
+    )
+
     assert executions.reconcile_unacquired_executions() == (1, 1)
     assert executions.latest_execution(job["id"])["id"] == replacement["id"]
     assert executions.latest_execution(job["id"])["fire_claim_acquired"] == 1
@@ -1009,6 +1038,8 @@ def test_unacquired_reconciliation_revalidates_winner_under_fire_fence(
         record["id"] != old["id"]
         for record in executions.list_executions(job_id=job["id"])
     )
+    assert [record["id"] for record in emitted] == [replacement["id"]]
+    assert emitted[0]["fire_claim_acquired"] == 1
 
 
 def test_execution_fence_confirmation_is_idempotent(isolated_cron):

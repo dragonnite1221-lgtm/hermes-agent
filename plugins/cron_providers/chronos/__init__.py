@@ -136,6 +136,26 @@ class ChronosCronScheduler(CronScheduler):
         """
         self._arm_one_shot(job)
 
+    def rearm_aborted_claim(self, claimed_job: Dict[str, Any]) -> None:
+        """Provision the fresh occurrence persisted by abort rollback.
+
+        A failed local thread handoff happens after the NAS one-shot has been
+        consumed. Waiting for ordinary reconciliation would strand a
+        scale-to-zero deployment, so this hook must raise if the replacement
+        cannot be registered and let the housekeeping failure stay visible.
+        """
+        from cron.jobs import get_job
+
+        job = get_job(str(claimed_job.get("id") or ""))
+        if (
+            job
+            and job.get("enabled")
+            and job.get("state") != "paused"
+            and job.get("next_run_at")
+            and not job.get("fire_claim")
+        ):
+            self._arm_one_shot(job)
+
     # -- arming -----------------------------------------------------------
 
     def _arm_one_shot(self, job: Dict[str, Any]) -> None:

@@ -553,6 +553,7 @@ from cron.executions import (
     heartbeat_execution,
     mark_execution_running,
     mark_fire_claim_acquired,
+    remember_execution_recovery_intent,
 )
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -7416,6 +7417,48 @@ def tick(
                 _max_workers if _max_workers else "unbounded",
             )
 
+        def _clear_run_claim_best_effort(job: dict) -> None:
+            """Clear only the exact one-shot claim returned by this due scan."""
+            schedule = job.get("schedule")
+            if not (isinstance(schedule, dict) and schedule.get("kind") == "once"):
+                return
+            try:
+                run_claim = job.get("run_claim")
+                expected_owner = (
+                    str(run_claim.get("by"))
+                    if isinstance(run_claim, dict) and run_claim.get("by")
+                    else None
+                )
+                clear_run_claim(
+                    job["id"],
+                    expected_owner=expected_owner,
+                    expected_claim=(dict(run_claim) if isinstance(run_claim, dict) else None),
+                )
+            except Exception as claim_err:
+                logger.warning(
+                    "Could not clear run_claim for job '%s' after dispatch "
+                    "failure: %s (claim will expire at TTL)",
+                    job.get("name", job.get("id")),
+                    claim_err,
+                )
+
+        def _discard_provisional_best_effort(
+            execution_id: str, *, context: str
+        ) -> None:
+            try:
+                discard_unacquired_execution(execution_id)
+            except Exception:
+                # The process that created this provisional row is still
+                # alive, so lease-based recovery alone would ignore it.
+                # Preserve local cleanup intent before returning control.
+                remember_execution_recovery_intent(execution_id)
+                logger.exception(
+                    "Could not discard provisional execution %s after %s; "
+                    "marked for local reconciliation",
+                    execution_id,
+                    context,
+                )
+
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end. Thin wrapper around the shared
             module-level ``run_one_job`` so ``tick`` and external providers
@@ -7436,17 +7479,16 @@ def tick(
                 # leave a live-gateway-owned ``claimed`` row behind: recovery
                 # correctly treats that owner as alive, so repeated failures
                 # would otherwise accumulate until the process exits.
-                try:
-                    discard_unacquired_execution(job["execution_id"])
-                except Exception:
-                    logger.exception(
-                        "Could not discard provisional execution %s after "
-                        "fire-claim setup failed",
-                        job["execution_id"],
-                    )
+                _discard_provisional_best_effort(
+                    job["execution_id"], context="fire-claim setup failed"
+                )
+                _clear_run_claim_best_effort(job)
                 raise
             if not claimed:
-                discard_unacquired_execution(job["execution_id"])
+                _discard_provisional_best_effort(
+                    job["execution_id"], context="fire claim was not acquired"
+                )
+                _clear_run_claim_best_effort(job)
                 return True
             if job.get("execution_fire_claim_pending") is True:
                 if isinstance(claimed, dict) and isinstance(
@@ -7496,40 +7538,6 @@ def tick(
             """
             job_id = job["id"]
 
-            def _clear_run_claim_best_effort() -> None:
-                """Best-effort claim cleanup on the dispatch-failure paths.
-
-                Only one-shot jobs carry a ``run_claim`` (stamped by
-                get_due_jobs, #59229), so recurring jobs skip the call
-                entirely — clear_run_claim acquires _jobs_lock (blocking
-                cross-process flock) and does a full load_jobs read, and the
-                dispatch-failure paths fire exactly when the process can
-                least afford N pointless lock/read round-trips (interpreter
-                shutdown, EMFILE).  clear_run_claim itself does
-                load_jobs/save_jobs file I/O; on those degraded paths it can
-                raise, and these early-exits exist precisely to skip cleanly
-                — a stale claim expiring at the TTL is a better outcome than
-                crashing the tick (#86522).
-                """
-                _schedule = job.get("schedule")
-                if not (isinstance(_schedule, dict) and _schedule.get("kind") == "once"):
-                    return
-                try:
-                    run_claim = job.get("run_claim")
-                    expected_owner = (
-                        str(run_claim.get("by"))
-                        if isinstance(run_claim, dict) and run_claim.get("by")
-                        else None
-                    )
-                    clear_run_claim(job_id, expected_owner=expected_owner)
-                except Exception as claim_err:
-                    logger.warning(
-                        "Could not clear run_claim for job '%s' after dispatch "
-                        "failure: %s (claim will expire at TTL)",
-                        job.get("name", job_id),
-                        claim_err,
-                    )
-
             # A tick can race gateway teardown: once the interpreter is
             # finalizing, ``pool.submit`` raises "cannot schedule new futures
             # after interpreter shutdown" and crashes the tick. Skip cleanly —
@@ -7540,11 +7548,11 @@ def tick(
                     "Job '%s' not dispatched — interpreter is shutting down",
                     job.get("name", job_id),
                 )
-                _clear_run_claim_best_effort()
+                _clear_run_claim_best_effort(job)
                 return None
             if not try_register_running_job(job_id):
                 logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                _clear_run_claim_best_effort()
+                _clear_run_claim_best_effort(job)
                 return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
@@ -7569,7 +7577,7 @@ def tick(
                 # audit requirement: every add is paired with guaranteed
                 # cleanup).
                 release_running_job(job_id)
-                _clear_run_claim_best_effort()
+                _clear_run_claim_best_effort(job)
                 logger.exception(
                     "Job '%s' not dispatched: execution creation failed: %s",
                     job.get("name", job_id),
@@ -7587,8 +7595,10 @@ def tick(
                 fut = pool.submit(_run_and_release)
             except Exception as submit_err:
                 release_running_job(job_id)
-                _clear_run_claim_best_effort()
-                discard_unacquired_execution(execution["id"])
+                _clear_run_claim_best_effort(job)
+                _discard_provisional_best_effort(
+                    execution["id"], context="executor submit failed"
+                )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
                 if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):
