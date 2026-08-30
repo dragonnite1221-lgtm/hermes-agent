@@ -68,6 +68,46 @@ class TestJobScriptField:
         updated = update_job(job["id"], {"script": "/new/script.py"})
         assert updated["script"] == "/new/script.py"
 
+    def test_per_job_timeout_roundtrips_and_zero_clears(self, cron_env):
+        from cron.jobs import create_job, get_job, update_job
+
+        job = create_job(
+            prompt=None,
+            schedule="every 30m",
+            script="long-running.py",
+            no_agent=True,
+            script_timeout_seconds=16200,
+        )
+
+        assert job["script_timeout_seconds"] == 16200
+        assert get_job(job["id"])["script_timeout_seconds"] == 16200
+
+        updated = update_job(job["id"], {"script_timeout_seconds": 0})
+        assert updated["script_timeout_seconds"] is None
+
+    @pytest.mark.parametrize("value", (-1, True, "1.5", "invalid"))
+    def test_per_job_timeout_rejects_invalid_values(self, cron_env, value):
+        from cron.jobs import create_job
+
+        with pytest.raises(ValueError, match="positive integer"):
+            create_job(
+                prompt=None,
+                schedule="every 30m",
+                script="long-running.py",
+                no_agent=True,
+                script_timeout_seconds=value,
+            )
+
+    def test_per_job_timeout_requires_a_script(self, cron_env):
+        from cron.jobs import create_job
+
+        with pytest.raises(ValueError, match="requires script or monitor_script"):
+            create_job(
+                prompt="report",
+                schedule="every 30m",
+                script_timeout_seconds=16200,
+            )
+
 
 def test_cronjob_tool_rejects_stale_past_one_shot(cron_env, monkeypatch):
     from tools.cronjob_tools import cronjob
