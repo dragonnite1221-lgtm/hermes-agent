@@ -182,8 +182,13 @@ class TestSyncFallbacks:
 
     def test_pool_at_capacity_runs_inline(self):
         """A rejected dispatch must not strand the already-taken claim."""
+        claimed = {
+            **_job("job-bg-07"),
+            "fire_claim": {"by": "bg-owner"},
+            "execution_id": "exec-bg-07",
+        }
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
                  patch("tools.async_delegation.dispatch_async_delegation",
                        return_value={"status": "rejected", "error": "capacity"}), \
                  patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
@@ -192,7 +197,12 @@ class TestSyncFallbacks:
                 res = _try_dispatch_background_run(_job('job-bg-07'))
         assert res["dispatched"] is False
         assert res["success"] is True
-        m_run.assert_called_once()   # ran inline on this thread
+        m_run.assert_called_once_with(
+            claimed,
+            adapters=None,
+            loop=None,
+            extra_prompt=None,
+        )
 
 
 class TestInFlightDedupe:
@@ -215,6 +225,27 @@ class TestInFlightDedupe:
             m_run.assert_not_called()
         finally:
             sched.release_running_job("job-bg-08")
+
+    def test_immediate_run_does_not_claim_after_ticker_registers(self):
+        """The running-set CAS precedes the ledger/fire claim.
+
+        A ticker worker may own the in-process slot before it has taken its
+        durable fire claim. A manual run must lose here without creating a
+        phantom execution row or consuming an interrupted retry.
+        """
+        from cron import scheduler as sched
+        from tools.cronjob_tools import _execute_job_now
+
+        job = _job("job-bg-race")
+        assert sched.try_register_running_job(job["id"])
+        try:
+            with patch("tools.cronjob_tools.claim_job_for_fire") as m_claim:
+                res = _execute_job_now(job)
+            assert res["claimed"] is False
+            assert "already running" in res["error"]
+            m_claim.assert_not_called()
+        finally:
+            sched.release_running_job(job["id"])
 
     def test_run_claimed_job_registers_and_releases(self):
         """A normal run holds the registration for run_one_job's duration and

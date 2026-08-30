@@ -453,6 +453,18 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
             )
         yield owns_claim
 
+
+@contextlib.contextmanager
+def fire_recovery_fence(job_id: str):
+    """Serialize interrupted recovery with this job's external side effects.
+
+    Recovery acquires this fence before the global jobs lock, matching the
+    established fire-fence lock order.  Failing to acquire it is a closed
+    recovery outcome: the active attempt remains untouched for a later pass.
+    """
+    with _fire_job_lock(job_id) as acquired:
+        yield acquired
+
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
@@ -524,6 +536,12 @@ def _schedule_display_for_job(job: Dict[str, Any]) -> str:
         return str(schedule)
 
     return "?"
+
+
+def _job_schedule_kind(job: Dict[str, Any]) -> Optional[str]:
+    """Return a job's schedule kind without trusting hand-edited storage."""
+    schedule = job.get("schedule")
+    return schedule.get("kind") if isinstance(schedule, dict) else None
 
 
 def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -1812,6 +1830,21 @@ def _validate_job_mode_invariants(
         )
 
 
+def _validate_interrupted_retry_mode(
+    retry_interrupted: Any, *, no_agent: bool, script: Optional[str]
+) -> bool:
+    """Validate the explicit at-least-once restart policy for script jobs."""
+    if not isinstance(retry_interrupted, bool):
+        raise ValueError("retry_interrupted must be a boolean")
+    if retry_interrupted and (not no_agent or not script):
+        raise ValueError(
+            "retry_interrupted=True is only supported for no_agent script jobs. "
+            "Enable it only when the script is idempotent because side effects "
+            "from the interrupted attempt may already have occurred."
+        )
+    return retry_interrupted
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1833,6 +1866,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    retry_interrupted: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1900,6 +1934,10 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        retry_interrupted: Explicit at-least-once restart policy for an
+                idempotent no-agent script. If the scheduler proves the prior
+                execution owner died without a durable terminal result, the
+                job is made due once more after its duplicate-fence lease.
 
     Returns:
         The created job dict
@@ -1949,6 +1987,11 @@ def create_job(
         normalized_monitor_url,
         normalized_no_agent,
         normalized_script,
+    )
+    normalized_retry_interrupted = _validate_interrupted_retry_mode(
+        retry_interrupted,
+        no_agent=normalized_no_agent,
+        script=normalized_script,
     )
 
     # Normalize context_from: accept str or list of str, store as list or None
@@ -2008,6 +2051,7 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
+        "retry_interrupted": normalized_retry_interrupted,
         "monitor_script": normalized_monitor_script,
         "monitor_url": normalized_monitor_url,
         # Hash-suppression state for monitor jobs: {"last_output_hash": ...,
@@ -2077,29 +2121,40 @@ class AmbiguousJobReference(LookupError):
         )
 
 
-def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
-    """Resolve a job reference (ID or name) to a job record.
-
-    - Exact ID match wins (works even if a different job's name equals this ID).
-    - Otherwise, case-insensitive name match.
-    - If a name matches more than one job, raises AmbiguousJobReference so the
-      caller can surface the matching IDs rather than silently picking one.
-    """
+def _resolve_job_ref_from_records(
+    ref: str, records: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Resolve one ID/name against an already-consistent jobs snapshot."""
     if not ref:
         return None
-    jobs = load_jobs()
-    for job in jobs:
+    for job in records:
         if job["id"] == ref:
-            return _normalize_job_record(job)
+            return job
     ref_lower = ref.lower()
-    name_matches = [j for j in jobs if (j.get("name") or "").lower() == ref_lower]
+    name_matches = [
+        job
+        for job in records
+        if (job.get("name") or "").lower() == ref_lower
+    ]
     if not name_matches:
         return None
     if len(name_matches) > 1:
         raise AmbiguousJobReference(
             ref, [_normalize_job_record(j) for j in name_matches]
         )
-    return _normalize_job_record(name_matches[0])
+    return name_matches[0]
+
+
+def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
+    """Resolve a job reference (ID or name) to a normalized job record.
+
+    - Exact ID match wins (works even if a different job's name equals this ID).
+    - Otherwise, case-insensitive name match.
+    - If a name matches more than one job, raises AmbiguousJobReference so the
+      caller can surface the matching IDs rather than silently picking one.
+    """
+    job = _resolve_job_ref_from_records(ref, load_jobs())
+    return _normalize_job_record(job) if job is not None else None
 
 
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
@@ -2160,9 +2215,18 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["reasoning_effort"] = _normalize_reasoning_effort(
                     updates["reasoning_effort"]
                 )
+            if "retry_interrupted" in updates and not isinstance(
+                updates["retry_interrupted"], bool
+            ):
+                raise ValueError("retry_interrupted must be a boolean")
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            cancel_interrupted_retry = (
+                updates.get("retry_interrupted") is False
+                and isinstance(job.get("interrupted_retry"), dict)
+            )
+            cancelled_retry = job.get("interrupted_retry") if cancel_interrupted_retry else None
 
             # Re-check execution-mode invariants on the MERGED record when
             # any participating field changes, so create-time invariants
@@ -2171,7 +2235,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # monitor: the scheduler's no_agent short-circuit runs before
             # the monitor gate). Scoped to changed fields so legacy records
             # untouched by this update keep loading.
-            if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
+            if {
+                "monitor_script",
+                "monitor_url",
+                "no_agent",
+                "script",
+                "retry_interrupted",
+            }.intersection(updates):
                 _upd_script = updated.get("script")
                 _upd_script = str(_upd_script).strip() if isinstance(_upd_script, str) else None
                 _validate_job_mode_invariants(
@@ -2180,7 +2250,18 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     bool(updated.get("no_agent")),
                     _upd_script or None,
                 )
+                updated["retry_interrupted"] = _validate_interrupted_retry_mode(
+                    updated.get("retry_interrupted", False),
+                    no_agent=bool(updated.get("no_agent")),
+                    script=_upd_script or None,
+                )
             schedule_changed = "schedule" in updates
+            if not schedule_changed and not isinstance(updated.get("schedule"), dict):
+                # Match the tick reader's repair contract at the mutation
+                # boundary too. A legacy/hand-edited null schedule must not
+                # prevent operators from disabling retry or repairing other
+                # fields, and the next write should persist a read-safe shape.
+                updated["schedule"] = {}
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
             ) and _normalized_inference_axes(updated) != previous_inference_axes
@@ -2198,6 +2279,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 if isinstance(updated_schedule, str):
                     updated_schedule = parse_schedule(updated_schedule)
                     updated["schedule"] = updated_schedule
+                if not isinstance(updated_schedule, dict):
+                    raise ValueError("schedule must be a schedule string or object")
                 updated["schedule_display"] = updates.get(
                     "schedule_display",
                     updated_schedule.get("display", updated.get("schedule_display")),
@@ -2225,7 +2308,75 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                             f"Requested one-shot time {run_at} is more than "
                             f"{ONESHOT_GRACE_SECONDS}s in the past and cannot be scheduled."
                         )
-                    updated["next_run_at"] = updated_next_run
+                    pending_retry = updated.get("interrupted_retry")
+                    if isinstance(pending_retry, dict):
+                        # A schedule edit changes the cadence after the owed
+                        # attempt; it must not postpone that already-persisted
+                        # obligation. The retry claim will compute the next
+                        # occurrence from the newly edited schedule.
+                        try:
+                            retry_eligible_at = _ensure_aware(
+                                datetime.fromisoformat(
+                                    str(pending_retry["eligible_at"])
+                                )
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            retry_eligible_at = _hermes_now()
+                        rollback = pending_retry.get("rollback")
+                        next_run_snapshot = (
+                            rollback.get("next_run_at")
+                            if isinstance(rollback, dict)
+                            else None
+                        )
+                        if isinstance(next_run_snapshot, dict):
+                            # The marker's inverse must follow an operator's
+                            # schedule edit. If the old owner renews and wins
+                            # cancellation, restore the edited cadence rather
+                            # than the cadence captured before the edit.
+                            next_run_snapshot["present"] = (
+                                updated_next_run is not None
+                            )
+                            next_run_snapshot["value"] = copy.deepcopy(
+                                updated_next_run
+                            )
+                        updated["next_run_at"] = retry_eligible_at.isoformat()
+                    else:
+                        updated["next_run_at"] = updated_next_run
+
+            if cancel_interrupted_retry:
+                updated.pop("interrupted_retry", None)
+                if (
+                    _job_schedule_kind(updated) == "once"
+                    and not schedule_changed
+                ):
+                    repeat = updated.get("repeat")
+                    if isinstance(repeat, dict):
+                        times = repeat.get("times")
+                        completed = repeat.get("completed", 0)
+                        if (
+                            isinstance(times, int)
+                            and isinstance(completed, int)
+                            and completed < times
+                        ):
+                            repeat["completed"] = completed + 1
+                    updated["enabled"] = False
+                    updated["state"] = "error"
+                    updated["next_run_at"] = None
+                    updated["last_status"] = "unknown"
+                    updated["last_error"] = (
+                        "Interrupted execution was not retried because the explicit "
+                        "retry policy was disabled. Side effects remain unknown."
+                    )
+                elif _job_schedule_kind(updated) == "once":
+                    # A simultaneously supplied schedule is a replacement
+                    # occurrence, not the canceled interrupted attempt. Keep
+                    # the newly computed one-shot runnable exactly once.
+                    if updated.get("state") != "paused":
+                        updated["enabled"] = True
+                        updated["state"] = "scheduled"
+                        updated["next_run_at"] = compute_next_run(updated["schedule"])
+                elif updated.get("state") != "paused":
+                    updated["next_run_at"] = compute_next_run(updated["schedule"])
 
             if inference_fields_changed:
                 provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
@@ -2249,6 +2400,20 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             jobs[i] = updated
             save_jobs(jobs)
+            if isinstance(cancelled_retry, dict):
+                try:
+                    from cron.executions import forget_interrupted_retry_acks
+
+                    forget_interrupted_retry_acks(
+                        _interrupted_retry_execution_ids(cancelled_retry),
+                        job_id=job_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Job '%s': canceled retry acknowledgement cleanup failed: %s",
+                        job_id,
+                        exc,
+                    )
             return _normalize_job_record(jobs[i])
     return None
 
@@ -2271,27 +2436,51 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
 
 def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Resume a paused job and compute the next future run from now. Accepts a job ID or name."""
-    job = resolve_job_ref(job_id)
-    if not job:
-        return None
+    with _jobs_lock():
+        records = load_jobs()
+        job = _resolve_job_ref_from_records(job_id, records)
+        if job is None:
+            return None
 
-    next_run_at = compute_next_run(job["schedule"])
-    if next_run_at is None and job["schedule"].get("kind") == "once":
-        run_at = job["schedule"].get("run_at", "unknown")
-        raise ValueError(
-            f"Cannot resume: one-shot time {run_at} is in the past "
-            f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
+        retry = job.get("interrupted_retry")
+        schedule = job.get("schedule")
+        if isinstance(retry, dict):
+            # A paused interrupted retry is a durable owed attempt. Its original
+            # one-shot run_at may already be in the past, so recomputing from the
+            # original schedule would strand it permanently. Preserve the retry's
+            # independently persisted eligibility instead; the due scan still
+            # fences dispatch on the execution-ledger handoff.
+            try:
+                next_run_at = _ensure_aware(
+                    datetime.fromisoformat(str(retry["eligible_at"]))
+                ).isoformat()
+            except (KeyError, TypeError, ValueError):
+                next_run_at = _hermes_now().isoformat()
+        else:
+            next_run_at = (
+                compute_next_run(schedule) if isinstance(schedule, dict) else None
+            )
+        if (
+            next_run_at is None
+            and isinstance(schedule, dict)
+            and schedule.get("kind") == "once"
+        ):
+            run_at = schedule.get("run_at", "unknown")
+            raise ValueError(
+                f"Cannot resume: one-shot time {run_at} is in the past "
+                f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
+            )
+        job.update(
+            {
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "next_run_at": next_run_at,
+            }
         )
-    return update_job(
-        job["id"],
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": next_run_at,
-        },
-    )
+        save_jobs(records)
+        return _normalize_job_record(job)
 
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -2311,6 +2500,308 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
+FIRE_CLAIM_TTL_SECONDS = 300
+ABORTED_FIRE_RETRY_DELAY_SECONDS = 5
+
+
+def _interrupted_retry_eligible_at(job: Dict[str, Any], now: datetime) -> datetime:
+    """Return the first instant an abandoned attempt's fire claim is stale."""
+    claim = job.get("fire_claim")
+    if not isinstance(claim, dict):
+        return now
+    try:
+        claimed_at = _ensure_aware(datetime.fromisoformat(str(claim["at"])))
+    except (KeyError, TypeError, ValueError):
+        return now
+    age = (now - claimed_at).total_seconds()
+    if 0 <= age < FIRE_CLAIM_TTL_SECONDS:
+        return claimed_at + timedelta(seconds=FIRE_CLAIM_TTL_SECONDS)
+    return now
+
+
+def requeue_interrupted_jobs(
+    executions: Collection[Dict[str, Any]],
+    *,
+    expected_heartbeats: Optional[Dict[str, Optional[str]]] = None,
+) -> Set[str]:
+    """Durably schedule one retry for each opted-in abandoned job.
+
+    A retry waits until the retained fire-claim lease expires, preventing the
+    due scanner from consuming the recovery before it can acquire the claim.
+    Finite one-shots also regain exactly one dispatch slot. The execution IDs
+    persisted in ``interrupted_retry`` make both mutations idempotent if the
+    scheduler dies after this save but before the execution ledger is updated.
+    """
+    requested: Dict[str, Dict[str, Optional[str]]] = {}
+    for execution in executions:
+        if not isinstance(execution, dict):
+            continue
+        job_id = str(execution.get("job_id") or "")
+        execution_id = str(execution.get("id") or "")
+        if job_id and execution_id:
+            requested.setdefault(job_id, {})[execution_id] = (
+                expected_heartbeats.get(execution_id)
+                if expected_heartbeats is not None
+                else None
+            )
+    if not requested:
+        return set()
+    requeued: Set[str] = set()
+    now = _hermes_now()
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            job_id = str(job.get("id") or "")
+            if job_id not in requested or job.get("retry_interrupted") is not True:
+                continue
+            script = job.get("script")
+            script = str(script).strip() if isinstance(script, str) else None
+            try:
+                _validate_interrupted_retry_mode(
+                    True,
+                    no_agent=job.get("no_agent") is True,
+                    script=script or None,
+                )
+            except ValueError as exc:
+                logger.error(
+                    "Job '%s': refusing invalid interrupted retry policy: %s",
+                    job_id,
+                    exc,
+                )
+                continue
+            # Pausing controls dispatch, not whether an already-owed recovery
+            # is recorded. Preserve the marker while paused so resume_job can
+            # restore its eligibility; still reject every other disabled or
+            # terminal state.
+            if not is_job_runnable(job) and effective_job_state(job) != "paused":
+                continue
+            existing = job.get("interrupted_retry")
+            existing_ids = _interrupted_retry_execution_ids(existing)
+            new_ids = set(requested[job_id]) - existing_ids
+            if new_ids:
+                eligible_at = _interrupted_retry_eligible_at(job, now)
+                schedule = job.get("schedule")
+                kind = schedule.get("kind") if isinstance(schedule, dict) else None
+                repeat = job.get("repeat")
+                rollback = (
+                    copy.deepcopy(existing.get("rollback"))
+                    if isinstance(existing, dict)
+                    and isinstance(existing.get("rollback"), dict)
+                    else {
+                        key: {
+                            "present": key in job,
+                            "value": copy.deepcopy(job.get(key)),
+                        }
+                        for key in ("next_run_at", "run_claim", "repeat")
+                    }
+                )
+                if not existing_ids and kind == "once" and isinstance(repeat, dict):
+                    times = repeat.get("times")
+                    completed = repeat.get("completed", 0)
+                    valid_times = times is None or (
+                        isinstance(times, int)
+                        and not isinstance(times, bool)
+                        and times >= 0
+                    )
+                    valid_completed = (
+                        isinstance(completed, int)
+                        and not isinstance(completed, bool)
+                        and completed >= 0
+                    )
+                    if not valid_times or not valid_completed:
+                        logger.error(
+                            "Job '%s': refusing interrupted retry with malformed "
+                            "repeat metadata times=%r completed=%r",
+                            job_id,
+                            times,
+                            completed,
+                        )
+                        continue
+                    if times is not None and times > 0 and completed > 0:
+                        repeat["completed"] = completed - 1
+                    job["run_claim"] = None
+                job["interrupted_retry"] = {
+                    "execution_ids": sorted(existing_ids | set(requested[job_id])),
+                    "eligible_at": eligible_at.isoformat(),
+                    "rollback": rollback,
+                    **(
+                        {
+                            "expected_heartbeats": {
+                                **(
+                                    copy.deepcopy(existing.get("expected_heartbeats"))
+                                    if isinstance(existing, dict)
+                                    and isinstance(existing.get("expected_heartbeats"), dict)
+                                    else {}
+                                ),
+                                **{
+                                    execution_id: requested[job_id][execution_id]
+                                    for execution_id in new_ids
+                                },
+                            }
+                        }
+                        if expected_heartbeats is not None
+                        else {}
+                    ),
+                }
+            else:
+                try:
+                    eligible_at = _ensure_aware(datetime.fromisoformat(str(existing["eligible_at"])))
+                except (KeyError, TypeError, ValueError):
+                    eligible_at = now
+            job["next_run_at"] = eligible_at.isoformat()
+            marker = job.get("interrupted_retry")
+            rollback = marker.get("rollback") if isinstance(marker, dict) else None
+            if isinstance(rollback, dict):
+                for key, snapshot in rollback.items():
+                    if not isinstance(snapshot, dict):
+                        continue
+                    snapshot.setdefault("requeued_present", key in job)
+                    snapshot.setdefault("requeued_value", copy.deepcopy(job.get(key)))
+            requeued.add(job_id)
+        if requeued:
+            save_jobs(jobs)
+    return requeued
+
+
+def _restore_interrupted_retry_rollback(
+    job: Dict[str, Any], marker: Dict[str, Any]
+) -> None:
+    rollback = marker.get("rollback")
+    if isinstance(rollback, dict):
+        for key, snapshot in rollback.items():
+            if not isinstance(snapshot, dict):
+                continue
+            if (
+                (key in job) != snapshot.get("requeued_present")
+                or job.get(key) != snapshot.get("requeued_value")
+            ):
+                continue
+            if snapshot.get("present"):
+                job[key] = copy.deepcopy(snapshot.get("value"))
+            else:
+                job.pop(key, None)
+        return
+    # Legacy markers lack an exact inverse. Remove the unsafe retry and fail
+    # closed: recurring cadence resumes at its next legal future occurrence;
+    # a one-shot remains terminal/non-dispatchable.
+    schedule = job.get("schedule")
+    kind = schedule.get("kind") if isinstance(schedule, dict) else None
+    if kind in {"cron", "interval"}:
+        job["next_run_at"] = compute_next_run(schedule, _hermes_now().isoformat())
+    elif kind == "once":
+        job["next_run_at"] = None
+
+
+def cancel_interrupted_retry_executions(execution_ids: Collection[str]) -> Set[str]:
+    """Remove retry markers whose owner-renewal CAS defeated recovery.
+
+    Recovery writes jobs.json before terminalizing SQLite so a crash can never
+    lose an owed retry. If the owner's heartbeat changes between those writes,
+    this inverse operation restores the exact schedule state saved with the
+    marker. The restore is a three-way CAS: later operator edits win.
+    """
+    cancelled_ids = {str(value) for value in execution_ids if value}
+    if not cancelled_ids:
+        return set()
+    changed_jobs: Set[str] = set()
+    with _jobs_lock():
+        stored_jobs = load_jobs()
+        for job in stored_jobs:
+            marker = job.get("interrupted_retry")
+            if not isinstance(marker, dict):
+                continue
+            marker_ids = _interrupted_retry_execution_ids(marker)
+            remaining = marker_ids - cancelled_ids
+            if remaining == marker_ids:
+                continue
+            job_id = str(job.get("id") or "")
+            changed_jobs.add(job_id)
+            if remaining:
+                marker["execution_ids"] = sorted(remaining)
+                expected = marker.get("expected_heartbeats")
+                if isinstance(expected, dict):
+                    marker["expected_heartbeats"] = {
+                        execution_id: heartbeat
+                        for execution_id, heartbeat in expected.items()
+                        if execution_id in remaining
+                    }
+                continue
+            _restore_interrupted_retry_rollback(job, marker)
+            job.pop("interrupted_retry", None)
+        if changed_jobs:
+            save_jobs(stored_jobs)
+    return changed_jobs
+
+
+def reconcile_interrupted_retry_markers() -> Set[str]:
+    """Repair the crash boundary between jobs-store requeue and ledger CAS.
+
+    A marker without an ACK is kept only while its exact heartbeat generation
+    is still the one recovery observed. A renewed or normally finished owner
+    defeats that stale recovery attempt and the marker is rolled back. Unknown
+    rows recreate a missing ACK, covering a crash after SQLite terminalization.
+    """
+    changed_jobs: Set[str] = set()
+    with _jobs_lock():
+        stored_jobs = load_jobs()
+        marker_ids = {
+            execution_id
+            for job in stored_jobs
+            if isinstance(job, dict)
+            for marker in [job.get("interrupted_retry")]
+            if isinstance(marker, dict)
+            for execution_id in _interrupted_retry_execution_ids(marker)
+        }
+        if not marker_ids:
+            return set()
+        from cron.executions import (
+            interrupted_retry_states,
+            remember_interrupted_retry_acks,
+        )
+
+        states, acked_ids = interrupted_retry_states(marker_ids)
+        for job in stored_jobs:
+            marker = job.get("interrupted_retry")
+            if not isinstance(marker, dict):
+                continue
+            expected = marker.get("expected_heartbeats")
+            expected = expected if isinstance(expected, dict) else {}
+            ids = _interrupted_retry_execution_ids(marker)
+            cancel_ids: Set[str] = set()
+            recreate_ids: Set[str] = set()
+            for execution_id in ids - acked_ids:
+                state = states.get(execution_id)
+                if state is None or state.get("status") in {"completed", "failed"}:
+                    cancel_ids.add(execution_id)
+                elif state.get("status") == "unknown":
+                    recreate_ids.add(execution_id)
+                elif (
+                    execution_id in expected
+                    and state.get("heartbeat_at") != expected.get(execution_id)
+                ):
+                    cancel_ids.add(execution_id)
+            job_id = str(job.get("id") or "")
+            if recreate_ids:
+                remember_interrupted_retry_acks(recreate_ids, job_id=job_id)
+            if not cancel_ids:
+                continue
+            remaining = ids - cancel_ids
+            changed_jobs.add(job_id)
+            if remaining:
+                marker["execution_ids"] = sorted(remaining)
+                marker["expected_heartbeats"] = {
+                    execution_id: heartbeat
+                    for execution_id, heartbeat in expected.items()
+                    if execution_id in remaining
+                }
+            else:
+                _restore_interrupted_retry_rollback(job, marker)
+                job.pop("interrupted_retry", None)
+        if changed_jobs:
+            save_jobs(stored_jobs)
+    return changed_jobs
+
+
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID or name."""
     job = resolve_job_ref(job_id)
@@ -2319,6 +2810,15 @@ def remove_job(job_id: str) -> bool:
     canonical_id = job["id"]
     with _jobs_lock():
         jobs = load_jobs()
+        current_job = next(
+            (candidate for candidate in jobs if candidate["id"] == canonical_id),
+            None,
+        )
+        removed_retry = (
+            current_job.get("interrupted_retry")
+            if isinstance(current_job, dict)
+            else None
+        )
         original_len = len(jobs)
         jobs = [j for j in jobs if j["id"] != canonical_id]
         if len(jobs) < original_len:
@@ -2346,6 +2846,20 @@ def remove_job(job_id: str) -> bool:
             _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
             with _fire_fence_locks_guard:
                 _fire_fence_locks.pop(_fence_key, None)
+            if isinstance(removed_retry, dict):
+                try:
+                    from cron.executions import forget_interrupted_retry_acks
+
+                    forget_interrupted_retry_acks(
+                        _interrupted_retry_execution_ids(removed_retry),
+                        job_id=canonical_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Job '%s': removed retry acknowledgement cleanup failed: %s",
+                        canonical_id,
+                        exc,
+                    )
             return True
     return False
 
@@ -2492,6 +3006,7 @@ def _mark_job_run_locked(
                             job_id,
                         )
                         return False
+                interrupted_retry = job.pop("interrupted_retry", None)
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = status or ("ok" if success else "error")
@@ -2537,7 +3052,7 @@ def _mark_job_run_locked(
                     repeat = job["repeat"]
                     times = repeat.get("times")
                     completed = repeat.get("completed", 0)
-                    kind = job.get("schedule", {}).get("kind")
+                    kind = _job_schedule_kind(job)
                     preclaimed_oneshot = (
                         kind == "once"
                         and times is not None
@@ -2564,6 +3079,9 @@ def _mark_job_run_locked(
                         job["state"] = "completed"
                         job["next_run_at"] = None
                         save_jobs(jobs)
+                        _forget_interrupted_retry_best_effort(
+                            job_id, interrupted_retry
+                        )
                         return True
                 
                 # Compute next run
@@ -2576,7 +3094,7 @@ def _mark_job_run_locked(
                 # missing runtime dep into "job completed" and the user's
                 # schedule quietly goes off. See issue #16265.
                 if job["next_run_at"] is None:
-                    kind = job.get("schedule", {}).get("kind")
+                    kind = _job_schedule_kind(job)
                     if kind in {"cron", "interval"}:
                         job["state"] = "error"
                         if not job.get("last_error"):
@@ -2599,6 +3117,7 @@ def _mark_job_run_locked(
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
+                _forget_interrupted_retry_best_effort(job_id, interrupted_retry)
                 return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
@@ -2671,7 +3190,7 @@ def claim_dispatch(job_id: str) -> bool:
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
-            if job.get("schedule", {}).get("kind") != "once":
+            if _job_schedule_kind(job) != "once":
                 return True  # recurring jobs use advance_next_run(), not dispatch claims
             repeat = job.get("repeat")
             if not repeat:
@@ -2752,7 +3271,7 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
         for job in jobs:
             if job.get("id") != job_id:
                 continue
-            if job.get("schedule", {}).get("kind") != "once":
+            if _job_schedule_kind(job) != "once":
                 return False
             claim = job.get("run_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_owner:
@@ -2763,7 +3282,12 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
-def clear_run_claim(job_id: str) -> bool:
+def clear_run_claim(
+    job_id: str,
+    *,
+    expected_owner: Optional[str] = None,
+    expected_claim: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Clear a one-shot job's ``run_claim`` when its dispatch fails.
 
     ``get_due_jobs`` stamps a ``run_claim`` before returning a one-shot as
@@ -2781,9 +3305,18 @@ def clear_run_claim(job_id: str) -> bool:
         for job in jobs:
             if job.get("id") != job_id:
                 continue
-            if job.get("schedule", {}).get("kind") != "once":
+            if _job_schedule_kind(job) != "once":
                 return False
-            if job.get("run_claim") is not None:
+            claim = job.get("run_claim")
+            if expected_claim is not None and claim != expected_claim:
+                return False
+            if (
+                isinstance(claim, dict)
+                and expected_owner is not None
+                and claim.get("by") != expected_owner
+            ):
+                return False
+            if claim is not None:
                 job["run_claim"] = None
                 save_jobs(jobs)
                 return True
@@ -2816,8 +3349,15 @@ def advance_next_runs(job_ids) -> int:
         for job in jobs:
             if job["id"] not in ids:
                 continue
-            kind = job.get("schedule", {}).get("kind")
+            kind = _job_schedule_kind(job)
             if kind not in {"cron", "interval"}:
+                continue
+            if isinstance(job.get("interrupted_retry"), dict):
+                # This is an already-owed attempt, not an ordinary cadence
+                # fire.  Its claim path advances only after the durable
+                # execution fence exists and carries an exact rollback
+                # snapshot.  Pre-advancing here would strand the retry when
+                # execution creation/submission fails before that claim.
                 continue
             new_next = compute_next_run(job["schedule"], now)
             if new_next and new_next != job.get("next_run_at"):
@@ -2846,28 +3386,127 @@ def advance_next_run(job_id: str) -> bool:
 
 
 def _machine_id() -> str:
-    """Stable-ish identifier for claim attribution/debugging (NOT correctness).
+    """Stable host plus process attribution for jobs-store claim diagnostics."""
+    from cron.executions import _machine_id as execution_machine_id
 
-    Uses ``HERMES_MACHINE_ID`` if set, else hostname + pid. The CAS correctness
-    comes from the file lock + the fresh-claim check, not from this value.
+    return f"{execution_machine_id()}:{os.getpid()}"
+
+
+def _interrupted_retry_execution_ids(marker: Any) -> Set[str]:
+    """Return only a well-formed retry marker's execution identifiers.
+
+    jobs.json is operator-visible durable state and may contain legacy or
+    partially written values.  Every consumer uses this single boundary so a
+    scalar/dict/string cannot raise during recovery or block healthy siblings.
     """
-    explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
-    if explicit:
-        return explicit
+    if not isinstance(marker, dict):
+        return set()
+    raw = marker.get("execution_ids")
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return set()
+    return {str(value) for value in raw if value}
+
+
+def _interrupted_retry_ready(job: Dict[str, Any], now: datetime) -> bool:
+    """Validate the jobs.json→execution-ledger handoff for a retry marker."""
+    marker = job.get("interrupted_retry")
+    if not isinstance(marker, dict):
+        return True
     try:
-        import socket
-        host = socket.gethostname()
-    except Exception:
-        host = "unknown"
-    return f"{host}:{os.getpid()}"
+        eligible_at = _ensure_aware(datetime.fromisoformat(str(marker["eligible_at"])))
+    except (KeyError, TypeError, ValueError):
+        eligible_at = now
+    if now < eligible_at:
+        return False
+    try:
+        from cron.executions import execution_ids_are_terminal
+
+        return execution_ids_are_terminal(
+            _interrupted_retry_execution_ids(marker),
+            job_id=str(job.get("id") or ""),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': cannot verify interrupted retry ledger handoff: %s",
+            job.get("id"),
+            exc,
+        )
+        return False
+
+
+def _forget_interrupted_retry_best_effort(
+    job_id: str, marker: Optional[Dict[str, Any]]
+) -> None:
+    if not isinstance(marker, dict):
+        return
+    try:
+        from cron.executions import forget_interrupted_retry_acks
+
+        forget_interrupted_retry_acks(
+            _interrupted_retry_execution_ids(marker),
+            job_id=job_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': consumed retry acknowledgement cleanup failed: %s",
+            job_id,
+            exc,
+        )
+
+
+def rearm_aborted_fire(
+    job_id: str,
+    *,
+    expected_next_run_at: str,
+    delay_seconds: int = ABORTED_FIRE_RETRY_DELAY_SECONDS,
+) -> bool:
+    """Move an externally fired but unstarted occurrence to a fresh instant.
+
+    A successful pre-run rollback restores the already-fired ``next_run_at``.
+    External one-shot schedulers deduplicate that exact timestamp, so asking
+    them to arm it again is a no-op.  This per-job CAS preserves concurrent
+    operator edits while durably assigning the owed occurrence a new future
+    time that survives provider restart and reconciliation.
+    """
+    job_id = str(job_id)
+    expected_next_run_at = str(expected_next_run_at)
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            stored_jobs = load_jobs()
+            for job in stored_jobs:
+                if str(job.get("id")) != job_id:
+                    continue
+                if (
+                    str(job.get("next_run_at")) != expected_next_run_at
+                    or job.get("fire_claim")
+                ):
+                    return False
+                retry_at = _hermes_now() + timedelta(
+                    seconds=max(1, int(delay_seconds))
+                )
+                try:
+                    restored_at = _ensure_aware(
+                        datetime.fromisoformat(expected_next_run_at)
+                    )
+                    if retry_at <= restored_at:
+                        retry_at = restored_at + timedelta(microseconds=1)
+                except (TypeError, ValueError):
+                    pass
+                job["next_run_at"] = retry_at.isoformat()
+                save_jobs(stored_jobs)
+                return True
+    return False
 
 
 def claim_job_for_fire(
     job_id: str,
     *,
-    claim_ttl_seconds: int = 300,
+    claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS,
     force: bool = False,
     return_job: bool = False,
+    execution_id: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -2877,6 +3516,7 @@ def claim_job_for_fire(
             claim_ttl_seconds=claim_ttl_seconds,
             force=force,
             return_job=return_job,
+            execution_id=execution_id,
         )
 
 
@@ -2886,6 +3526,7 @@ def _claim_job_for_fire_locked(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    execution_id: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
@@ -2937,6 +3578,30 @@ def _claim_job_for_fire_locked(
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
+            interrupted_retry = job.get("interrupted_retry")
+            if not _interrupted_retry_ready(job, now):
+                return False
+            # Keep an in-memory undo record for the second half of the
+            # cross-store hand-off.  The jobs-store CAS necessarily commits
+            # before the execution-ledger fence; if that SQLite promotion
+            # cannot be committed, the caller uses this exact snapshot to put
+            # the occurrence back instead of silently consuming it.
+            due_run_claim = copy.deepcopy(job.get("run_claim"))
+            rollback = {
+                key: {
+                    "present": key in job,
+                    "value": copy.deepcopy(job.get(key)),
+                }
+                for key in (
+                    "next_run_at",
+                    "interrupted_retry",
+                    "repeat",
+                    "enabled",
+                    "state",
+                    "paused_at",
+                    "paused_reason",
+                )
+            }
             if force:
                 job["enabled"] = True
                 job["state"] = "scheduled"
@@ -2946,15 +3611,298 @@ def _claim_job_for_fire_locked(
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
-            job["fire_claim"] = {"at": now.isoformat(), "by": owner}
-            kind = job.get("schedule", {}).get("kind")
+            job["fire_claim"] = {
+                "at": now.isoformat(),
+                "by": owner,
+                **({"execution_id": str(execution_id)} if execution_id else {}),
+            }
+            # Clearing this marker is the commit point of the cross-store
+            # handoff.  The execution ledger check above proves the abandoned
+            # attempts are terminal before this retry can be acquired.
+            job.pop("interrupted_retry", None)
+            kind = _job_schedule_kind(job)
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
                     job["next_run_at"] = nxt
+            # Record the exact values produced by this claim.  Rollback is a
+            # three-way merge (before / claimed / current), not an overwrite:
+            # a concurrent operator edit that lands after the jobs-store CAS
+            # must remain authoritative when the execution fence later fails.
+            for key in tuple(rollback):
+                snapshot = rollback[key]
+                snapshot["claimed_present"] = key in job
+                snapshot["claimed_value"] = copy.deepcopy(job.get(key))
+                if (
+                    snapshot["present"] == snapshot["claimed_present"]
+                    and snapshot["value"] == snapshot["claimed_value"]
+                    and key not in {"next_run_at", "repeat"}
+                ):
+                    rollback.pop(key)
+            if "interrupted_retry" in rollback:
+                # Restoring an owed retry is valid only while the explicit
+                # at-least-once policy remains enabled.  This guard resolves
+                # the otherwise-ambiguous absent->absent state when an
+                # operator disables the policy after the claim consumed the
+                # marker but before ledger promotion fails.
+                rollback["_retry_policy_claimed"] = copy.deepcopy(
+                    job.get("retry_interrupted")
+                )
+            if isinstance(due_run_claim, dict):
+                # get_due_jobs() claims a finite one-shot before ledger/fire
+                # setup begins. A clean pre-run abort must release that exact
+                # due-scan owner too; otherwise the restored occurrence stays
+                # hidden until the much longer run-claim TTL expires.
+                rollback["_run_claim_to_clear"] = due_run_claim
             save_jobs(jobs)
-            return copy.deepcopy(job) if return_job else True
+            claimed_job = copy.deepcopy(job)
+            claimed_job["_fire_claim_rollback"] = rollback
+            # Ledger-first callers finalize the acknowledgement only after
+            # their execution row is fenced as the CAS winner.  Legacy bool
+            # callers have no second phase, so retain the historical cleanup.
+            if not execution_id or not return_job:
+                _forget_interrupted_retry_best_effort(job_id, interrupted_retry)
+            return claimed_job if return_job else True
         return False
+
+
+def finalize_fire_claim_setup(claimed_job: Dict[str, Any]) -> None:
+    """Finish the jobs/ledger hand-off after the execution fence commits."""
+    rollback = claimed_job.pop("_fire_claim_rollback", None)
+    if not isinstance(rollback, dict):
+        return
+    retry_snapshot = rollback.get("interrupted_retry")
+    interrupted_retry = (
+        retry_snapshot.get("value")
+        if isinstance(retry_snapshot, dict) and retry_snapshot.get("present")
+        else None
+    )
+    _forget_interrupted_retry_best_effort(claimed_job.get("id", ""), interrupted_retry)
+
+
+class FireClaimRollbackUnavailableError(RuntimeError):
+    """The exact claim rollback could not acquire its serialization lock."""
+
+
+def rollback_fire_claim_setup(
+    claimed_job: Dict[str, Any],
+    *,
+    aborted_execution_id: Optional[str] = None,
+    allow_dispatched_oneshot: bool = False,
+    fresh_retry_delay_seconds: Optional[int] = None,
+) -> bool:
+    """Restore an occurrence whose execution-ledger fence did not commit.
+
+    The rollback is compare-and-set against the exact jobs-store claim owner
+    and execution id.  It therefore cannot undo a later owner's claim.  Retry
+    acknowledgements are deliberately left intact so an interrupted retry is
+    claimable again after restoration.
+    """
+    rollback = claimed_job.get("_fire_claim_rollback")
+    expected_claim = claimed_job.get("fire_claim")
+    job_id = str(claimed_job.get("id") or "")
+    if not job_id or not isinstance(rollback, dict) or not isinstance(expected_claim, dict):
+        return False
+
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            # This is not an ownership-CAS loss. The claim may still be ours,
+            # with cadence/retry state consumed, but we could not inspect or
+            # restore it. Force callers onto durable ledger recovery instead
+            # of terminalizing the only remaining retry witness.
+            raise FireClaimRollbackUnavailableError(
+                f"Could not acquire the fire-claim rollback lock for job {job_id}"
+            )
+        with _jobs_lock():
+            stored_jobs = load_jobs()
+            for job in stored_jobs:
+                if job.get("id") != job_id:
+                    continue
+                current_claim = job.get("fire_claim")
+                if not isinstance(current_claim, dict):
+                    return False
+                if current_claim.get("by") != expected_claim.get("by"):
+                    return False
+                if current_claim.get("execution_id") != expected_claim.get("execution_id"):
+                    return False
+
+                retry_snapshot = rollback.get("interrupted_retry")
+                retry_policy_changed = isinstance(retry_snapshot, dict) and (
+                    job.get("retry_interrupted")
+                    != rollback.get("_retry_policy_claimed")
+                )
+                force_fields = {
+                    "enabled",
+                    "state",
+                    "paused_at",
+                    "paused_reason",
+                }
+                force_group_changed = any(
+                    key in rollback
+                    and (
+                        (key in job) != rollback[key].get("claimed_present")
+                        or job.get(key) != rollback[key].get("claimed_value")
+                    )
+                    for key in force_fields
+                )
+
+                if isinstance(retry_snapshot, dict) and not retry_policy_changed:
+                    original_retry = (
+                        retry_snapshot.get("value")
+                        if retry_snapshot.get("present")
+                        else None
+                    )
+                    if isinstance(original_retry, dict):
+                        # The claim temporarily removes the marker, so the
+                        # serialized orphan pruner may legitimately delete its
+                        # ACK before ledger promotion fails. Recreate the ACK
+                        # while still holding the jobs lock and *before* the
+                        # marker is restored. A crash can therefore leave an
+                        # orphan ACK (self-pruning), never a stranded marker.
+                        from cron.executions import remember_interrupted_retry_acks
+
+                        remember_interrupted_retry_acks(
+                            _interrupted_retry_execution_ids(original_retry),
+                            job_id=job_id,
+                        )
+
+                for key, snapshot in rollback.items():
+                    if key.startswith("_"):
+                        continue
+                    if not isinstance(snapshot, dict):
+                        continue
+                    if key in force_fields and force_group_changed:
+                        # Pause/resume state is one logical operator edit.  If
+                        # any member changed after our force-claim, preserve
+                        # the whole newer group instead of mixing generations.
+                        continue
+                    if retry_policy_changed and key in {
+                        "interrupted_retry",
+                        "next_run_at",
+                    }:
+                        continue
+                    current_matches_claim = (
+                        (key in job) == snapshot.get("claimed_present")
+                        and job.get(key) == snapshot.get("claimed_value")
+                    )
+                    if (
+                        not current_matches_claim
+                        and allow_dispatched_oneshot
+                        and key == "repeat"
+                        and _job_schedule_kind(job) == "once"
+                        and isinstance(job.get("repeat"), dict)
+                        and isinstance(snapshot.get("claimed_value"), dict)
+                    ):
+                        # ``claim_dispatch`` is the sole jobs-store mutation
+                        # between the external fire CAS and workload start. A
+                        # save can succeed and still raise to its caller, so
+                        # abort recovery must recognize exactly that one-step
+                        # mutation. Compare every field except ``completed``
+                        # and accept only a +1 transition; any operator edit or
+                        # newer dispatch generation remains authoritative.
+                        current_repeat = copy.deepcopy(job["repeat"])
+                        claimed_repeat = copy.deepcopy(
+                            snapshot["claimed_value"]
+                        )
+                        current_completed = current_repeat.pop("completed", 0)
+                        claimed_completed = claimed_repeat.pop("completed", 0)
+                        current_matches_claim = (
+                            current_repeat == claimed_repeat
+                            and isinstance(current_completed, int)
+                            and not isinstance(current_completed, bool)
+                            and isinstance(claimed_completed, int)
+                            and not isinstance(claimed_completed, bool)
+                            and current_completed == claimed_completed + 1
+                        )
+                    if not current_matches_claim and not (
+                        key == "next_run_at"
+                        and isinstance(retry_snapshot, dict)
+                        and not retry_policy_changed
+                    ):
+                        continue
+                    if snapshot.get("present"):
+                        restored_value = copy.deepcopy(snapshot.get("value"))
+                        if (
+                            key == "next_run_at"
+                            and fresh_retry_delay_seconds is not None
+                            and restored_value
+                        ):
+                            retry_at = _hermes_now() + timedelta(
+                                seconds=max(1, int(fresh_retry_delay_seconds))
+                            )
+                            try:
+                                original_at = _ensure_aware(
+                                    datetime.fromisoformat(str(restored_value))
+                                )
+                                if retry_at <= original_at:
+                                    retry_at = original_at + timedelta(
+                                        microseconds=1
+                                    )
+                            except (TypeError, ValueError):
+                                pass
+                            restored_value = retry_at.isoformat()
+                        job[key] = restored_value
+                    else:
+                        job.pop(key, None)
+                expected_run_claim = rollback.get("_run_claim_to_clear")
+                if (
+                    isinstance(expected_run_claim, dict)
+                    and job.get("run_claim") == expected_run_claim
+                ):
+                    job["run_claim"] = None
+                if aborted_execution_id:
+                    pending_aborts = job.get("_pre_run_abort_execution_ids")
+                    pending_abort_ids = {
+                        str(value)
+                        for value in pending_aborts
+                        if value
+                    } if isinstance(pending_aborts, list) else set()
+                    pending_abort_ids.add(str(aborted_execution_id))
+                    job["_pre_run_abort_execution_ids"] = sorted(
+                        pending_abort_ids
+                    )
+                # Never reinstate the stale/malformed claim that this CAS
+                # superseded; removing our exact claim makes the restored
+                # occurrence immediately eligible for a clean attempt.
+                job["fire_claim"] = None
+                save_jobs(stored_jobs)
+                if retry_policy_changed:
+                    original_retry = (
+                        retry_snapshot.get("value")
+                        if retry_snapshot.get("present")
+                        else None
+                    )
+                    _forget_interrupted_retry_best_effort(job_id, original_retry)
+                claimed_job.pop("_fire_claim_rollback", None)
+                return True
+    return False
+
+
+def forget_pre_run_abort_execution(job_id: str, execution_id: str) -> bool:
+    """Remove a terminalized pre-run abort tombstone from jobs.json."""
+    job_id = str(job_id)
+    execution_id = str(execution_id)
+    with _jobs_lock():
+        stored_jobs = load_jobs()
+        for job in stored_jobs:
+            if str(job.get("id")) != job_id:
+                continue
+            raw_ids = job.get("_pre_run_abort_execution_ids")
+            ids = (
+                {str(value) for value in raw_ids if value}
+                if isinstance(raw_ids, list)
+                else set()
+            )
+            if execution_id not in ids:
+                return False
+            ids.discard(execution_id)
+            if ids:
+                job["_pre_run_abort_execution_ids"] = sorted(ids)
+            else:
+                job.pop("_pre_run_abort_execution_ids", None)
+            save_jobs(stored_jobs)
+            return True
+    return False
 
 
 # Completed one-shot job records are retained in jobs.json (final status +
@@ -3044,13 +3992,16 @@ def _sweep_completed_oneshots(
 
 
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
-    with _fire_job_lock(job_id) as acquired:
-        if not acquired:
-            return False
-        return _heartbeat_fire_claim_locked(
-            job_id,
-            expected_owner=expected_owner,
-        )
+    """Renew ownership without waiting behind the side-effect fence.
+
+    The jobs-store owner CAS is the authoritative fence.  Keeping heartbeat
+    renewal independent of ``_fire_job_lock`` lets a long network side effect
+    retain its lease while recovery waits on that same per-job fence.
+    """
+    return _heartbeat_fire_claim_locked(
+        job_id,
+        expected_owner=expected_owner,
+    )
 
 
 def _heartbeat_fire_claim_locked(job_id: str, *, expected_owner: str) -> bool:
@@ -3216,6 +4167,13 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             if not job.get("enabled", True):
                 continue
 
+            # The built-in ticker does not take the external fire CAS. Keep a
+            # recovered retry out of its due set until the abandoned attempt's
+            # terminal ledger handoff has committed. The marker remains until
+            # mark_job_run so a crash in the replacement run stays recoverable.
+            if not _interrupted_retry_ready(job, now):
+                continue
+
             # Contradiction self-heal: enabled=true with pause markers means the
             # operator believes the job is frozen while the scheduler would still
             # fire it (07-30 outage). Refuse to run and force enabled=false so
@@ -3252,7 +4210,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # is treated as stale (the claiming tick died mid-run) and allowed
             # through so the job is recovered rather than wedged forever.
             existing_claim = job.get("run_claim")
-            if existing_claim and job.get("schedule", {}).get("kind") == "once":
+            if existing_claim and _job_schedule_kind(job) == "once":
                 try:
                     claimed_at = _ensure_aware(
                         datetime.fromisoformat(existing_claim["at"])
@@ -3410,7 +4368,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # (gateway was down and missed the window). Fast-forward to
                 # the next future occurrence instead of firing a stale run.
                 grace = _compute_grace_seconds(schedule)
-                if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
+                if (
+                    kind in {"cron", "interval"}
+                    and not isinstance(job.get("interrupted_retry"), dict)
+                    and (now - next_run_dt).total_seconds() > grace
+                ):
                     # Job is past its catch-up grace window — skip accumulated
                     # missed runs but still execute once now to avoid deferring
                     # indefinitely (e.g. a long-running job just finished).

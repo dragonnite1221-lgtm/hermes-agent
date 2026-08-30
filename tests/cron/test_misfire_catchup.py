@@ -99,6 +99,48 @@ class TestFireOverdueJobs:
         _park_in_past(job["id"], minutes=600)
         assert fire_overdue_jobs(RecordingProvider()) == 0
 
+    def test_external_housekeeping_recovers_dead_owners_when_misfire_disabled(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "cron.scheduler_provider._misfire_grace_minutes", lambda: 0.0
+        )
+        provider = RecordingProvider()
+        recovered = []
+        reconciled = []
+        monkeypatch.setattr(
+            provider,
+            "recover_interrupted",
+            lambda: recovered.append("recover") or 1,
+        )
+        monkeypatch.setattr(
+            provider,
+            "reconcile",
+            lambda: reconciled.append("reconcile"),
+        )
+
+        assert fire_overdue_jobs(provider) == 0
+        assert recovered == ["recover"]
+        assert reconciled == ["reconcile"]
+
+    def test_external_housekeeping_reconciles_after_prior_remote_failure(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "cron.scheduler_provider._misfire_grace_minutes", lambda: 0.0
+        )
+        provider = RecordingProvider()
+        reconciled = []
+        monkeypatch.setattr(provider, "recover_interrupted", lambda: 0)
+        monkeypatch.setattr(
+            provider,
+            "reconcile",
+            lambda: reconciled.append("reconcile"),
+        )
+
+        assert fire_overdue_jobs(provider) == 0
+        assert reconciled == ["reconcile"]
+
     def test_future_job_not_fired(self, tmp_cron_dir):
         create_job(prompt="p", schedule="every 1h")  # next_run_at in future
         provider = RecordingProvider()
@@ -161,3 +203,35 @@ class TestFireOverdueJobs:
         assert time.monotonic() - start < 1.0  # returned before the run
         assert provider.wait_fired(timeout=10)
         assert provider.fired == [job["id"]]
+
+    def test_thread_start_failure_restores_claimed_occurrence(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A failed background handoff must not consume the due occurrence."""
+        job = create_job(prompt="p", schedule="every 1h")
+        _park_in_past(job["id"], minutes=30)
+        before = get_job(job["id"])
+        assert before is not None
+        provider = RecordingProvider()
+        rearmed = []
+        monkeypatch.setattr(
+            provider,
+            "rearm_aborted_claim",
+            lambda claimed: rearmed.append(claimed["id"]),
+        )
+
+        monkeypatch.setattr(
+            threading.Thread,
+            "start",
+            lambda _thread: (_ for _ in ()).throw(
+                RuntimeError("cannot start new thread")
+            ),
+        )
+
+        assert fire_overdue_jobs(provider) == 0
+        restored = get_job(job["id"])
+        assert restored is not None
+        assert restored["next_run_at"] == before["next_run_at"]
+        assert restored["fire_claim"] is None
+        assert provider.fired == []
+        assert rearmed == [job["id"]]

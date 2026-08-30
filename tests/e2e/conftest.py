@@ -273,16 +273,20 @@ def make_adapter(platform: Platform, runner=None):
 async def send_and_capture(adapter, text: str, platform: Platform, **event_kwargs) -> AsyncMock:
     """Send a message through the full e2e flow and return the send mock.
 
-    Polls for the send rather than waiting a fixed delay: handler DB work now
-    hops to worker threads (AsyncSessionDB), so completion latency varies.
+    ``handle_message`` intentionally returns after spawning the session task.
+    Await that task instead of guessing at completion with a wall-clock poll:
+    handler DB work hops to worker threads (AsyncSessionDB), so a busy CI host
+    can legitimately take longer than an arbitrary settle window.
     """
     event = make_event(platform, text, **event_kwargs)
     adapter.send.reset_mock()
     await adapter.handle_message(event)
-    for _ in range(40):  # up to ~2s; returns as soon as the send lands
-        if adapter.send.called:
-            break
-        await asyncio.sleep(0.05)
+
+    session_key = build_session_key(event.source)
+    task = adapter._session_tasks.get(session_key)
+    if task is not None and not task.done():
+        await asyncio.wait_for(task, timeout=15)
+
     return adapter.send
 
 

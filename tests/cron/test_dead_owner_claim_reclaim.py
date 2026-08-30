@@ -134,6 +134,29 @@ class TestTickReapsDeadOwnerClaims:
         _run_tick()
         assert len(calls) == 2, "an expired throttle window must reap again"
 
+    def test_reap_throttle_is_profile_local(self, monkeypatch, tmp_path):
+        calls = []
+        active_home = {"path": tmp_path / "profile-a"}
+        monkeypatch.setattr(scheduler_mod, "_last_dead_owner_reap_at", {})
+        monkeypatch.setattr(
+            scheduler_mod, "_get_hermes_home", lambda: active_home["path"]
+        )
+        monkeypatch.setattr(
+            "cron.executions.recover_interrupted_executions",
+            lambda: calls.append(str(active_home["path"])) or 0,
+        )
+
+        _run_tick()
+        active_home["path"] = tmp_path / "profile-b"
+        _run_tick()
+        active_home["path"] = tmp_path / "profile-a"
+        _run_tick()
+
+        assert calls == [
+            str(tmp_path / "profile-a"),
+            str(tmp_path / "profile-b"),
+        ]
+
     def test_reap_failure_does_not_break_the_tick(self, monkeypatch):
         def _boom():
             raise RuntimeError("ledger unavailable")

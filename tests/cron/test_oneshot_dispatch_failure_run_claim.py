@@ -46,6 +46,7 @@ def _make_oneshot(claimed: bool = True) -> dict:
             if j["id"] == job["id"]:
                 j["run_claim"] = {"at": "2026-08-17T10:00:00+00:00", "by": "test:1"}
         jobs_mod.save_jobs(jobs)
+        return next(j for j in jobs if j["id"] == job["id"])
     return job
 
 
@@ -73,6 +74,27 @@ class TestClearRunClaim:
 
     def test_unknown_job_id_returns_false(self, cron_store):
         assert clear_run_claim("no-such-job") is False
+
+    def test_expected_owner_cannot_clear_replacement_claim(self, cron_store):
+        job = _make_oneshot(claimed=True)
+        assert clear_run_claim(job["id"], expected_owner="other-owner") is False
+        reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
+        assert reloaded["run_claim"]["by"] == "test:1"
+
+    def test_exact_claim_cannot_clear_same_owner_replacement(self, cron_store):
+        job = _make_oneshot(claimed=True)
+        original_claim = dict(job["run_claim"])
+        stored = jobs_mod.load_jobs()
+        replacement = {"at": "2026-08-17T10:01:00+00:00", "by": "test:1"}
+        next(item for item in stored if item["id"] == job["id"])["run_claim"] = replacement
+        jobs_mod.save_jobs(stored)
+
+        assert clear_run_claim(
+            job["id"],
+            expected_owner="test:1",
+            expected_claim=original_claim,
+        ) is False
+        assert jobs_mod.get_job(job["id"])["run_claim"] == replacement
 
 
 class TestDispatchFailurePathsClearClaim:
@@ -103,6 +125,19 @@ class TestDispatchFailurePathsClearClaim:
         assert reloaded.get("run_claim") is None
         assert job["id"] not in sched.get_running_job_ids()
 
+    def test_running_guard_skip_clears_only_tick_oneshot_claim(self, cron_store):
+        from cron import scheduler as sched
+
+        job = _make_oneshot(claimed=True)
+        sched._running_job_ids.add(job["id"])
+        try:
+            assert self._tick_one(job) == 0
+        finally:
+            sched._running_job_ids.discard(job["id"])
+            sched._shutdown_parallel_pool()
+        reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
+        assert reloaded.get("run_claim") is None
+
     def test_submit_failure_clears_claim(self, cron_store):
         from cron import scheduler as sched
         job = _make_oneshot(claimed=True)
@@ -118,6 +153,49 @@ class TestDispatchFailurePathsClearClaim:
         reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
         assert reloaded.get("run_claim") is None
         assert job["id"] not in sched.get_running_job_ids()
+
+    def test_submit_cleanup_failure_records_local_recovery_intent(
+        self, cron_store
+    ):
+        from cron import scheduler as sched
+
+        job = _make_oneshot(claimed=True)
+
+        class _ExplodingPool:
+            def submit(self, *args, **kwargs):
+                raise RuntimeError("cannot schedule new futures")
+
+        with (
+            patch.object(sched, "_get_parallel_pool", return_value=_ExplodingPool()),
+            patch.object(sched, "_get_sequential_pool", return_value=_ExplodingPool()),
+            patch.object(
+                sched,
+                "discard_unacquired_execution",
+                side_effect=OSError("ledger cleanup unavailable"),
+            ),
+            patch.object(sched, "remember_execution_recovery_intent") as remember,
+        ):
+            self._tick_one(job)
+
+        remember.assert_called_once()
+        assert job["id"] not in sched.get_running_job_ids()
+
+    @pytest.mark.parametrize("claim_outcome", [False, RuntimeError("store gone")])
+    def test_worker_claim_failure_clears_due_scan_claim(
+        self, cron_store, claim_outcome
+    ):
+        from cron import scheduler as sched
+
+        job = _make_oneshot(claimed=True)
+        effect = (
+            {"return_value": claim_outcome}
+            if claim_outcome is False
+            else {"side_effect": claim_outcome}
+        )
+        with patch.object(sched, "claim_job_for_fire", **effect):
+            self._tick_one(job)
+
+        assert jobs_mod.get_job(job["id"])["run_claim"] is None
 
     def test_clear_failure_is_best_effort_not_fatal(self, cron_store):
         """A raising clear_run_claim (corrupt store, teardown I/O error) must

@@ -9,6 +9,8 @@ All NAS calls are mocked — ZERO live network. These prove:
     (job gone) stops re-arming.
 """
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 
@@ -98,6 +100,31 @@ def test_register_job_propagates_provision_failure(chronos):
         )
 
 
+def test_rearm_aborted_claim_provisions_persisted_fresh_occurrence(
+    chronos, monkeypatch
+):
+    prov, fake = chronos
+    retry = {
+        "id": "j1",
+        "enabled": True,
+        "state": "scheduled",
+        "next_run_at": "2026-06-18T12:00:05+00:00",
+        "fire_claim": None,
+    }
+    monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: retry)
+
+    prov.rearm_aborted_claim({"id": "j1"})
+
+    assert fake.provisions == [
+        {
+            "job_id": "j1",
+            "fire_at": retry["next_run_at"],
+            "agent_callback_url": "https://agent.example/",
+            "dedup_key": f"j1:{retry['next_run_at']}",
+        }
+    ]
+
+
 # -- reconcile ----------------------------------------------------------------
 
 def test_reconcile_arms_all_enabled(temp_home, chronos, monkeypatch):
@@ -137,7 +164,7 @@ def test_fire_due_rearms_next_oneshot(chronos, monkeypatch):
 
 
 def test_fire_due_rearms_after_claimed_job_failure(chronos, monkeypatch):
-    """A claimed attempt is consumed even when the job pipeline reports failure."""
+    """A pre-run abort is reported while its persisted retry is re-armed."""
     prov, fake = chronos
     claimed = {"id": "j1", "fire_claim": {"by": "owner-1"}}
     persisted = {
@@ -146,15 +173,31 @@ def test_fire_due_rearms_after_claimed_job_failure(chronos, monkeypatch):
         "next_run_at": "2026-06-18T12:05:00+00:00",
     }
 
-    monkeypatch.setattr("cron.jobs.claim_job_for_fire", lambda jid, **kw: claimed)
+    claim_calls = []
+    acquired = []
+    monkeypatch.setattr(
+        "cron.jobs.claim_job_for_fire",
+        lambda jid, **kw: claim_calls.append(kw) or claimed,
+    )
     monkeypatch.setattr(
         "cron.executions.create_execution",
-        lambda jid, source: {"id": "exec-1"},
+        lambda jid, source, fire_claim_acquired: {
+            "id": "exec-1",
+            "fire_claim_acquired": int(fire_claim_acquired),
+        },
+    )
+    monkeypatch.setattr(
+        "cron.executions.mark_fire_claim_acquired",
+        lambda execution_id: acquired.append(execution_id) or {"id": execution_id},
     )
     monkeypatch.setattr("cron.scheduler.run_one_job", lambda *args, **kwargs: False)
     monkeypatch.setattr("cron.jobs.get_job", lambda jid: persisted)
 
-    assert prov.fire_due("j1") is True
+    assert prov.fire_due("j1") is False
+    assert claim_calls == [
+        {"return_job": True, "execution_id": "exec-1", "force": False}
+    ]
+    assert acquired == ["exec-1"]
     assert [provision["job_id"] for provision in fake.provisions] == ["j1"]
 
 
@@ -162,25 +205,42 @@ def test_fire_due_forwards_manual_force_to_claim(chronos, monkeypatch):
     """A manual force fire must reach the store claim as force=True."""
     prov, _fake = chronos
     seen = []
+    discarded = []
     monkeypatch.setattr(
         "cron.jobs.claim_job_for_fire",
         lambda jid, **kw: seen.append(kw) or False,
     )
     monkeypatch.setattr(
         "cron.executions.create_execution",
-        lambda jid, source: {"id": "exec-1"},
+        lambda jid, source, fire_claim_acquired: {
+            "id": "exec-1",
+            "fire_claim_acquired": int(fire_claim_acquired),
+        },
+    )
+    monkeypatch.setattr(
+        "cron.executions.discard_unacquired_execution",
+        lambda execution_id: discarded.append(execution_id),
     )
 
     assert prov.fire_due("j1", force=True) is False
-    assert seen == [{"return_job": True, "force": True}]
+    assert seen == [
+        {"return_job": True, "execution_id": "exec-1", "force": True}
+    ]
+    assert discarded == ["exec-1"]
 
 
 def test_fire_due_no_rearm_when_job_gone(chronos, monkeypatch):
     """repeat-N exhausted / one-shot completed → mark_job_run deleted the job →
     get_job None → no re-arm (the schedule stops cleanly)."""
     prov, fake = chronos
-    monkeypatch.setattr("cron.scheduler_provider.CronScheduler.fire_due",
-                        lambda self, jid, **kw: True)
+    monkeypatch.setattr(
+        "cron.scheduler_provider.CronScheduler.claim_fire",
+        lambda self, jid, **kw: {"id": jid},
+    )
+    monkeypatch.setattr(
+        "cron.scheduler_provider.CronScheduler.fire_claimed",
+        lambda self, job, **kw: True,
+    )
     monkeypatch.setattr("cron.jobs.get_job", lambda jid: None)
 
     assert prov.fire_due("j1") is True
@@ -190,8 +250,10 @@ def test_fire_due_no_rearm_when_job_gone(chronos, monkeypatch):
 def test_fire_due_no_rearm_when_claim_lost(chronos, monkeypatch):
     """If the run didn't happen (claim lost), don't re-arm."""
     prov, fake = chronos
-    monkeypatch.setattr("cron.scheduler_provider.CronScheduler.fire_due",
-                        lambda self, jid, **kw: False)
+    monkeypatch.setattr(
+        "cron.scheduler_provider.CronScheduler.claim_fire",
+        lambda self, jid, **kw: None,
+    )
 
     assert prov.fire_due("j1") is False
     assert fake.provisions == []
@@ -216,15 +278,60 @@ def test_chronos_is_split_fire_capable(chronos):
     assert provider_supports_fire_cancel(prov) is True
 
 
-def test_fire_claimed_no_rearm_when_run_failed(chronos, monkeypatch):
+def test_fire_claimed_rearms_persisted_retry_when_run_aborts(chronos, monkeypatch):
     prov, fake = chronos
+    persisted = {
+        "id": "j1",
+        "enabled": True,
+        "next_run_at": "2026-06-18T12:05:00+00:00",
+    }
     monkeypatch.setattr(
         "cron.scheduler_provider.CronScheduler.fire_claimed",
         lambda self, job, **kw: False,
     )
+    monkeypatch.setattr("cron.jobs.get_job", lambda jid: persisted)
 
     assert prov.fire_claimed({"id": "j1"}) is False
-    assert fake.provisions == []
+    assert [provision["job_id"] for provision in fake.provisions] == ["j1"]
+
+
+def test_fire_claimed_moves_restored_occurrence_to_fresh_future_time(
+    temp_home, chronos, monkeypatch
+):
+    from cron import jobs
+
+    prov, fake = chronos
+    now = datetime(2026, 8, 30, 1, 0, tzinfo=timezone.utc)
+    restored_fire_at = (now - timedelta(seconds=1)).isoformat()
+    job = jobs.create_job(
+        prompt=None,
+        schedule="every 1h",
+        script="idempotent-sync.py",
+        no_agent=True,
+        deliver="local",
+    )
+    jobs.update_job(
+        job["id"], {"next_run_at": restored_fire_at, "fire_claim": None}
+    )
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    monkeypatch.setattr(
+        "cron.scheduler_provider.CronScheduler.fire_claimed",
+        lambda self, claimed, **kw: False,
+    )
+    claimed = {
+        "id": job["id"],
+        "execution_id": "exec-aborted",
+        "_fire_claim_rollback": {
+            "next_run_at": {"present": True, "value": restored_fire_at}
+        },
+    }
+
+    assert prov.fire_claimed(claimed) is False
+
+    retry_at = (now + timedelta(seconds=jobs.ABORTED_FIRE_RETRY_DELAY_SECONDS)).isoformat()
+    assert jobs.get_job(job["id"])["next_run_at"] == retry_at
+    assert fake.provisions[-1]["fire_at"] == retry_at
+    assert fake.provisions[-1]["dedup_key"] != f"{job['id']}:{restored_fire_at}"
 
 
 def test_fire_claimed_no_rearm_when_job_gone(chronos, monkeypatch):

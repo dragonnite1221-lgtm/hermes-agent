@@ -534,11 +534,11 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import (
-    advance_next_runs,
     claim_dispatch,
     claim_job_for_fire,
     fire_claim_fence,
     clear_run_claim,
+    finalize_fire_claim_setup,
     get_due_jobs,
     heartbeat_fire_claim,
     heartbeat_run_claim,
@@ -546,7 +546,15 @@ from cron.jobs import (
     save_job_output,
     use_cron_store,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    discard_unacquired_execution,
+    finish_execution,
+    heartbeat_execution,
+    mark_execution_running,
+    mark_fire_claim_acquired,
+    remember_execution_recovery_intent,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -6490,18 +6498,11 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
     lost_ownership = threading.Event()
     heartbeat_context = contextvars.copy_context()
 
-    def _finish_unstarted(error: str) -> None:
-        execution_id = job.get("execution_id")
-        if not execution_id:
-            return
-        try:
-            finish_execution(execution_id, success=False, error=error)
-        except Exception:
-            logger.warning(
-                "Job '%s': failed to close unstarted execution ledger row",
-                job_id,
-                exc_info=True,
-            )
+    def _abort_unstarted(error: str) -> None:
+        """Restore a provisionally consumed occurrence, then close its row."""
+        from cron.scheduler_provider import abort_fire_claim_execution
+
+        abort_fire_claim_execution(job, error)
 
     try:
         owns_fire_claim = heartbeat_fire_claim(job_id, expected_owner=owner)
@@ -6511,18 +6512,28 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
             job_id,
             exc_info=True,
         )
-        _finish_unstarted(
+        _abort_unstarted(
             "Fire claim ownership could not be validated before execution started."
         )
-        return True
+        return False
 
     if owns_fire_claim is False:
         logger.warning(
             "Job '%s': fire claim ownership was already lost before execution",
             job_id,
         )
-        _finish_unstarted("Fire claim ownership lost before execution started.")
-        return True
+        _abort_unstarted("Fire claim ownership lost before execution started.")
+        return False
+    execution_id = str(job.get("execution_id") or "")
+    if execution_id:
+        try:
+            heartbeat_execution(execution_id)
+        except Exception:
+            logger.debug(
+                "Job '%s': initial execution-owner heartbeat failed",
+                job_id,
+                exc_info=True,
+            )
 
     def _heartbeat_loop() -> None:
         last_confirmed = time.monotonic()
@@ -6554,6 +6565,19 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                         _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS,
                     )
                     return
+                continue
+            if execution_id:
+                try:
+                    heartbeat_execution(execution_id)
+                except Exception:
+                    # jobs.json fire_claim is the authoritative dispatch
+                    # fence. Ledger telemetry must never turn a successfully
+                    # renewed owner into a false ownership loss.
+                    logger.debug(
+                        "Job '%s': execution-ledger heartbeat failed",
+                        job_id,
+                        exc_info=True,
+                    )
 
     heartbeat_thread = threading.Thread(
         target=heartbeat_context.run,
@@ -6569,10 +6593,10 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
             job_id,
             exc_info=True,
         )
-        _finish_unstarted(
+        _abort_unstarted(
             "Fire claim heartbeat could not be started; execution was not run."
         )
-        return True
+        return False
 
     try:
         return run(lost_ownership)
@@ -6600,8 +6624,9 @@ def run_one_job(
     both the ticker and external providers use the same store CAS before
     calling it. It does keep an acquired claim alive for the full execution.
 
-    Returns True if the job was processed (even if the job itself failed —
-    failure is recorded via ``mark_job_run``), False only if processing raised.
+    Returns True if the workload started and the attempt was processed (even
+    if the workload itself failed — failure is recorded via ``mark_job_run``).
+    Returns False when pre-run setup aborts or processing raises.
 
     ``cancel_event``: optional transport-level cancellation source (dashboard
     webhook drain, API server shutdown). It is OR-combined with the internal
@@ -6690,45 +6715,55 @@ def _run_one_job_body(
     delivery_attempted = False
     delivery_error = None
     try:
-        # Pre-run dispatch claim (issue #38758): atomically commit a finite
-        # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
-        # mid-execution (gateway kill, OOM, segfault, hard-timeout) cannot
-        # re-fire the job forever on restart. No-op for recurring jobs (they
-        # use advance_next_run) and infinite/no-repeat jobs. This lives here in
-        # the shared body so BOTH the built-in ticker and the external provider
-        # (Chronos fire_due) get at-most-times semantics.
-        if not claim_dispatch(job["id"]):
-            logger.info(
-                "Job '%s': one-shot dispatch limit reached — skipping",
-                job.get("name", job["id"]),
-            )
-            finish_execution(
-                execution_id,
-                success=False,
-                error="Dispatch claim rejected; execution was not started.",
-            )
-            return True  # not an error — already handled/removed
+        from cron.scheduler_provider import abort_fire_claim_execution
 
-        # The attempt is claimed durably before executor/provider dispatch and
-        # becomes running only immediately before the actual run.
-        mark_execution_running(execution_id)
-
-        # Run the job under the profile's secret scope. get_secret() fails
-        # closed outside a scope once profile isolation is in play (multiple
-        # gateway profiles / room→profile multiplexing), and cron fires from
-        # the ticker thread where no per-turn scope is installed — so
-        # resolve_runtime_provider() raised UnscopedSecretError before model
-        # selection, breaking every cron job. Mirrors the per-turn pattern in
-        # gateway/run.py (_profile_runtime_scope).
+        # Prepare every fallible pre-run dependency while the exact jobs-store
+        # rollback witness is still available. The witness is finalized only
+        # after the ledger row is running and finite one-shot dispatch has
+        # durably committed.
         from agent.secret_scope import (
             build_profile_secret_scope,
             reset_secret_scope,
             set_secret_scope,
         )
 
-        _scope_token = set_secret_scope(
-            build_profile_secret_scope(_get_hermes_home())
-        )
+        _scope_token = None
+        dispatch_outcome_ambiguous = False
+        try:
+            # Cron fires outside a gateway turn, so establish the profile's
+            # secret scope before committing any execution-side state.
+            _scope_token = set_secret_scope(
+                build_profile_secret_scope(_get_hermes_home())
+            )
+            if mark_execution_running(execution_id) is None:
+                raise RuntimeError(
+                    "Execution ledger row could not enter running state."
+                )
+            # Finite one-shots claim capacity before the side effect. This is
+            # the last persistence boundary before the user workload begins.
+            try:
+                dispatch_claimed = claim_dispatch(job["id"])
+            except Exception:
+                dispatch_outcome_ambiguous = True
+                raise
+            if not dispatch_claimed:
+                raise RuntimeError(
+                    "Dispatch claim rejected; execution was not started."
+                )
+        except Exception as pre_run_error:
+            if _scope_token is not None:
+                reset_secret_scope(_scope_token)
+            abort_fire_claim_execution(
+                job,
+                str(pre_run_error),
+                prefer_recovery=dispatch_outcome_ambiguous,
+            )
+            return False
+
+        # No fallible persistence or thread setup remains between this commit
+        # point and invoking the user workload.
+        finalize_fire_claim_setup(job)
+
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
         # its finally block; doing that before _deliver_result runs means the
@@ -7175,10 +7210,12 @@ def create_job_with_scheduler_registration(**kwargs) -> dict:
 
 # Dead-owner claim reclaim throttle (#86721): recover_interrupted_executions
 # opens the executions ledger, so the per-tick reap is rate-limited rather
-# than run on every idle 60s cycle. Tests may reset _last_dead_owner_reap_at
-# to None to force a reap on the next tick.
+# than run on every idle 60s cycle. The map is profile-local because a
+# multiplex gateway ticks several HERMES_HOME scopes in one process; a single
+# scalar lets the first profile suppress recovery for every later profile.
+# Tests may still replace this with None/a float for backward compatibility.
 _DEAD_OWNER_REAP_INTERVAL_SECONDS = 300.0
-_last_dead_owner_reap_at: Optional[float] = None
+_last_dead_owner_reap_at: dict[str, float] | Optional[float] = {}
 
 
 def tick(
@@ -7280,11 +7317,22 @@ def tick(
         # 60s ticks don't pay a ledger connection every cycle (#33612).
         global _last_dead_owner_reap_at
         _reap_now = time.monotonic()
+        _reap_key = str(_get_hermes_home().resolve())
+        if isinstance(_last_dead_owner_reap_at, dict):
+            _profile_last_reap_at = _last_dead_owner_reap_at.get(_reap_key)
+        else:
+            # Compatibility for tests/extensions that historically reset the
+            # scalar to None or an expired timestamp.
+            _profile_last_reap_at = _last_dead_owner_reap_at
         if (
-            _last_dead_owner_reap_at is None
-            or _reap_now - _last_dead_owner_reap_at >= _DEAD_OWNER_REAP_INTERVAL_SECONDS
+            _profile_last_reap_at is None
+            or _reap_now - _profile_last_reap_at
+            >= _DEAD_OWNER_REAP_INTERVAL_SECONDS
         ):
-            _last_dead_owner_reap_at = _reap_now
+            if isinstance(_last_dead_owner_reap_at, dict):
+                _last_dead_owner_reap_at[_reap_key] = _reap_now
+            else:
+                _last_dead_owner_reap_at = _reap_now
             try:
                 from cron.executions import recover_interrupted_executions
 
@@ -7342,18 +7390,6 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, the advance keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
-        # Batched: one load + one save for the whole due set, not one per job.
-        # Composes with the claim-time advance in claim_job_for_fire: for
-        # cron-kind jobs both compute the same next occurrence; interval jobs
-        # re-anchor from their own "now" at claim time (harmless for
-        # at-most-once — mark_job_run re-anchors at completion regardless).
-        advance_next_runs([job["id"] for job in due_jobs])
-
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
         _max_workers: Optional[int] = None
@@ -7381,6 +7417,48 @@ def tick(
                 _max_workers if _max_workers else "unbounded",
             )
 
+        def _clear_run_claim_best_effort(job: dict) -> None:
+            """Clear only the exact one-shot claim returned by this due scan."""
+            schedule = job.get("schedule")
+            if not (isinstance(schedule, dict) and schedule.get("kind") == "once"):
+                return
+            try:
+                run_claim = job.get("run_claim")
+                expected_owner = (
+                    str(run_claim.get("by"))
+                    if isinstance(run_claim, dict) and run_claim.get("by")
+                    else None
+                )
+                clear_run_claim(
+                    job["id"],
+                    expected_owner=expected_owner,
+                    expected_claim=(dict(run_claim) if isinstance(run_claim, dict) else None),
+                )
+            except Exception as claim_err:
+                logger.warning(
+                    "Could not clear run_claim for job '%s' after dispatch "
+                    "failure: %s (claim will expire at TTL)",
+                    job.get("name", job.get("id")),
+                    claim_err,
+                )
+
+        def _discard_provisional_best_effort(
+            execution_id: str, *, context: str
+        ) -> None:
+            try:
+                discard_unacquired_execution(execution_id)
+            except Exception:
+                # The process that created this provisional row is still
+                # alive, so lease-based recovery alone would ignore it.
+                # Preserve local cleanup intent before returning control.
+                remember_execution_recovery_intent(execution_id)
+                logger.exception(
+                    "Could not discard provisional execution %s after %s; "
+                    "marked for local reconciliation",
+                    execution_id,
+                    context,
+                )
+
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end. Thin wrapper around the shared
             module-level ``run_one_job`` so ``tick`` and external providers
@@ -7389,14 +7467,44 @@ def tick(
             # Acquire the durable claim only when this worker actually starts,
             # not while it may wait behind other work in an executor queue.
             # This prevents a queued lease from expiring before execution.
-            claimed = claim_job_for_fire(job["id"], return_job=True)
-            if not claimed:
-                finish_execution(
-                    job["execution_id"],
-                    success=False,
-                    error="Fire claim lost; execution was not started.",
+            try:
+                claimed = claim_job_for_fire(
+                    job["id"],
+                    return_job=True,
+                    execution_id=job["execution_id"],
                 )
+            except Exception:
+                # The execution row is provisional until the jobs-store CAS
+                # succeeds.  A transient jobs.json read/write failure must not
+                # leave a live-gateway-owned ``claimed`` row behind: recovery
+                # correctly treats that owner as alive, so repeated failures
+                # would otherwise accumulate until the process exits.
+                _discard_provisional_best_effort(
+                    job["execution_id"], context="fire-claim setup failed"
+                )
+                _clear_run_claim_best_effort(job)
+                raise
+            if not claimed:
+                _discard_provisional_best_effort(
+                    job["execution_id"], context="fire claim was not acquired"
+                )
+                _clear_run_claim_best_effort(job)
                 return True
+            if job.get("execution_fire_claim_pending") is True:
+                if isinstance(claimed, dict) and isinstance(
+                    claimed.get("_fire_claim_rollback"), dict
+                ):
+                    from cron.scheduler_provider import commit_fire_claim_execution
+
+                    commit_fire_claim_execution(claimed, job["execution_id"])
+                elif mark_fire_claim_acquired(job["execution_id"]) is None:
+                    # Compatibility for legacy/test overrides that return the
+                    # historical bool even with return_job=True. Production
+                    # jobs-store calls return the exact dict and take the
+                    # rollback-capable branch above.
+                    raise RuntimeError(
+                        "Fire claim won but execution ownership fence was not committed"
+                    )
             # Production CAS returns the exact persisted record with its unique
             # owner. Bool fallback keeps older test doubles/API overrides
             # compatible; real callers using return_job=True never take it.
@@ -7430,34 +7538,6 @@ def tick(
             """
             job_id = job["id"]
 
-            def _clear_run_claim_best_effort() -> None:
-                """Best-effort claim cleanup on the dispatch-failure paths.
-
-                Only one-shot jobs carry a ``run_claim`` (stamped by
-                get_due_jobs, #59229), so recurring jobs skip the call
-                entirely — clear_run_claim acquires _jobs_lock (blocking
-                cross-process flock) and does a full load_jobs read, and the
-                dispatch-failure paths fire exactly when the process can
-                least afford N pointless lock/read round-trips (interpreter
-                shutdown, EMFILE).  clear_run_claim itself does
-                load_jobs/save_jobs file I/O; on those degraded paths it can
-                raise, and these early-exits exist precisely to skip cleanly
-                — a stale claim expiring at the TTL is a better outcome than
-                crashing the tick (#86522).
-                """
-                _schedule = job.get("schedule")
-                if not (isinstance(_schedule, dict) and _schedule.get("kind") == "once"):
-                    return
-                try:
-                    clear_run_claim(job_id)
-                except Exception as claim_err:
-                    logger.warning(
-                        "Could not clear run_claim for job '%s' after dispatch "
-                        "failure: %s (claim will expire at TTL)",
-                        job.get("name", job_id),
-                        claim_err,
-                    )
-
             # A tick can race gateway teardown: once the interpreter is
             # finalizing, ``pool.submit`` raises "cannot schedule new futures
             # after interpreter shutdown" and crashes the tick. Skip cleanly —
@@ -7468,16 +7548,27 @@ def tick(
                     "Job '%s' not dispatched — interpreter is shutting down",
                     job.get("name", job_id),
                 )
-                _clear_run_claim_best_effort()
+                _clear_run_claim_best_effort(job)
                 return None
             if not try_register_running_job(job_id):
                 logger.info("Job '%s' already running — skipping", job.get("name", job_id))
+                _clear_run_claim_best_effort(job)
                 return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             try:
-                execution = create_execution(job_id, source="builtin")
-                dispatched_job = dict(job, execution_id=execution["id"])
+                execution = create_execution(
+                    job_id,
+                    source="builtin",
+                    fire_claim_acquired=False,
+                )
+                dispatched_job = dict(
+                    job,
+                    execution_id=execution["id"],
+                    execution_fire_claim_pending=(
+                        execution.get("fire_claim_acquired") == 0
+                    ),
+                )
                 _ctx = contextvars.copy_context()
             except Exception as execution_err:
                 # Init/creation failure between the claim and the submit —
@@ -7486,7 +7577,7 @@ def tick(
                 # audit requirement: every add is paired with guaranteed
                 # cleanup).
                 release_running_job(job_id)
-                _clear_run_claim_best_effort()
+                _clear_run_claim_best_effort(job)
                 logger.exception(
                     "Job '%s' not dispatched: execution creation failed: %s",
                     job.get("name", job_id),
@@ -7504,11 +7595,9 @@ def tick(
                 fut = pool.submit(_run_and_release)
             except Exception as submit_err:
                 release_running_job(job_id)
-                _clear_run_claim_best_effort()
-                finish_execution(
-                    execution["id"],
-                    success=False,
-                    error=f"Executor dispatch failed: {submit_err}",
+                _clear_run_claim_best_effort(job)
+                _discard_provisional_best_effort(
+                    execution["id"], context="executor submit failed"
                 )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.

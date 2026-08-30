@@ -20,9 +20,274 @@ selected via the `cron.provider` config key (empty = built-in).
 from __future__ import annotations
 
 import inspect
+import logging
 import threading
 from abc import ABC, abstractmethod
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
+
+
+class FireClaimNotAcquiredError(RuntimeError):
+    """Ledger/claim setup failed before this caller acquired fire ownership."""
+
+
+def abort_fire_claim_execution(
+    claimed_job: dict,
+    error: str,
+    *,
+    prefer_recovery: bool = False,
+) -> str:
+    """Close every pre-run abort without losing a consumed occurrence.
+
+    A clean jobs-store rollback is preferred before dispatch state changes.
+    When the rollback write fails, or a dispatch write had an ambiguous
+    outcome, the active ledger row is instead assigned to the normal durable
+    interrupted-recovery path. That path restores one-shot capacity and the
+    retry marker together, avoiding a partial cross-store rewind.
+    """
+    from cron.executions import finish_execution, release_execution_for_recovery
+    from cron.jobs import (
+        forget_pre_run_abort_execution,
+        rollback_fire_claim_setup,
+    )
+
+    job_id = str(claimed_job.get("id") or "")
+    execution_id = str(claimed_job.get("execution_id") or "")
+    rollback_errored = False
+    restored = False
+    if prefer_recovery:
+        try:
+            if execution_id:
+                release_execution_for_recovery(execution_id, error=error)
+        except Exception:
+            # release_execution_for_recovery records an in-process recovery
+            # witness before its fallible SQLite write. Keep the active row
+            # non-terminal if the jobs-store rollback also cannot commit.
+            logger.warning(
+                "Job '%s': failed to release its unstarted execution for "
+                "periodic recovery",
+                job_id,
+                exc_info=True,
+            )
+
+    if isinstance(claimed_job.get("_fire_claim_rollback"), dict):
+        try:
+            restored = rollback_fire_claim_setup(
+                claimed_job,
+                aborted_execution_id=execution_id or None,
+                allow_dispatched_oneshot=prefer_recovery,
+                fresh_retry_delay_seconds=claimed_job.get(
+                    "_aborted_fire_rearm_delay_seconds"
+                ),
+            )
+        except Exception:
+            rollback_errored = True
+            logger.warning(
+                "Job '%s': failed to restore fire claim after pre-run abort; "
+                "releasing the ledger witness to periodic recovery",
+                job_id,
+                exc_info=True,
+            )
+
+    if not prefer_recovery and rollback_errored:
+        try:
+            if execution_id and release_execution_for_recovery(
+                execution_id, error=error
+            ):
+                return "released"
+        except Exception:
+            logger.warning(
+                "Job '%s': failed to release its unstarted execution for "
+                "periodic recovery",
+                job_id,
+                exc_info=True,
+            )
+
+    # An ambiguous dispatch write is recoverable without waiting for the
+    # generic five-minute stale-owner sweep when the exact jobs-store inverse
+    # above succeeds. If it does not, retain the released/local-intent ledger
+    # witness: terminalizing it here would strand the still-owned fire claim.
+    if prefer_recovery and not restored:
+        return "released"
+
+    terminalization_confirmed = False
+    if execution_id:
+        last_terminalization_error: Exception | None = None
+        for _attempt in range(3):
+            try:
+                finish_execution(execution_id, success=False, error=error)
+                terminalization_confirmed = True
+                break
+            except Exception as exc:
+                last_terminalization_error = exc
+        if not terminalization_confirmed:
+            logger.warning(
+                "Job '%s': failed to close unstarted execution ledger row; "
+                "the durable pre-run-abort tombstone will retry it: %s",
+                job_id,
+                last_terminalization_error,
+            )
+        elif restored:
+            try:
+                forget_pre_run_abort_execution(job_id, execution_id)
+            except Exception:
+                # A leftover tombstone is safe and self-clearing: the periodic
+                # reconciler observes the already-terminal row and removes it.
+                logger.warning(
+                    "Job '%s': failed to clear terminalized pre-run-abort marker",
+                    job_id,
+                    exc_info=True,
+                )
+    if restored:
+        return "restored"
+    return "closed"
+
+
+def commit_fire_claim_execution(
+    claimed_job: dict, execution_id: str, *, attempts: int = 3
+) -> dict:
+    """Commit the execution fence or durably restore the consumed fire.
+
+    The execution update is idempotent, so ambiguous SQLite outcomes can be
+    retried safely.  If it still cannot be confirmed, the exact jobs-store CAS
+    is rolled back before the provisional ledger row is discarded.  Callers
+    therefore never return with a cadence or interrupted retry consumed but no
+    runnable execution behind it.
+    """
+    from cron.executions import (
+        discard_unacquired_execution,
+        mark_fire_claim_acquired,
+        remember_execution_recovery_intent,
+    )
+    from cron.jobs import rollback_fire_claim_setup
+
+    last_error: Exception | None = None
+    for _attempt in range(max(1, attempts)):
+        try:
+            record = mark_fire_claim_acquired(execution_id)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if record is not None:
+            # Keep the exact jobs-store rollback witness until run_one_job has
+            # validated the durable claim, started its renewal monitor, moved
+            # the ledger row to running, and committed finite dispatch state.
+            # A fenced row alone does not mean the job actually began.
+            return record
+        last_error = RuntimeError("execution row was not claimable")
+
+    try:
+        rolled_back = rollback_fire_claim_setup(claimed_job)
+    except Exception as exc:
+        # Both durable halves are still present but neither transition could
+        # be acknowledged. Mark this live process's provisional row for the
+        # ordinary fenced recovery pass; otherwise its healthy PID would keep
+        # the exact jobs-store winner stranded until process restart.
+        remember_execution_recovery_intent(execution_id)
+        raise FireClaimNotAcquiredError(
+            "Fire claim execution fence failed and its durable rollback also failed; "
+            "the jobs-store claim remains as a recovery witness"
+        ) from exc
+    if not rolled_back:
+        remember_execution_recovery_intent(execution_id)
+        raise FireClaimNotAcquiredError(
+            "Fire claim execution fence failed and the exact jobs-store claim "
+            "could not be rolled back; the persisted claim remains as a recovery witness"
+        ) from last_error
+
+    try:
+        discard_unacquired_execution(execution_id)
+    except Exception:
+        # The occurrence is already restored, but this process is still the
+        # recorded owner of the abandoned provisional row. Without a local
+        # recovery witness, reconciliation would defer to the healthy owner
+        # lease forever and repeated ledger outages could accumulate rows.
+        remember_execution_recovery_intent(execution_id)
+        logger.warning(
+            "Could not discard rolled-back provisional execution %s; "
+            "marked for local reconciliation",
+            execution_id,
+            exc_info=True,
+        )
+    raise FireClaimNotAcquiredError(
+        "Fire claim execution fence could not be committed; the occurrence was restored"
+    ) from last_error
+
+
+def claim_fire_with_execution(
+    job_id: str,
+    *,
+    source: str,
+    force: bool = False,
+    claim_ttl_seconds: int | None = None,
+) -> dict | None:
+    """Create the durable attempt before consuming a job fire claim.
+
+    Every dispatch surface must use this ordering. In particular, an
+    interrupted-retry marker may be cleared by the claim; creating the
+    replacement execution first ensures a crash immediately after the claim
+    still leaves a recoverable owner record rather than silently losing the
+    owed retry.
+    """
+    from cron.executions import (
+        create_execution,
+        discard_unacquired_execution,
+        remember_execution_recovery_intent,
+    )
+    from cron.jobs import claim_job_for_fire
+
+    def _discard_provisional_best_effort(*, context: str) -> None:
+        try:
+            discard_unacquired_execution(execution["id"])
+        except Exception:
+            # This process is still live, so lease recovery would otherwise
+            # ignore its deliberately abandoned provisional row indefinitely.
+            remember_execution_recovery_intent(execution["id"])
+            logger.exception(
+                "Could not discard provisional execution %s after %s; "
+                "marked for local reconciliation",
+                execution["id"],
+                context,
+            )
+
+    try:
+        execution = create_execution(
+            job_id, source=source, fire_claim_acquired=False
+        )
+    except Exception as exc:
+        raise FireClaimNotAcquiredError(
+            f"Could not create the durable execution record: {exc}"
+        ) from exc
+    try:
+        if claim_ttl_seconds is None:
+            claimed_job = claim_job_for_fire(
+                job_id,
+                return_job=True,
+                execution_id=execution["id"],
+                force=force,
+            )
+        else:
+            claimed_job = claim_job_for_fire(
+                job_id,
+                return_job=True,
+                execution_id=execution["id"],
+                force=force,
+                claim_ttl_seconds=claim_ttl_seconds,
+            )
+    except Exception as exc:
+        _discard_provisional_best_effort(context="fire-claim setup failed")
+        raise FireClaimNotAcquiredError(
+            f"Could not acquire the cron fire claim: {exc}"
+        ) from exc
+    if not isinstance(claimed_job, dict):
+        _discard_provisional_best_effort(context="fire claim was not acquired")
+        return None
+    if execution.get("fire_claim_acquired") == 0:
+        commit_fire_claim_execution(claimed_job, execution["id"])
+    claimed_job["execution_id"] = execution["id"]
+    return claimed_job
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail
 # with fd exhaustion (EMFILE/ENFILE, #87644).  Base is the tick interval
@@ -132,6 +397,15 @@ class CronScheduler(ABC):
         """
         return None
 
+    def rearm_aborted_claim(self, claimed_job: dict[str, Any]) -> None:
+        """Restore an external trigger after a claimed fire was not handed off.
+
+        The built-in provider re-reads the local store on its next tick. An
+        external scale-to-zero provider must override this hook because there
+        may be no future warm process to reconcile the restored occurrence.
+        """
+        return None
+
     def recover_interrupted(self) -> int:
         """Run profile-local attempt recovery for every provider lifecycle."""
         from cron.executions import recover_interrupted_executions
@@ -163,9 +437,10 @@ class CronScheduler(ABC):
         ``run_one_job`` body. Built-in never calls this (it has its own tick
         loop); an external provider routes its inbound fire here.
 
-        Returns True if THIS caller claimed and processed the attempt, even if
-        the job itself failed. Returns False only if the claim was lost
-        (another machine/retry won it) or the job no longer exists.
+        Returns True if THIS caller claimed the occurrence and the workload
+        started, even if the workload itself failed. Returns False if the
+        claim was lost, the job vanished, or pre-run setup aborted while
+        preserving the occurrence for retry.
         """
         claimed_job = self.claim_fire(job_id, force=force)
         if claimed_job is None:
@@ -179,31 +454,7 @@ class CronScheduler(ABC):
         external scheduler, then pass the exact owner-bearing snapshot to
         ``fire_claimed`` in tracked background work.
         """
-        from cron.executions import create_execution, finish_execution
-        from cron.jobs import claim_job_for_fire
-
-        execution = create_execution(job_id, source=self.name)
-        claim_kwargs = {"return_job": True}
-        if force:
-            claim_kwargs["force"] = True
-        try:
-            claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
-        except BaseException as exc:
-            finish_execution(
-                execution["id"],
-                success=False,
-                error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
-            )
-            raise
-        if not isinstance(claimed_job, dict):
-            finish_execution(
-                execution["id"],
-                success=False,
-                error="Fire claim was not acquired",
-            )
-            return None
-        claimed_job["execution_id"] = execution["id"]
-        return claimed_job
+        return claim_fire_with_execution(job_id, source=self.name, force=force)
 
     def fire_claimed(
         self,
@@ -222,13 +473,12 @@ class CronScheduler(ABC):
         """
         from cron.scheduler import run_one_job
 
-        run_one_job(
+        return run_one_job(
             claimed_job,
             adapters=adapters,
             loop=loop,
             cancel_event=cancel_event,
         )
-        return True
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):
@@ -370,6 +620,30 @@ def fire_overdue_jobs(
     if isinstance(provider, InProcessCronScheduler):
         return 0
 
+    # Chronos intentionally has no local tick loop, but a warm gateway still
+    # runs this housekeeping path every five minutes. Recover dead external
+    # owner processes here so an opted-in retry does not wait indefinitely for
+    # the gateway itself to restart. This is independent of misfire catch-up:
+    # operators may disable that grace-based feature without disabling crash
+    # recovery.
+    try:
+        recovered = provider.recover_interrupted()
+        if recovered:
+            logger.warning(
+                "Recovered %d interrupted external-provider execution(s)",
+                recovered,
+            )
+    except Exception as exc:
+        logger.warning("External-provider interrupted execution recovery failed: %s", exc)
+
+    # Reconcile every sweep. A previous recovery may have committed its local
+    # retry marker and then failed the remote call; the next sweep must still
+    # arm that durable retry even though there is no owner left to recover.
+    try:
+        provider.reconcile()
+    except Exception as exc:
+        logger.warning("External-provider reconciliation sweep failed: %s", exc)
+
     grace_minutes = _misfire_grace_minutes()
     if grace_minutes <= 0:
         return 0
@@ -410,13 +684,27 @@ def fire_overdue_jobs(
             claimed = provider.claim_fire(job_id)
             if claimed is None:
                 continue
-            threading.Thread(
+            worker = threading.Thread(
                 target=provider.fire_claimed,
                 args=(claimed,),
                 kwargs={"adapters": adapters, "loop": loop},
                 daemon=True,
                 name=f"cron-misfire-{job_id[:12]}",
-            ).start()
+            )
+            try:
+                worker.start()
+            except Exception as handoff_error:
+                # The durable occurrence was consumed before the background
+                # handoff. Restore that exact occurrence (or release its
+                # ledger witness to periodic recovery if rollback I/O is
+                # unavailable) so thread/resource exhaustion cannot silently
+                # lose an interrupted retry or ordinary scheduled fire.
+                abort_outcome = abort_fire_claim_execution(
+                    claimed, str(handoff_error)
+                )
+                if abort_outcome == "restored":
+                    provider.rearm_aborted_claim(claimed)
+                raise
             fired += 1
         except Exception as exc:
             logger.warning(
@@ -542,7 +830,15 @@ class InProcessCronScheduler(CronScheduler):
             return
 
         # ── Single-profile (legacy) path ──────────────────────────────────
-        recovered = self.recover_interrupted()
+        try:
+            recovered = self.recover_interrupted()
+        except Exception as exc:
+            recovered = 0
+            logger.error(
+                "Initial interrupted-execution recovery failed; continuing cron ticker: %s",
+                exc,
+                exc_info=True,
+            )
         if recovered:
             logger.warning(
                 "Marked %d interrupted cron execution(s) unknown after restart",
@@ -641,7 +937,17 @@ class InProcessCronScheduler(CronScheduler):
             home_token = set_hermes_home_override(str(home))
             try:
                 with use_cron_store(home):
-                    recovered = self.recover_interrupted()
+                    try:
+                        recovered = self.recover_interrupted()
+                    except Exception as exc:
+                        recovered = 0
+                        logger.error(
+                            "Initial interrupted-execution recovery failed for "
+                            "profile at %s; continuing multiplex ticker: %s",
+                            home,
+                            exc,
+                            exc_info=True,
+                        )
                     if recovered:
                         logger.warning(
                             "Marked %d interrupted cron execution(s) for profile at %s",

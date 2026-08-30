@@ -364,6 +364,7 @@ def test_builtin_inherits_hook_defaults():
 
 def test_fire_due_default_claims_then_runs(monkeypatch):
     """The default fire_due runs the exact owner-bearing CAS snapshot."""
+    import cron.executions as executions
     import cron.jobs as jobs
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
@@ -377,6 +378,7 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
         or {"id": jid, "name": "t", "fire_claim": {"by": "exact-owner"}},
         raising=False,
     )
+    monkeypatch.setattr(executions, "create_execution", lambda *_a, **_kw: {"id": "exec-1"})
     monkeypatch.setattr(
         sched,
         "run_one_job",
@@ -384,8 +386,35 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     )
 
     assert InProcessCronScheduler().fire_due("j1") is True
-    assert claims == [("j1", {"return_job": True})]
+    assert claims == [
+        ("j1", {"return_job": True, "execution_id": "exec-1", "force": False})
+    ]
     assert ran == [("j1", "exact-owner")]
+
+
+def test_fire_due_propagates_pre_run_abort(monkeypatch):
+    """A claimed occurrence is not reported as fired unless its body starts."""
+    import cron.executions as executions
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    monkeypatch.setattr(
+        jobs,
+        "claim_job_for_fire",
+        lambda jid, **kw: {
+            "id": jid,
+            "name": "t",
+            "fire_claim": {"by": "exact-owner"},
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        executions, "create_execution", lambda *_a, **_kw: {"id": "exec-1"}
+    )
+    monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: False)
+
+    assert InProcessCronScheduler().fire_due("j1") is False
 
 
 def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
@@ -404,7 +433,7 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
     monkeypatch.setattr(
         executions,
         "create_execution",
-        lambda jid, source: events.append("ledger") or {"id": "exec-1"},
+        lambda jid, source, **_kwargs: events.append("ledger") or {"id": "exec-1"},
     )
     monkeypatch.setattr(
         sched,
@@ -423,6 +452,7 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
 
 
 def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
+    import cron.executions as executions
     import cron.jobs as jobs
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
@@ -434,20 +464,34 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
         lambda jid, **kw: claims.append((jid, kw))
         or {"id": jid, "name": "t", "fire_claim": {"by": "manual-owner"}},
     )
+    monkeypatch.setattr(executions, "create_execution", lambda *_a, **_kw: {"id": "exec-1"})
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: True)
 
     assert InProcessCronScheduler().fire_due("j1", force=True) is True
-    assert claims == [("j1", {"force": True, "return_job": True})]
+    assert claims == [
+        (
+            "j1",
+            {"force": True, "return_job": True, "execution_id": "exec-1"},
+        )
+    ]
 
 
 def test_fire_due_lost_claim_does_not_run(monkeypatch):
     """If the CAS claim is lost (another machine/retry won), fire_due returns
     False and never runs the job."""
+    import cron.executions as executions
     import cron.jobs as jobs
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
+    discarded = []
+    monkeypatch.setattr(executions, "create_execution", lambda *_a, **_kw: {"id": "exec-lost"})
+    monkeypatch.setattr(
+        executions,
+        "discard_unacquired_execution",
+        lambda execution_id: discarded.append(execution_id) or True,
+    )
     monkeypatch.setattr(
         jobs,
         "claim_job_for_fire",
@@ -458,15 +502,24 @@ def test_fire_due_lost_claim_does_not_run(monkeypatch):
 
     assert InProcessCronScheduler().fire_due("j1") is False
     assert ran == []
+    assert discarded == ["exec-lost"]
 
 
 def test_fire_due_missing_job_does_not_run(monkeypatch):
     """If the job vanished before atomic claim, fire_due does not run it."""
+    import cron.executions as executions
     import cron.jobs as jobs
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
+    discarded = []
+    monkeypatch.setattr(executions, "create_execution", lambda *_a, **_kw: {"id": "exec-gone"})
+    monkeypatch.setattr(
+        executions,
+        "discard_unacquired_execution",
+        lambda execution_id: discarded.append(execution_id) or True,
+    )
     monkeypatch.setattr(
         jobs,
         "claim_job_for_fire",
@@ -477,6 +530,7 @@ def test_fire_due_missing_job_does_not_run(monkeypatch):
 
     assert InProcessCronScheduler().fire_due("gone") is False
     assert ran == []
+    assert discarded == ["exec-gone"]
 
 
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──
@@ -640,3 +694,60 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_single_profile_recovery_failure_does_not_stop_ticker(monkeypatch):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    stop = threading.Event()
+    ticks = []
+    heartbeats = []
+    provider = InProcessCronScheduler()
+    monkeypatch.setattr(
+        provider,
+        "recover_interrupted",
+        lambda: (_ for _ in ()).throw(OSError("ledger locked")),
+    )
+
+    def tick_once(*_args, **_kwargs):
+        ticks.append(1)
+        stop.set()
+
+    with patch("cron.scheduler.tick", side_effect=tick_once), patch(
+        "cron.jobs.record_ticker_heartbeat",
+        lambda **kwargs: heartbeats.append(kwargs),
+    ):
+        provider.start(stop, interval=0)
+
+    assert ticks == [1]
+    assert heartbeats
+
+
+def test_multiplex_recovery_failure_is_isolated_per_profile(tmp_path, monkeypatch):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    profiles = [("broken", tmp_path / "broken"), ("healthy", tmp_path / "healthy")]
+    for _, home in profiles:
+        (home / "cron").mkdir(parents=True)
+    stop = threading.Event()
+    recovery_calls = []
+    tick_calls = []
+    provider = InProcessCronScheduler()
+
+    def recover():
+        recovery_calls.append(1)
+        if len(recovery_calls) == 1:
+            raise OSError("broken profile ledger")
+        return 0
+
+    def tick(*_args, **_kwargs):
+        tick_calls.append(1)
+        if len(tick_calls) == len(profiles):
+            stop.set()
+
+    monkeypatch.setattr(provider, "recover_interrupted", recover)
+    with patch("cron.scheduler.tick", side_effect=tick), patch(
+        "cron.jobs.record_ticker_heartbeat", lambda **_kwargs: None
+    ):
+        provider.start(stop, interval=0, profile_homes=profiles)
+
+    assert len(recovery_calls) == len(profiles)
+    assert len(tick_calls) == len(profiles)

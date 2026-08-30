@@ -26,6 +26,60 @@ _JOB = {"id": "job-run-1", "name": "manual run", "prompt": "hi",
 
 
 class TestCronjobRunExecutesImmediately:
+    def test_direct_claim_compatibility_keeps_default_bool_contract(self):
+        from tools.cronjob_tools import claim_job_for_fire
+
+        with patch(
+            "tools.cronjob_tools._claim_job_for_fire",
+            return_value=True,
+        ) as m_claim:
+            assert claim_job_for_fire("job-run-1") is True
+        m_claim.assert_called_once_with("job-run-1", force=False)
+
+    def test_direct_claim_compatibility_forwards_force(self):
+        from tools.cronjob_tools import claim_job_for_fire
+
+        claimed = {**_JOB, "execution_id": "exec-force"}
+        with patch(
+            "tools.cronjob_tools.claim_fire_with_execution",
+            return_value=claimed,
+        ) as m_claim:
+            assert claim_job_for_fire(
+                "job-run-1", return_job=True, force=True
+            ) is claimed
+        m_claim.assert_called_once_with(
+            "job-run-1", source="direct", force=True
+        )
+
+    def test_direct_claim_compatibility_forwards_claim_ttl(self):
+        from tools.cronjob_tools import claim_job_for_fire
+
+        with patch(
+            "tools.cronjob_tools._claim_job_for_fire",
+            return_value=True,
+        ) as m_claim:
+            assert claim_job_for_fire(
+                "job-run-1", claim_ttl_seconds=0
+            ) is True
+        m_claim.assert_called_once_with(
+            "job-run-1", force=False, claim_ttl_seconds=0
+        )
+
+        claimed = {**_JOB, "execution_id": "exec-ttl"}
+        with patch(
+            "tools.cronjob_tools.claim_fire_with_execution",
+            return_value=claimed,
+        ) as m_claim:
+            assert claim_job_for_fire(
+                "job-run-1", return_job=True, claim_ttl_seconds=0
+            ) is claimed
+        m_claim.assert_called_once_with(
+            "job-run-1",
+            source="direct",
+            force=False,
+            claim_ttl_seconds=0,
+        )
+
     def test_run_action_claims_and_fires_via_run_one_job(self):
         """action='run' must claim the job then fire it through run_one_job."""
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}
@@ -113,6 +167,26 @@ class TestCronjobRunExecutesImmediately:
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is False
         assert out["job"]["execution_error"] == "provider 500"
+
+    def test_run_reports_pre_run_abort_despite_stale_success_status(self):
+        """A restored occurrence cannot inherit an earlier successful status."""
+        stale = {"id": "job-run-1", "last_status": "ok", "last_error": None}
+        claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
+        with patch(
+            "tools.cronjob_tools.claim_job_for_fire", return_value=claimed
+        ), patch(
+            "cron.scheduler.run_one_job", return_value=False
+        ), patch(
+            "tools.cronjob_tools.get_job", return_value=stale
+        ):
+            result = _execute_job_now(dict(_JOB))
+
+        assert result["claimed"] is True
+        assert result["success"] is False
+        assert result["error"] == (
+            "Execution aborted before the workload started; the scheduled "
+            "occurrence was preserved for retry."
+        )
 
     def test_execute_job_now_bails_without_claim(self):
         """_execute_job_now never calls run_one_job when the claim is lost."""
@@ -226,6 +300,38 @@ class TestCronjobRunExecutesImmediately:
             assert res["success"] is True
             m_run.assert_called_once()
             m_thread.assert_not_called()   # heartbeat thread truly never created
+        finally:
+            set_activity_callback(None)
+
+    def test_activity_heartbeat_start_failure_restores_claimed_job(self):
+        """A manual pre-run thread failure must not consume an owed retry."""
+        claimed = {
+            **_JOB,
+            "execution_id": "exec-heartbeat-start",
+            "fire_claim": {"by": "manual-owner"},
+            "_fire_claim_rollback": {"interrupted_retry": {}},
+        }
+        set_activity_callback(lambda _description: None)
+        try:
+            with patch(
+                "tools.cronjob_tools.claim_job_for_fire", return_value=claimed
+            ), patch(
+                "tools.cronjob_tools.threading.Thread.start",
+                side_effect=RuntimeError("thread unavailable"),
+            ), patch(
+                "cron.scheduler_provider.abort_fire_claim_execution"
+            ) as m_abort, patch(
+                "tools.cronjob_tools.mark_job_run"
+            ) as m_mark, patch(
+                "cron.scheduler.run_one_job"
+            ) as m_run:
+                result = _execute_job_now(dict(_JOB))
+
+            assert result["success"] is False
+            assert "thread unavailable" in result["error"]
+            m_abort.assert_called_once_with(claimed, "thread unavailable")
+            m_mark.assert_not_called()
+            m_run.assert_not_called()
         finally:
             set_activity_callback(None)
 

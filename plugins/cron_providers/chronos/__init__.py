@@ -136,6 +136,26 @@ class ChronosCronScheduler(CronScheduler):
         """
         self._arm_one_shot(job)
 
+    def rearm_aborted_claim(self, claimed_job: Dict[str, Any]) -> None:
+        """Provision the fresh occurrence persisted by abort rollback.
+
+        A failed local thread handoff happens after the NAS one-shot has been
+        consumed. Waiting for ordinary reconciliation would strand a
+        scale-to-zero deployment, so this hook must raise if the replacement
+        cannot be registered and let the housekeeping failure stay visible.
+        """
+        from cron.jobs import get_job
+
+        job = get_job(str(claimed_job.get("id") or ""))
+        if (
+            job
+            and job.get("enabled")
+            and job.get("state") != "paused"
+            and job.get("next_run_at")
+            and not job.get("fire_claim")
+        ):
+            self._arm_one_shot(job)
+
     # -- arming -----------------------------------------------------------
 
     def _arm_one_shot(self, job: Dict[str, Any]) -> None:
@@ -225,6 +245,17 @@ class ChronosCronScheduler(CronScheduler):
 
     # -- fire -------------------------------------------------------------
 
+    def claim_fire(self, job_id: str, *, force: bool = False) -> dict | None:
+        """Tag the claim so a pre-run rollback assigns a fresh NAS key atomically."""
+        from cron.jobs import ABORTED_FIRE_RETRY_DELAY_SECONDS
+
+        claimed = super().claim_fire(job_id, force=force)
+        if isinstance(claimed, dict):
+            claimed["_aborted_fire_rearm_delay_seconds"] = (
+                ABORTED_FIRE_RETRY_DELAY_SECONDS
+            )
+        return claimed
+
     # NOTE: no ``fire_due`` override on purpose. The base implementation
     # virtually dispatches through ``self.claim_fire``/``self.fire_claimed``,
     # and ``provider_supports_split_fire`` treats ANY ``fire_due`` override
@@ -241,20 +272,61 @@ class ChronosCronScheduler(CronScheduler):
         cancel_event: Any = None,
     ) -> bool:
         job_id = claimed_job["id"]
+        rollback = claimed_job.get("_fire_claim_rollback")
+        next_run_snapshot = (
+            rollback.get("next_run_at") if isinstance(rollback, dict) else None
+        )
+        restored_fire_at = (
+            str(next_run_snapshot.get("value"))
+            if isinstance(next_run_snapshot, dict)
+            and next_run_snapshot.get("present")
+            and next_run_snapshot.get("value")
+            else None
+        )
         ran = super().fire_claimed(
             claimed_job,
             adapters=adapters,
             loop=loop,
             cancel_event=cancel_event,
         )
-        if ran:
-            from cron.jobs import get_job
-            job = get_job(job_id)
-            if job and job.get("enabled") and job.get("next_run_at"):
-                try:
-                    self._arm_one_shot(job)
-                except Exception as e:
-                    logger.warning("Chronos failed to re-arm job %s after fire: %s", job_id, e)
+        # A clean pre-run rollback restores the timestamp whose NAS one-shot
+        # just fired. Re-provisioning that same (job, timestamp) dedup key is a
+        # no-op, so first move the exact restored occurrence to a fresh future
+        # instant. The compare-and-set preserves a newer owner/operator edit.
+        from cron.jobs import get_job, rearm_aborted_fire
+
+        if not ran and restored_fire_at:
+            try:
+                current = get_job(job_id)
+                if (
+                    current
+                    and not current.get("fire_claim")
+                    and current.get("next_run_at") == restored_fire_at
+                    and not rearm_aborted_fire(
+                        job_id, expected_next_run_at=restored_fire_at
+                    )
+                ):
+                    logger.error(
+                        "Chronos could not persist a fresh retry for restored "
+                        "job %s",
+                        job_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Chronos failed to persist a fresh retry for job %s: %s",
+                    job_id,
+                    e,
+                )
+
+        # Re-arm the persisted desired occurrence after either completion or
+        # abort. Keep returning ``ran`` so the transport never acknowledges an
+        # aborted dispatch as started.
+        job = get_job(job_id)
+        if job and job.get("enabled") and job.get("next_run_at"):
+            try:
+                self._arm_one_shot(job)
+            except Exception as e:
+                logger.warning("Chronos failed to re-arm job %s after fire: %s", job_id, e)
         return ran
 
 

@@ -384,7 +384,7 @@ def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", _heartbeat)
     monkeypatch.setattr(scheduler, "run_job", _run_job)
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda job_id: True)
-    monkeypatch.setattr(scheduler, "mark_execution_running", lambda execution_id: None)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda execution_id: True)
     monkeypatch.setattr(scheduler, "finish_execution", lambda *args, **kwargs: None)
     save_output = MagicMock()
     deliver_result = MagicMock()
@@ -416,9 +416,9 @@ def test_initially_lost_fire_claim_finishes_execution_without_running(monkeypatc
     }
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: False)
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
-    monkeypatch.setattr(scheduler, "finish_execution", finish)
+    monkeypatch.setattr("cron.executions.finish_execution", finish)
 
-    assert scheduler.run_one_job(job) is True
+    assert scheduler.run_one_job(job) is False
 
     run_body.assert_not_called()
     finish.assert_called_once_with(
@@ -446,7 +446,7 @@ def test_initially_lost_claim_does_not_run_when_ledger_write_fails(monkeypatch):
         MagicMock(side_effect=OSError("ledger unavailable")),
     )
 
-    assert scheduler.run_one_job(job) is True
+    assert scheduler.run_one_job(job) is False
     run_body.assert_not_called()
 
 
@@ -467,9 +467,9 @@ def test_initial_heartbeat_exception_does_not_start_execution(monkeypatch):
         MagicMock(side_effect=OSError("store unavailable")),
     )
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
-    monkeypatch.setattr(scheduler, "finish_execution", finish)
+    monkeypatch.setattr("cron.executions.finish_execution", finish)
 
-    assert scheduler.run_one_job(job) is True
+    assert scheduler.run_one_job(job) is False
 
     run_body.assert_not_called()
     finish.assert_called_once_with(
@@ -492,14 +492,14 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
     }
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: True)
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
-    monkeypatch.setattr(scheduler, "finish_execution", finish)
+    monkeypatch.setattr("cron.executions.finish_execution", finish)
     monkeypatch.setattr(
         scheduler.threading.Thread,
         "start",
         MagicMock(side_effect=RuntimeError("cannot start thread")),
     )
 
-    assert scheduler.run_one_job(job) is True
+    assert scheduler.run_one_job(job) is False
 
     run_body.assert_not_called()
     finish.assert_called_once_with(
@@ -539,6 +539,44 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     assert calls >= 3
 
 
+def test_ledger_heartbeat_error_cannot_cancel_renewed_fire_claim(monkeypatch):
+    """Audit-ledger failure is isolated from the authoritative jobs-store lease."""
+    import cron.scheduler as scheduler
+
+    renewed = threading.Event()
+    fire_calls = 0
+
+    def heartbeat_fire(*_args, **_kwargs):
+        nonlocal fire_calls
+        fire_calls += 1
+        if fire_calls >= 2:
+            renewed.set()
+        return True
+
+    def run_body(_job, **kwargs):
+        assert renewed.wait(timeout=0.5)
+        assert kwargs["fire_claim_lost"].is_set() is False
+        return True
+
+    job = {
+        "id": "ledger-heartbeat-error",
+        "execution_id": "ledger-heartbeat-execution",
+        "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
+    }
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", heartbeat_fire)
+    monkeypatch.setattr(
+        scheduler,
+        "heartbeat_execution",
+        MagicMock(side_effect=OSError("ledger unavailable")),
+    )
+    monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.02)
+
+    assert scheduler.run_one_job(job) is True
+    assert fire_calls >= 2
+
+
 def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
     """A replacement owner cannot leave the stale ledger recorded as success."""
     import cron.scheduler as scheduler
@@ -556,7 +594,11 @@ def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
     finish = MagicMock()
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: True)
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(scheduler, "mark_execution_running", lambda *_args: None)
+    monkeypatch.setattr(
+        scheduler,
+        "mark_execution_running",
+        lambda execution_id: {"id": execution_id, "status": "running"},
+    )
     monkeypatch.setattr(
         scheduler,
         "run_job",

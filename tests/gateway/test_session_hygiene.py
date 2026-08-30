@@ -516,7 +516,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
             self, messages, *_args, commit_fence=None, **_kwargs
         ):
             worker_started.set()
-            assert release_worker.wait(timeout=2)
+            release_worker.wait()
             if commit_fence is not None and not commit_fence.begin_commit():
                 return (messages, None)
             try:
@@ -600,31 +600,37 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
         message_id="1",
     )
 
-    started = time.monotonic()
-    result = await runner._handle_message(event)
-    elapsed = time.monotonic() - started
+    handler_task = asyncio.create_task(runner._handle_message(event))
+    try:
+        # Causal assertion: the live turn must finish while the compression
+        # worker is still blocked. A generous timeout is only a deadlock guard,
+        # not the correctness oracle, so busy CI cannot turn scheduler latency
+        # into a false failure.
+        result = await asyncio.wait_for(asyncio.shield(handler_task), timeout=10)
+        assert result == "ok"
+        assert worker_started.is_set()
+        assert not release_worker.is_set()
+        assert runner._run_agent.await_count == 1
+        # Cooldown must be persisted to the state DB (survives restart, #74136),
+        # not stashed in an in-memory dict.
+        assert fake_db.record_compression_failure_cooldown.called
+        _cd_args = fake_db.record_compression_failure_cooldown.call_args[0]
+        assert _cd_args[0] == "sess-timeout"
+        assert _cd_args[1] > time.time()
+        timeout_warnings = [
+            sent
+            for sent in adapter.sent
+            if "Context compression timed out" in sent["content"]
+        ]
+        assert len(timeout_warnings) == 1
+        fake_db.archive_and_compact.assert_not_called()
+        SlowCompressAgent.last_instance.close.assert_not_called()
+    finally:
+        release_worker.set()
+        if not handler_task.done():
+            await asyncio.gather(handler_task, return_exceptions=True)
 
-    assert result == "ok"
-    # Loose wall-clock bound per flake policy: this asserts the handler did
-    # NOT block on the hygiene-compression timeout path (which would take
-    # multiple seconds), not a precise latency. 0.15s missed by ~1-8ms on
-    # busy CI shards twice on 2026-07-23.
-    assert elapsed < 2.0
-    assert worker_started.is_set()
-    assert runner._run_agent.await_count == 1
-    # Cooldown must be persisted to the state DB (survives restart, #74136),
-    # not stashed in an in-memory dict.
-    assert fake_db.record_compression_failure_cooldown.called
-    _cd_args = fake_db.record_compression_failure_cooldown.call_args[0]
-    assert _cd_args[0] == "sess-timeout"
-    assert _cd_args[1] > time.time()
-    timeout_warnings = [s for s in adapter.sent if "Context compression timed out" in s["content"]]
-    assert len(timeout_warnings) == 1
-    fake_db.archive_and_compact.assert_not_called()
-    SlowCompressAgent.last_instance.close.assert_not_called()
-
-    release_worker.set()
-    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
+    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=10)
 
     # The late worker observed cancellation at the commit fence, so it never
     # mutated the live session after the new turn began. Cleanup still ran once

@@ -101,6 +101,7 @@ class TestRunningJobGuard:
         }
         submitted = []
         claim_calls = []
+        acquired = []
 
         class DeferredPool:
             def submit(self, callback):
@@ -113,7 +114,15 @@ class TestRunningJobGuard:
         monkeypatch.setattr(
             sched,
             "create_execution",
-            lambda *_a, **_kw: {"id": "execution-1"},
+            lambda *_a, **_kw: {
+                "id": "execution-1",
+                "fire_claim_acquired": 0,
+            },
+        )
+        monkeypatch.setattr(
+            sched,
+            "mark_fire_claim_acquired",
+            lambda execution_id: acquired.append(execution_id) or {"id": execution_id},
         )
         monkeypatch.setattr(
             sched,
@@ -131,7 +140,13 @@ class TestRunningJobGuard:
         result = callback()
         future.set_result(result)
 
-        assert claim_calls == [("queued-job", {"return_job": True})]
+        assert claim_calls == [
+            (
+                "queued-job",
+                {"return_job": True, "execution_id": "execution-1"},
+            )
+        ]
+        assert acquired == ["execution-1"]
         assert "queued-job" not in sched._running_job_ids
 
 
@@ -164,13 +179,12 @@ class TestRunningJobGuard:
 
         called = []
 
-        def create_execution_side_effect(job_id, source):
+        def create_execution_side_effect(job_id, source, **_kwargs):
             if job_id == "failing-job":
                 raise RuntimeError("execution ledger unavailable")
             return {"id": f"{job_id}-execution"}
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [failing_job, healthy_job])
-        monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: 0)
         monkeypatch.setattr(sched, "create_execution", create_execution_side_effect)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: called.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
@@ -187,7 +201,11 @@ class TestRunningJobGuard:
             if job_id == "healthy-job"
             else None,
         )
-        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: None)
+        monkeypatch.setattr(
+            sched,
+            "mark_execution_running",
+            lambda execution_id: {"id": execution_id, "status": "running"},
+        )
         monkeypatch.setattr(sched, "heartbeat_fire_claim", lambda *_a, **_kw: True)
 
         n = sched.tick(verbose=False)
@@ -377,13 +395,10 @@ class TestSequentialPool:
         assert sched._sequential_pool is None
 
 
-class TestTickBatchAdvance:
-    """The tick's pre-dispatch advance must go through advance_next_runs
-    exactly once with the whole due set — a revert to the per-job loop
-    (or back to advance_next_run) must fail this test, not slip past the
-    helper-level I/O pin."""
+class TestTickDurableAdvance:
+    """Cadence moves only after the execution row and fire CAS both exist."""
 
-    def test_tick_calls_advance_next_runs_once_with_all_due_ids(self, tmp_path, monkeypatch):
+    def test_tick_does_not_advance_due_jobs_before_durable_claim(self, tmp_path, monkeypatch):
         import cron.scheduler as sched
 
         sched._parallel_pool = None
@@ -397,11 +412,7 @@ class TestTickBatchAdvance:
             for i in range(4)
         ]
 
-        advance_calls = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
-        monkeypatch.setattr(
-            sched, "advance_next_runs",
-            lambda ids: advance_calls.append(list(ids)) or len(list(ids)))
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -410,7 +421,5 @@ class TestTickBatchAdvance:
         n = sched.tick(verbose=False)
 
         assert n == 4
-        assert advance_calls == [["job-0", "job-1", "job-2", "job-3"]], (
-            f"tick must batch-advance the due set in ONE call; got {advance_calls}")
 
         sched._shutdown_parallel_pool()

@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -22,6 +23,9 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
 
     claimed = executions.create_execution("job-1", source="builtin")
     assert claimed["status"] == "claimed"
+    assert claimed["machine_id"] == executions._machine_id()
+    assert claimed["boot_id"] == executions._boot_id()
+    assert claimed["pid_namespace"] == executions._pid_namespace_id()
     assert claimed["claimed_at"]
     assert claimed["started_at"] is None
     assert claimed["finished_at"] is None
@@ -55,6 +59,77 @@ def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path
     assert executions.list_executions() == [default_row]
     assert (tmp_path / "default" / "cron" / "executions.db").is_file()
     assert (tmp_path / "worker" / "cron" / "executions.db").is_file()
+
+
+def test_discard_unacquired_execution_removes_only_claimed_attempt(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    unacquired = executions.create_execution(
+        "lost-race", source="external", fire_claim_acquired=False
+    )
+    running = executions.create_execution("running", source="external")
+    executions.mark_execution_running(running["id"])
+
+    assert executions.discard_unacquired_execution(unacquired["id"]) is True
+    assert executions.discard_unacquired_execution(running["id"]) is False
+    assert executions.latest_execution("lost-race") is None
+    assert executions.latest_execution("running")["status"] == "running"
+
+
+def test_provisional_execution_emits_claimed_only_after_fire_fence(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    emitted = []
+    monkeypatch.setattr(
+        executions,
+        "_emit_execution_state",
+        lambda record, **_kwargs: emitted.append(dict(record)),
+    )
+
+    provisional = executions.create_execution(
+        "external-job", source="external", fire_claim_acquired=False
+    )
+    assert emitted == []
+
+    assert executions.mark_fire_claim_acquired(provisional["id"]) is not None
+    assert [record["status"] for record in emitted] == ["claimed"]
+
+    # Fence confirmation is idempotent and must not duplicate lifecycle
+    # telemetry for retries that only re-read the committed winner.
+    assert executions.mark_fire_claim_acquired(provisional["id"]) is not None
+    assert [record["status"] for record in emitted] == ["claimed"]
+
+
+def test_foreign_lease_observations_are_globally_bounded_and_active_only(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "_MAX_FOREIGN_LEASE_OBSERVATIONS", 2)
+    active = [
+        executions.create_execution(f"active-{index}", source="external")
+        for index in range(3)
+    ]
+    with executions._transaction() as conn:
+        conn.executemany(
+            """INSERT INTO foreign_lease_observations
+               (execution_id, observer_boot_id, generation, observed_monotonic)
+               VALUES (?, ?, ?, ?)""",
+            [
+                (record["id"], f"old-boot-{index}", "generation", float(index))
+                for index, record in enumerate(active)
+            ]
+            + [("missing-execution", "old-boot-missing", "generation", 99.0)],
+        )
+        executions._prune_foreign_lease_observations_unlocked(conn)
+        rows = conn.execute(
+            "SELECT execution_id, observer_boot_id FROM foreign_lease_observations"
+        ).fetchall()
+
+    assert len(rows) == 2
+    assert {row["execution_id"] for row in rows} <= {
+        record["id"] for record in active
+    }
+    assert len({row["observer_boot_id"] for row in rows}) == 2
 
 
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
@@ -132,6 +207,345 @@ def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_
     assert executions.latest_execution("still-live")["status"] == "running"
 
 
+def test_recovery_checks_pid_only_for_same_machine(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    local = executions.create_execution("local-dead", source="builtin")
+    remote = executions.create_execution("remote-live", source="builtin")
+    legacy = executions.create_execution("legacy-unknown", source="builtin")
+    for record in (local, remote, legacy):
+        executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET process_id='previous-process', machine_id='node-a' "
+            "WHERE id=?",
+            (local["id"],),
+        )
+        conn.execute(
+            "UPDATE executions SET process_id='remote-process', machine_id='node-b' "
+            "WHERE id=?",
+            (remote["id"],),
+        )
+        conn.execute(
+            "UPDATE executions SET process_id='legacy-process', machine_id=NULL "
+            "WHERE id=?",
+            (legacy["id"],),
+        )
+    monkeypatch.setattr(executions, "_machine_id", lambda: "node-a")
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_args: False)
+
+    candidates = executions.interrupted_execution_candidates()
+
+    assert [row["id"] for row in candidates] == [local["id"]]
+    assert executions.latest_execution("remote-live")["status"] == "running"
+    assert executions.latest_execution("legacy-unknown")["status"] == "running"
+
+
+def test_unverifiable_local_pid_identity_falls_back_to_distributed_lease(
+    monkeypatch, tmp_path
+):
+    import gateway.status as gateway_status
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    rows = []
+    for index, started_at in enumerate((None, 12345)):
+        record = executions.create_execution(
+            f"ambiguous-live-{index}", source="builtin"
+        )
+        executions.mark_execution_running(record["id"])
+        with executions._transaction() as conn:
+            conn.execute(
+                """UPDATE executions SET process_id='other-live-process',
+                   pid=?, process_started_at=? WHERE id=?""",
+                (424242 + index, started_at, record["id"]),
+            )
+        rows.append(record)
+
+    monkeypatch.setattr(gateway_status, "_pid_exists", lambda _pid: True)
+    monkeypatch.setattr(executions, "_process_start_time", lambda _pid: None)
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [])
+
+    assert executions._owner_is_live(424242, None) is None
+    assert executions._owner_is_live(424243, 12345) is None
+    # The first observation starts a monotonic distributed lease instead of
+    # treating an unreadable/missing start-time fingerprint as proof of death.
+    assert executions.interrupted_execution_candidates() == []
+    assert all(
+        executions.latest_execution(row["job_id"])["status"] == "running"
+        for row in rows
+    )
+
+
+def test_foreign_owner_is_recovered_only_after_distributed_lease_expires(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+    monotonic_now = [1000.0]
+    monkeypatch.setattr(executions, "_hermes_now", lambda: now)
+    monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
+    record = executions.create_execution("remote-owner", source="external")
+    executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            """UPDATE executions SET process_id='remote-process',
+               machine_id='remote-host', heartbeat_at=? WHERE id=?""",
+            (now.isoformat(), record["id"]),
+        )
+    monkeypatch.setattr(executions, "_machine_id", lambda: "local-host")
+
+    assert executions.interrupted_execution_candidates() == []
+    # Remote wall time is deliberately far behind. It remains live because
+    # expiry is measured from this observer's unchanged generation, not by
+    # subtracting clocks from different hosts.
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET heartbeat_at=? WHERE id=?",
+            (
+                (now - timedelta(seconds=executions.EXECUTION_OWNER_LEASE_SECONDS + 1)).isoformat(),
+                record["id"],
+            ),
+        )
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS - 1
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += 2
+    assert [row["id"] for row in executions.interrupted_execution_candidates()] == [record["id"]]
+
+
+def test_same_machine_different_pid_namespace_uses_distributed_lease(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monotonic_now = [700.0]
+    monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
+    record = executions.create_execution("container-owner", source="builtin")
+    executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            """UPDATE executions SET process_id='other-process',
+               pid_namespace='other-pid-namespace' WHERE id=?""",
+            (record["id"],),
+        )
+    local_pid_checks = []
+    monkeypatch.setattr(
+        executions,
+        "_owner_is_live",
+        lambda *_args: local_pid_checks.append(True) or True,
+    )
+
+    assert executions.interrupted_execution_candidates() == []
+    assert local_pid_checks == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS + 1
+    assert [row["id"] for row in executions.interrupted_execution_candidates()] == [
+        record["id"]
+    ]
+    assert local_pid_checks == []
+
+
+def test_same_machine_and_namespace_different_boot_uses_distributed_lease(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monotonic_now = [900.0]
+    monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
+    record = executions.create_execution("other-host-boot", source="builtin")
+    executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            """UPDATE executions SET process_id='other-process',
+               boot_id='other-host-boot-id' WHERE id=?""",
+            (record["id"],),
+        )
+    local_pid_checks = []
+    monkeypatch.setattr(
+        executions,
+        "_owner_is_live",
+        lambda *_args: local_pid_checks.append(True) or True,
+    )
+
+    assert executions.interrupted_execution_candidates() == []
+    assert local_pid_checks == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS + 1
+    assert [row["id"] for row in executions.interrupted_execution_candidates()] == [
+        record["id"]
+    ]
+    assert local_pid_checks == []
+
+
+def test_foreign_heartbeat_generation_resets_observer_local_lease(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monotonic_now = [500.0]
+    monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
+    record = executions.create_execution("remote-renewing", source="external")
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET process_id='remote', machine_id='remote-host' WHERE id=?",
+            (record["id"],),
+        )
+    monkeypatch.setattr(executions, "_machine_id", lambda: "local-host")
+
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS - 1
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET heartbeat_at=? WHERE id=?",
+            ("1900-01-01T00:00:01+00:00", record["id"]),
+        )
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS - 1
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += 2
+    assert [row["id"] for row in executions.interrupted_execution_candidates()] == [record["id"]]
+
+
+def test_fresh_fire_claim_generation_keeps_foreign_execution_live(
+    monkeypatch, tmp_path
+):
+    import cron.jobs as jobs
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monotonic_now = [1200.0]
+    fire_at = ["2026-08-29T12:00:00+00:00"]
+    monkeypatch.setattr(executions.time, "monotonic", lambda: monotonic_now[0])
+    record = executions.create_execution("remote-fire-owner", source="external")
+    executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            """UPDATE executions SET process_id='remote-process',
+               machine_id='remote-host' WHERE id=?""",
+            (record["id"],),
+        )
+    monkeypatch.setattr(executions, "_machine_id", lambda: "local-host")
+    monkeypatch.setattr(
+        jobs,
+        "load_jobs",
+        lambda: [
+            {
+                "id": "remote-fire-owner",
+                "fire_claim": {
+                    "execution_id": record["id"],
+                    "by": "remote-owner-token",
+                    "at": fire_at[0],
+                },
+            }
+        ],
+    )
+
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS + 1
+    fire_at[0] = "2026-08-29T12:05:00+00:00"
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += executions.EXECUTION_OWNER_LEASE_SECONDS - 1
+    assert executions.interrupted_execution_candidates() == []
+    monotonic_now[0] += 2
+    assert [row["id"] for row in executions.interrupted_execution_candidates()] == [
+        record["id"]
+    ]
+
+
+def test_recovery_fails_closed_when_jobs_store_ownership_is_unreadable(
+    monkeypatch, tmp_path
+):
+    import cron.jobs as jobs
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("unknown-fire-owner", source="external")
+    executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET process_id='dead-owner', pid=-1 WHERE id=?",
+            (record["id"],),
+        )
+    monkeypatch.setattr(
+        jobs,
+        "load_jobs",
+        lambda: (_ for _ in ()).throw(OSError("jobs store offline")),
+    )
+
+    assert executions.interrupted_execution_candidates() == []
+
+
+def test_recovery_rechecks_fire_claim_generation_under_jobs_lock(
+    monkeypatch, tmp_path
+):
+    import cron.jobs as jobs
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("renewed-before-cas", source="external")
+    executions.mark_execution_running(record["id"])
+    candidate = {
+        **executions.latest_execution("renewed-before-cas"),
+        "_fire_claim_generation": "owner:old-generation",
+    }
+    monkeypatch.setattr(
+        executions, "interrupted_execution_candidates", lambda: [candidate]
+    )
+    monkeypatch.setattr(
+        jobs,
+        "load_jobs",
+        lambda: [
+            {
+                "id": "renewed-before-cas",
+                "retry_interrupted": True,
+                "script": "idempotent.py",
+                "no_agent": True,
+                "fire_claim": {
+                    "execution_id": record["id"],
+                    "by": "owner",
+                    "at": "new-generation",
+                },
+            }
+        ],
+    )
+
+    assert executions.recover_interrupted_executions() == 0
+    assert executions.latest_execution("renewed-before-cas")["status"] == "running"
+
+
+def test_machine_identity_does_not_depend_on_hermes_machine_id_env(monkeypatch):
+    import cron.executions as executions
+
+    monkeypatch.setenv("HERMES_MACHINE_ID", "replica-a")
+    first = executions._machine_id()
+    monkeypatch.setenv("HERMES_MACHINE_ID", "replica-b")
+
+    assert executions._machine_id() == first
+    assert first.startswith("hermes-host-")
+
+
+def test_existing_execution_schema_adds_machine_identity_column(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL CHECK(status IN
+                   ('claimed','running','completed','failed','unknown')),
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+
+    created = executions.create_execution("migrated", source="builtin")
+
+    assert created["machine_id"] == executions._machine_id()
+    assert created["boot_id"] == executions._boot_id()
+    assert created["pid_namespace"] == executions._pid_namespace_id()
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
+    assert "machine_id" in columns
+    assert "boot_id" in columns
+    assert "pid_namespace" in columns
+
+
 def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     """Real temp-HERMES_HOME subprocess restart: in-flight is audit-only unknown."""
     home = tmp_path / "home"
@@ -190,27 +604,61 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         def submit(self, _callable):
             raise ValueError("executor rejected")
 
-    finished = []
+    discarded = []
     monkeypatch.setattr(
         scheduler, "create_execution",
         lambda *_args, **_kwargs: {"id": "exec-submit-fail"},
     )
     monkeypatch.setattr(
-        scheduler, "finish_execution",
-        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+        scheduler, "discard_unacquired_execution",
+        lambda execution_id: discarded.append(execution_id) or True,
     )
     monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "submit-fail"}])
     monkeypatch.setattr(scheduler, "claim_job_for_fire", lambda _job_id: True)
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
 
     assert scheduler.tick(verbose=False, sync=False) == 0
-    assert finished == [
-        ("exec-submit-fail", {
-            "success": False,
-            "error": "Executor dispatch failed: executor rejected",
-        })
-    ]
+    assert discarded == ["exec-submit-fail"]
     assert "submit-fail" not in scheduler.get_running_job_ids()
+
+
+def test_builtin_claim_failure_discards_provisional_execution(monkeypatch, tmp_path):
+    import concurrent.futures
+
+    import cron.scheduler as scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    class InlinePool:
+        def submit(self, callable_):
+            future = concurrent.futures.Future()
+            try:
+                future.set_result(callable_())
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        executions.create_execution,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "discard_unacquired_execution",
+        executions.discard_unacquired_execution,
+    )
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "claim-fail"}])
+
+    def fail_claim(*_args, **_kwargs):
+        raise OSError("jobs store unavailable")
+
+    monkeypatch.setattr(scheduler, "claim_job_for_fire", fail_claim)
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: InlinePool())
+
+    assert scheduler.tick(verbose=False, sync=True) == 0
+    assert executions.list_executions(job_id="claim-fail") == []
+    assert "claim-fail" not in scheduler.get_running_job_ids()
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):
@@ -220,7 +668,8 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(
         scheduler,
         "mark_execution_running",
-        lambda execution_id: events.append(("running", execution_id)),
+        lambda execution_id: events.append(("running", execution_id))
+        or {"id": execution_id, "status": "running"},
         raising=False,
     )
     monkeypatch.setattr(
@@ -338,8 +787,8 @@ def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
     executions.latest_executions(["leak-check"])
     executions.recover_interrupted_executions()
 
-    assert len(opened) == 6
-    assert len(closed) == 6
+    assert len(opened) == 8
+    assert len(closed) == 8
     assert set(opened) == set(closed)
 
 
