@@ -200,9 +200,14 @@ def commit_fire_claim_execution(
     try:
         discard_unacquired_execution(execution_id)
     except Exception:
+        # The occurrence is already restored, but this process is still the
+        # recorded owner of the abandoned provisional row. Without a local
+        # recovery witness, reconciliation would defer to the healthy owner
+        # lease forever and repeated ledger outages could accumulate rows.
+        remember_execution_recovery_intent(execution_id)
         logger.warning(
             "Could not discard rolled-back provisional execution %s; "
-            "reconciliation will remove it",
+            "marked for local reconciliation",
             execution_id,
             exc_info=True,
         )

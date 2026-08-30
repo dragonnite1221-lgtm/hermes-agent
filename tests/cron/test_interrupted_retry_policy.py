@@ -993,6 +993,38 @@ def test_post_cas_execution_fence_failure_restores_interrupted_retry(
     )
 
 
+def test_post_cas_rollback_cleanup_failure_records_local_recovery_intent(
+    isolated_cron, monkeypatch
+):
+    import cron.scheduler_provider as provider
+
+    job = _script_job()
+    remembered = []
+    monkeypatch.setattr(
+        executions,
+        "mark_fire_claim_acquired",
+        lambda _execution_id: (_ for _ in ()).throw(OSError("ledger offline")),
+    )
+    monkeypatch.setattr(
+        executions,
+        "discard_unacquired_execution",
+        lambda _execution_id: (_ for _ in ()).throw(OSError("ledger still offline")),
+    )
+    monkeypatch.setattr(
+        executions,
+        "remember_execution_recovery_intent",
+        lambda execution_id: remembered.append(execution_id),
+    )
+
+    with pytest.raises(FireClaimNotAcquiredError, match="occurrence was restored"):
+        provider.claim_fire_with_execution(job["id"], source="external")
+
+    provisional = executions.latest_execution(job["id"])
+    assert provisional["fire_claim_acquired"] == 0
+    assert remembered == [provisional["id"]]
+    assert jobs.get_job(job["id"])["fire_claim"] is None
+
+
 def test_total_fence_and_rollback_failure_recovers_provisional_winner_in_process(
     isolated_cron, monkeypatch
 ):
