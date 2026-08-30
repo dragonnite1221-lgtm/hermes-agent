@@ -133,7 +133,11 @@ def _run_monitor_source(job: dict) -> tuple[bool, str]:
         from cron.scheduler import _run_job_script
 
         workdir = (job.get("workdir") or "").strip() or None
-        return _run_job_script(monitor_script, workdir=workdir)
+        return _run_job_script(
+            monitor_script,
+            workdir=workdir,
+            timeout_seconds=job.get("script_timeout_seconds"),
+        )
     monitor_url = (job.get("monitor_url") or "").strip()
     if monitor_url:
         return _fetch_monitor_url(monitor_url)

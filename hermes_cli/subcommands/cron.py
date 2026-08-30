@@ -197,7 +197,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         type=int,
         help=(
             "Positive wall-clock timeout for this job's script. Pass 0 to "
-            "clear the override and inherit cron.script_timeout_seconds."
+            "clear the override and inherit cron.script_timeout_seconds. "
+            "Maximum: 604800 seconds (7 days)."
         ),
     )
     cron_edit.add_argument(

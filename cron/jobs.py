@@ -1845,6 +1845,9 @@ def _validate_interrupted_retry_mode(
     return retry_interrupted
 
 
+MAX_SCRIPT_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
+
+
 def _normalize_script_timeout_seconds(
     value: Any, *, has_script: bool
 ) -> Optional[int]:
@@ -1865,6 +1868,11 @@ def _normalize_script_timeout_seconds(
         return None
     if timeout < 0:
         raise ValueError("script_timeout_seconds must be a positive integer")
+    if timeout > MAX_SCRIPT_TIMEOUT_SECONDS:
+        raise ValueError(
+            "script_timeout_seconds must not exceed "
+            f"{MAX_SCRIPT_TIMEOUT_SECONDS} seconds (7 days)"
+        )
     if not has_script:
         raise ValueError(
             "script_timeout_seconds requires script or monitor_script"
@@ -2257,17 +2265,29 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             ):
                 raise ValueError("retry_interrupted must be a boolean")
 
-            if "script_timeout_seconds" in updates:
+            if {"script_timeout_seconds", "script", "monitor_script"}.intersection(
+                updates
+            ):
                 effective_script = updates.get("script", job.get("script"))
                 effective_monitor = updates.get(
                     "monitor_script", job.get("monitor_script")
                 )
-                updates["script_timeout_seconds"] = (
-                    _normalize_script_timeout_seconds(
-                        updates["script_timeout_seconds"],
-                        has_script=bool(effective_script or effective_monitor),
+                has_effective_script = bool(effective_script or effective_monitor)
+                if not has_effective_script:
+                    # Keep the persisted record valid when its last executable
+                    # source is removed. Otherwise a later script addition can
+                    # unexpectedly reactivate a stale operator override.
+                    updates["script_timeout_seconds"] = None
+                else:
+                    timeout_value = updates.get(
+                        "script_timeout_seconds", job.get("script_timeout_seconds")
                     )
-                )
+                    updates["script_timeout_seconds"] = (
+                        _normalize_script_timeout_seconds(
+                            timeout_value,
+                            has_script=True,
+                        )
+                    )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

@@ -534,6 +534,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import (
+    MAX_SCRIPT_TIMEOUT_SECONDS,
     claim_dispatch,
     claim_job_for_fire,
     fire_claim_fence,
@@ -3681,7 +3682,7 @@ def _get_script_timeout() -> int:
     if _SCRIPT_TIMEOUT != _DEFAULT_SCRIPT_TIMEOUT:
         try:
             timeout = int(float(_SCRIPT_TIMEOUT))
-            if timeout > 0:
+            if 0 < timeout <= MAX_SCRIPT_TIMEOUT_SECONDS:
                 return timeout
         except Exception:
             logger.warning("Invalid patched _SCRIPT_TIMEOUT=%r; using env/config/default", _SCRIPT_TIMEOUT)
@@ -3690,7 +3691,7 @@ def _get_script_timeout() -> int:
     if env_value:
         try:
             timeout = int(float(env_value))
-            if timeout > 0:
+            if 0 < timeout <= MAX_SCRIPT_TIMEOUT_SECONDS:
                 return timeout
         except Exception:
             logger.warning("Invalid HERMES_CRON_SCRIPT_TIMEOUT=%r; using config/default", env_value)
@@ -3701,7 +3702,7 @@ def _get_script_timeout() -> int:
         configured = cron_cfg.get("script_timeout_seconds")
         if configured is not None:
             timeout = int(float(configured))
-            if timeout > 0:
+            if 0 < timeout <= MAX_SCRIPT_TIMEOUT_SECONDS:
                 return timeout
     except Exception as exc:
         logger.debug("Failed to load cron script timeout from config: %s", exc)
@@ -4008,7 +4009,11 @@ def _run_job_script(
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
-    if isinstance(timeout_seconds, int) and not isinstance(timeout_seconds, bool) and timeout_seconds > 0:
+    if (
+        isinstance(timeout_seconds, int)
+        and not isinstance(timeout_seconds, bool)
+        and 0 < timeout_seconds <= MAX_SCRIPT_TIMEOUT_SECONDS
+    ):
         script_timeout = timeout_seconds
     else:
         if timeout_seconds is not None:
@@ -4068,6 +4073,10 @@ def _run_job_script(
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
+        # Establish the wall-clock deadline before starting the child. This
+        # guarantees that even malformed runtime state cannot leave a newly
+        # spawned process orphaned if deadline construction fails.
+        deadline = time.monotonic() + script_timeout
         proc = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
@@ -4077,7 +4086,6 @@ def _run_job_script(
             env=env,
             **popen_kwargs,
         )
-        deadline = time.monotonic() + script_timeout
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_cron_script_process(proc)

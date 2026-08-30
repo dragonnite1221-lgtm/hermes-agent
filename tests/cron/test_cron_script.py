@@ -98,6 +98,18 @@ class TestJobScriptField:
                 script_timeout_seconds=value,
             )
 
+    def test_per_job_timeout_rejects_values_above_seven_days(self, cron_env):
+        from cron.jobs import create_job
+
+        with pytest.raises(ValueError, match="must not exceed 604800"):
+            create_job(
+                prompt=None,
+                schedule="every 30m",
+                script="long-running.py",
+                no_agent=True,
+                script_timeout_seconds=604801,
+            )
+
     def test_per_job_timeout_requires_a_script(self, cron_env):
         from cron.jobs import create_job
 
@@ -107,6 +119,24 @@ class TestJobScriptField:
                 schedule="every 30m",
                 script_timeout_seconds=16200,
             )
+
+    def test_removing_last_script_clears_timeout_override(self, cron_env):
+        from cron.jobs import create_job, get_job, update_job
+
+        job = create_job(
+            prompt=None,
+            schedule="every 30m",
+            script="long-running.py",
+            no_agent=True,
+            script_timeout_seconds=16200,
+        )
+
+        updated = update_job(
+            job["id"], {"script": None, "no_agent": False, "prompt": "report"}
+        )
+
+        assert updated["script_timeout_seconds"] is None
+        assert get_job(job["id"])["script_timeout_seconds"] is None
 
 
 def test_cronjob_tool_rejects_stale_past_one_shot(cron_env, monkeypatch):
@@ -187,6 +217,62 @@ class TestRunJobScript:
 
         assert result == (True, "ok")
         assert captured["timeout_seconds"] == 16200
+
+    def test_oversized_runtime_timeout_falls_back_before_spawn(
+        self, cron_env, monkeypatch
+    ):
+        import cron.scheduler as scheduler
+
+        script = cron_env / "scripts" / "noop.py"
+        script.write_text("pass\n")
+        observed = {}
+
+        monkeypatch.setattr(scheduler, "_get_script_timeout", lambda: 30)
+        monkeypatch.setattr(scheduler.time, "monotonic", lambda: 100.0)
+
+        class CapturedProcess:
+            returncode = 0
+
+            def __init__(self, *_args, **_kwargs):
+                observed["spawned"] = True
+
+            def communicate(self, timeout):
+                observed["communicate_timeout"] = timeout
+                return "ok", ""
+
+        monkeypatch.setattr(scheduler.subprocess, "Popen", CapturedProcess)
+
+        success, output = scheduler._run_job_script(
+            "noop.py", timeout_seconds=604801
+        )
+
+        assert success is True
+        assert output == "ok"
+        assert observed == {"spawned": True, "communicate_timeout": 0.1}
+
+    def test_deadline_failure_cannot_orphan_a_child(self, cron_env, monkeypatch):
+        import cron.scheduler as scheduler
+
+        script = cron_env / "scripts" / "noop.py"
+        script.write_text("pass\n")
+        spawned = []
+
+        monkeypatch.setattr(
+            scheduler.time,
+            "monotonic",
+            lambda: (_ for _ in ()).throw(OverflowError("clock overflow")),
+        )
+        monkeypatch.setattr(
+            scheduler.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: spawned.append(True),
+        )
+
+        success, output = scheduler._run_job_script("noop.py", timeout_seconds=30)
+
+        assert success is False
+        assert "clock overflow" in output
+        assert spawned == []
 
     def test_script_relative_path(self, cron_env):
         from cron.scheduler import _run_job_script
