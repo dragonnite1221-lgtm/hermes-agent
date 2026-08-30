@@ -135,6 +135,59 @@ class TestRunJobScript:
         assert success is True
         assert output == "hello from script"
 
+    def test_explicit_timeout_overrides_global_config(self, cron_env, monkeypatch):
+        import cron.scheduler as scheduler
+
+        script = cron_env / "scripts" / "slow.py"
+        script.write_text("pass\n")
+
+        class NeverFinishes:
+            returncode = None
+            pid = 0
+            stdout = None
+            stderr = None
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+        monkeypatch.setattr(scheduler.subprocess, "Popen", NeverFinishes)
+        monotonic = iter((100.0, 103.0))
+        monkeypatch.setattr(scheduler.time, "monotonic", lambda: next(monotonic))
+        monkeypatch.setattr(scheduler, "_get_script_timeout", lambda: 600)
+        monkeypatch.setattr(scheduler, "_terminate_cron_script_process", lambda _proc: None)
+        monkeypatch.setattr(scheduler, "_drain_script_pipes", lambda _proc: None)
+
+        success, output = scheduler._run_job_script(
+            "slow.py", timeout_seconds=2
+        )
+
+        assert success is False
+        assert "timed out after 2s" in output
+
+    def test_job_runner_forwards_persisted_timeout(self, monkeypatch):
+        import cron.scheduler as scheduler
+
+        captured = {}
+
+        def fake_run(script_path, **kwargs):
+            captured["script_path"] = script_path
+            captured.update(kwargs)
+            return True, "ok"
+
+        monkeypatch.setattr(scheduler, "_run_job_script", fake_run)
+
+        result = scheduler._run_job_script_with_claim_heartbeat(
+            {
+                "id": "job-1",
+                "schedule": {"kind": "cron"},
+                "script_timeout_seconds": 16200,
+            },
+            "long-running.py",
+        )
+
+        assert result == (True, "ok")
+        assert captured["timeout_seconds"] == 16200
+
     def test_script_relative_path(self, cron_env):
         from cron.scheduler import _run_job_script
 
