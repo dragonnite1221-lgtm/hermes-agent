@@ -165,6 +165,21 @@ class TestRunJobScript:
         assert success is True
         assert output == "hello from script"
 
+    def test_global_timeout_above_per_job_limit_is_preserved(
+        self, cron_env, monkeypatch
+    ):
+        import cron.scheduler as scheduler
+
+        monkeypatch.delenv("HERMES_CRON_SCRIPT_TIMEOUT", raising=False)
+        monkeypatch.setattr(scheduler, "_SCRIPT_TIMEOUT", scheduler._DEFAULT_SCRIPT_TIMEOUT)
+        monkeypatch.setattr(
+            scheduler,
+            "load_config",
+            lambda: {"cron": {"script_timeout_seconds": 30 * 24 * 60 * 60}},
+        )
+
+        assert scheduler._get_script_timeout() == 30 * 24 * 60 * 60
+
     def test_explicit_timeout_overrides_global_config(self, cron_env, monkeypatch):
         import cron.scheduler as scheduler
 
