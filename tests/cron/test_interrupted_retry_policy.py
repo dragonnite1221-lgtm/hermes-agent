@@ -880,6 +880,60 @@ def test_lost_fire_claim_does_not_create_phantom_failed_execution(isolated_cron)
     assert executions.list_executions(job_id=job["id"]) == []
 
 
+def test_lost_fire_claim_cleanup_failure_records_local_recovery_intent(
+    isolated_cron, monkeypatch
+):
+    from cron.scheduler_provider import claim_fire_with_execution
+
+    job = _script_job()
+    assert isinstance(jobs.claim_job_for_fire(job["id"], return_job=True), dict)
+    remembered = []
+    monkeypatch.setattr(
+        executions,
+        "discard_unacquired_execution",
+        lambda _execution_id: (_ for _ in ()).throw(OSError("ledger locked")),
+    )
+    monkeypatch.setattr(
+        executions,
+        "remember_execution_recovery_intent",
+        lambda execution_id: remembered.append(execution_id),
+    )
+
+    assert claim_fire_with_execution(job["id"], source="external") is None
+    assert remembered == [executions.latest_execution(job["id"])["id"]]
+
+
+def test_fire_claim_error_cleanup_failure_records_local_recovery_intent(
+    isolated_cron, monkeypatch
+):
+    from cron.scheduler_provider import (
+        FireClaimNotAcquiredError,
+        claim_fire_with_execution,
+    )
+
+    job = _script_job()
+    remembered = []
+    monkeypatch.setattr(
+        jobs,
+        "claim_job_for_fire",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("store offline")),
+    )
+    monkeypatch.setattr(
+        executions,
+        "discard_unacquired_execution",
+        lambda _execution_id: (_ for _ in ()).throw(OSError("ledger locked")),
+    )
+    monkeypatch.setattr(
+        executions,
+        "remember_execution_recovery_intent",
+        lambda execution_id: remembered.append(execution_id),
+    )
+
+    with pytest.raises(FireClaimNotAcquiredError, match="fire claim"):
+        claim_fire_with_execution(job["id"], source="external")
+    assert remembered == [executions.latest_execution(job["id"])["id"]]
+
+
 def test_post_cas_execution_fence_retries_idempotently(isolated_cron, monkeypatch):
     import cron.scheduler_provider as provider
 

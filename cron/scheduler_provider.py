@@ -226,8 +226,26 @@ def claim_fire_with_execution(
     still leaves a recoverable owner record rather than silently losing the
     owed retry.
     """
-    from cron.executions import create_execution, discard_unacquired_execution
+    from cron.executions import (
+        create_execution,
+        discard_unacquired_execution,
+        remember_execution_recovery_intent,
+    )
     from cron.jobs import claim_job_for_fire
+
+    def _discard_provisional_best_effort(*, context: str) -> None:
+        try:
+            discard_unacquired_execution(execution["id"])
+        except Exception:
+            # This process is still live, so lease recovery would otherwise
+            # ignore its deliberately abandoned provisional row indefinitely.
+            remember_execution_recovery_intent(execution["id"])
+            logger.exception(
+                "Could not discard provisional execution %s after %s; "
+                "marked for local reconciliation",
+                execution["id"],
+                context,
+            )
 
     try:
         execution = create_execution(
@@ -254,18 +272,12 @@ def claim_fire_with_execution(
                 claim_ttl_seconds=claim_ttl_seconds,
             )
     except Exception as exc:
-        try:
-            discard_unacquired_execution(execution["id"])
-        except Exception:
-            logger.exception(
-                "Could not terminalize execution %s after fire-claim setup failed",
-                execution["id"],
-            )
+        _discard_provisional_best_effort(context="fire-claim setup failed")
         raise FireClaimNotAcquiredError(
             f"Could not acquire the cron fire claim: {exc}"
         ) from exc
     if not isinstance(claimed_job, dict):
-        discard_unacquired_execution(execution["id"])
+        _discard_provisional_best_effort(context="fire claim was not acquired")
         return None
     if execution.get("fire_claim_acquired") == 0:
         commit_fire_claim_execution(claimed_job, execution["id"])
