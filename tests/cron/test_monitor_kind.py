@@ -250,6 +250,35 @@ def test_hash_is_exact_bytes(hermes_env):
     assert hash_monitor_output("a\nb") != hash_monitor_output("a\nb ")
 
 
+def test_monitor_script_forwards_per_job_timeout(hermes_env, monkeypatch):
+    import cron.scheduler as scheduler
+    from cron.monitor import _run_monitor_source
+
+    captured = {}
+
+    def fake_run(script_path, **kwargs):
+        captured["script_path"] = script_path
+        captured.update(kwargs)
+        return True, "stable"
+
+    monkeypatch.setattr(scheduler, "_run_job_script", fake_run)
+
+    result = _run_monitor_source(
+        {
+            "monitor_script": "monitor.py",
+            "workdir": "/tmp/monitor-workdir",
+            "script_timeout_seconds": 16200,
+        }
+    )
+
+    assert result == (True, "stable")
+    assert captured == {
+        "script_path": "monitor.py",
+        "workdir": "/tmp/monitor-workdir",
+        "timeout_seconds": 16200,
+    }
+
+
 def test_unified_diff_is_capped(hermes_env):
     from cron.monitor import MAX_DIFF_CHARS, build_monitor_diff
 

@@ -60,6 +60,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--script-timeout-seconds",
+        type=int,
+        help=(
+            "Positive wall-clock timeout for this job's script. Omit to "
+            "inherit cron.script_timeout_seconds from config.yaml."
+        ),
+    )
+    cron_create.add_argument(
         "--no-agent",
         dest="no_agent",
         action="store_true",
@@ -182,6 +190,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "Path to a script under ~/.hermes/scripts/. Pass empty string to clear. "
             "With --no-agent the script IS the job; otherwise its stdout is "
             "injected into the agent's prompt each run."
+        ),
+    )
+    cron_edit.add_argument(
+        "--script-timeout-seconds",
+        type=int,
+        help=(
+            "Positive wall-clock timeout for this job's script. Pass 0 to "
+            "clear the override and inherit cron.script_timeout_seconds. "
+            "Maximum: 604800 seconds (7 days)."
         ),
     )
     cron_edit.add_argument(

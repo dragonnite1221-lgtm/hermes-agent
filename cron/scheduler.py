@@ -534,6 +534,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import (
+    MAX_SCRIPT_TIMEOUT_SECONDS,
     claim_dispatch,
     claim_job_for_fire,
     fire_claim_fence,
@@ -3922,6 +3923,7 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    timeout_seconds: Optional[int] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -3954,6 +3956,8 @@ def _run_job_script(
             mutated, avoiding the global-side-effect bug where a cron
             job's ``os.chdir()`` leaks into concurrent gateway sessions
             (#69396).
+        timeout_seconds: Optional positive per-job timeout. None inherits the
+            global ``cron.script_timeout_seconds`` setting.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -4005,7 +4009,19 @@ def _run_job_script(
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
-    script_timeout = _get_script_timeout()
+    if (
+        isinstance(timeout_seconds, int)
+        and not isinstance(timeout_seconds, bool)
+        and 0 < timeout_seconds <= MAX_SCRIPT_TIMEOUT_SECONDS
+    ):
+        script_timeout = timeout_seconds
+    else:
+        if timeout_seconds is not None:
+            logger.warning(
+                "Invalid per-job script_timeout_seconds=%r; using config/default",
+                timeout_seconds,
+            )
+        script_timeout = _get_script_timeout()
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -4057,6 +4073,10 @@ def _run_job_script(
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
+        # Establish the wall-clock deadline before starting the child. This
+        # guarantees that even malformed runtime state cannot leave a newly
+        # spawned process orphaned if deadline construction fails.
+        deadline = time.monotonic() + script_timeout
         proc = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
@@ -4066,7 +4086,6 @@ def _run_job_script(
             env=env,
             **popen_kwargs,
         )
-        deadline = time.monotonic() + script_timeout
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_cron_script_process(proc)
@@ -4131,12 +4150,18 @@ def _run_job_script_with_claim_heartbeat(
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    timeout_seconds = job.get("script_timeout_seconds")
     if not (
         isinstance(schedule, dict)
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            timeout_seconds=timeout_seconds,
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -4167,10 +4192,20 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            timeout_seconds=timeout_seconds,
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            timeout_seconds=timeout_seconds,
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -4241,7 +4276,10 @@ def _build_job_prompt(
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(
+                script_path,
+                timeout_seconds=job.get("script_timeout_seconds"),
+            )
         if success:
             if script_output:
                 prompt = (

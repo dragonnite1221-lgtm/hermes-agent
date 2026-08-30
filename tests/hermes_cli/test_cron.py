@@ -22,6 +22,26 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 class TestCronCommandLifecycle:
 
+    def test_edit_persists_per_job_script_timeout(self, tmp_cron_dir, capsys):
+        job = create_job(
+            prompt=None,
+            schedule="every 1h",
+            script="long-running.py",
+            no_agent=True,
+        )
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+
+        args = parser.parse_args(
+            ["cron", "edit", job["id"], "--script-timeout-seconds", "16200"]
+        )
+        assert cron_command(args) == 0
+
+        updated = get_job(job["id"])
+        assert updated["script_timeout_seconds"] == 16200
+        assert "Script timeout: 16200s" in capsys.readouterr().out
+
     def test_create_defaults_retry_interrupted_to_false(
         self, tmp_cron_dir, monkeypatch
     ):

@@ -1845,6 +1845,41 @@ def _validate_interrupted_retry_mode(
     return retry_interrupted
 
 
+MAX_SCRIPT_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
+
+
+def _normalize_script_timeout_seconds(
+    value: Any, *, has_script: bool
+) -> Optional[int]:
+    """Normalize an operator-owned per-job script timeout override."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("script_timeout_seconds must be a positive integer")
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "script_timeout_seconds must be a positive integer"
+        ) from exc
+    if str(value).strip() not in {str(timeout), f"+{timeout}"}:
+        raise ValueError("script_timeout_seconds must be a positive integer")
+    if timeout == 0:
+        return None
+    if timeout < 0:
+        raise ValueError("script_timeout_seconds must be a positive integer")
+    if timeout > MAX_SCRIPT_TIMEOUT_SECONDS:
+        raise ValueError(
+            "script_timeout_seconds must not exceed "
+            f"{MAX_SCRIPT_TIMEOUT_SECONDS} seconds (7 days)"
+        )
+    if not has_script:
+        raise ValueError(
+            "script_timeout_seconds requires script or monitor_script"
+        )
+    return timeout
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1867,6 +1902,7 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     retry_interrupted: bool = False,
+    script_timeout_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1938,6 +1974,10 @@ def create_job(
                 idempotent no-agent script. If the scheduler proves the prior
                 execution owner died without a durable terminal result, the
                 job is made due once more after its duplicate-fence lease.
+        script_timeout_seconds: Optional positive per-job wall-clock timeout
+                for script and monitor_script execution. None inherits
+                ``cron.script_timeout_seconds``. Operator-owned; zero clears
+                an existing override on update.
 
     Returns:
         The created job dict
@@ -1975,6 +2015,10 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_script_timeout = _normalize_script_timeout_seconds(
+        script_timeout_seconds,
+        has_script=bool(normalized_script or normalized_monitor_script),
+    )
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -2052,6 +2096,7 @@ def create_job(
         "script": normalized_script,
         "no_agent": normalized_no_agent,
         "retry_interrupted": normalized_retry_interrupted,
+        "script_timeout_seconds": normalized_script_timeout,
         "monitor_script": normalized_monitor_script,
         "monitor_url": normalized_monitor_url,
         # Hash-suppression state for monitor jobs: {"last_output_hash": ...,
@@ -2219,6 +2264,30 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["retry_interrupted"], bool
             ):
                 raise ValueError("retry_interrupted must be a boolean")
+
+            if {"script_timeout_seconds", "script", "monitor_script"}.intersection(
+                updates
+            ):
+                effective_script = updates.get("script", job.get("script"))
+                effective_monitor = updates.get(
+                    "monitor_script", job.get("monitor_script")
+                )
+                has_effective_script = bool(effective_script or effective_monitor)
+                if not has_effective_script:
+                    # Keep the persisted record valid when its last executable
+                    # source is removed. Otherwise a later script addition can
+                    # unexpectedly reactivate a stale operator override.
+                    updates["script_timeout_seconds"] = None
+                else:
+                    timeout_value = updates.get(
+                        "script_timeout_seconds", job.get("script_timeout_seconds")
+                    )
+                    updates["script_timeout_seconds"] = (
+                        _normalize_script_timeout_seconds(
+                            timeout_value,
+                            has_script=True,
+                        )
+                    )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
