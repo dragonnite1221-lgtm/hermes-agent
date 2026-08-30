@@ -162,6 +162,8 @@ def cron_list(show_all: bool = False):
         script = job.get("script")
         if script:
             print(f"    Script:    {script}")
+        if job.get("script_timeout_seconds"):
+            print(f"    Timeout:   {job['script_timeout_seconds']}s (job override)")
         monitor_source = job.get("monitor_script") or job.get("monitor_url")
         if monitor_source:
             print(f"    Monitor:   {monitor_source} (agent runs only on output change)")
@@ -402,6 +404,7 @@ def cron_create(args):
         # Create has a concrete false default. ``None`` is meaningful only on
         # edit, where it means "leave the stored policy unchanged".
         retry_interrupted=getattr(args, "retry_interrupted", False) is True,
+        script_timeout_seconds=getattr(args, "script_timeout_seconds", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -422,6 +425,8 @@ def cron_create(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("retry_interrupted"):
         print("  Restart: retry interrupted run (at-least-once)")
+    if job_data.get("script_timeout_seconds"):
+        print(f"  Script timeout: {job_data['script_timeout_seconds']}s")
     if job_data.get("continuity"):
         print("  Continuity: on (each run sees the previous run's output)")
     if job_data.get("workdir"):
@@ -480,6 +485,7 @@ def cron_edit(args):
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
         retry_interrupted=getattr(args, "retry_interrupted", None),
+        script_timeout_seconds=getattr(args, "script_timeout_seconds", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -503,6 +509,8 @@ def cron_edit(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("retry_interrupted"):
         print("  Restart: retry interrupted run (at-least-once)")
+    if updated.get("script_timeout_seconds"):
+        print(f"  Script timeout: {updated['script_timeout_seconds']}s")
     if updated.get("continuity"):
         print("  Continuity: on (each run sees the previous run's output)")
     if updated.get("workdir"):

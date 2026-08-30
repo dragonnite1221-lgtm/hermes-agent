@@ -41,6 +41,20 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
 
 
+def test_cron_script_timeout_is_operator_configurable():
+    parser = _build()
+
+    created = parser.parse_args(
+        ["cron", "create", "30m", "--script", "job.py", "--script-timeout-seconds", "16200"]
+    )
+    cleared = parser.parse_args(
+        ["cron", "edit", "j", "--script-timeout-seconds", "0"]
+    )
+
+    assert created.script_timeout_seconds == 16200
+    assert cleared.script_timeout_seconds == 0
+
+
 def test_cron_accept_hooks_flag_on_run_and_tick():
     parser = _build()
     # --accept-hooks is suppressed-default; present only when passed.
