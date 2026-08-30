@@ -415,6 +415,10 @@ class TestRuntimeRepair:
 
         with patch("hermes_cli.managed_uv.subprocess.run", side_effect=fake_run), \
              patch(
+                 "hermes_cli.managed_uv._capture_active_lazy_feature_specs",
+                 return_value={},
+             ), \
+             patch(
                  "hermes_cli.managed_uv._smoke_candidate_venv",
                  return_value=(True, "", None),
              ):
@@ -423,6 +427,7 @@ class TestRuntimeRepair:
                 project_root=root,
                 generation=generation,
                 python=python,
+                source_python=root / "source-venv" / "bin" / "python",
             )
 
         assert candidate is not None
@@ -436,6 +441,141 @@ class TestRuntimeRepair:
         assert "--locked" in sync_argv
         assert "--no-config" not in sync_argv
         assert "UV_NO_CONFIG" not in sync_env
+
+    def test_capture_active_lazy_features_filters_to_current_allowlist(self, tmp_path):
+        from hermes_cli.managed_uv import _capture_active_lazy_feature_specs
+        from tools.lazy_deps import LAZY_DEPS
+
+        source_python = tmp_path / "source-venv" / "bin" / "python"
+        site_packages = source_python.parent.parent / "lib/python3.13/site-packages"
+        telegram_metadata = site_packages / "python_telegram_bot-22.8.dist-info/METADATA"
+        telegram_metadata.parent.mkdir(parents=True)
+        telegram_metadata.write_text(
+            "Metadata-Version: 2.1\nName: python-telegram-bot\nVersion: 22.8\n",
+            encoding="utf-8",
+        )
+        attacker_metadata = site_packages / "attacker_injected-1.0.dist-info/METADATA"
+        attacker_metadata.parent.mkdir()
+        attacker_metadata.write_text(
+            "Metadata-Version: 2.1\nName: attacker-injected\nVersion: 1.0\n",
+            encoding="utf-8",
+        )
+
+        captured = _capture_active_lazy_feature_specs(
+            source_python,
+            project_root=Path(__file__).parents[2],
+        )
+
+        assert captured == {
+            "platform.telegram": LAZY_DEPS["platform.telegram"],
+        }
+        assert not source_python.exists()
+
+    def test_capture_active_lazy_features_fails_closed_on_invalid_probe(self, tmp_path):
+        from hermes_cli.managed_uv import _capture_active_lazy_feature_specs
+
+        allowlist = tmp_path / "tools/lazy_deps.py"
+        allowlist.parent.mkdir()
+        allowlist.write_text("LAZY_DEPS = build_untrusted_specs()\n", encoding="utf-8")
+
+        assert (
+            _capture_active_lazy_feature_specs(
+                tmp_path / "source-venv" / "bin" / "python",
+                project_root=tmp_path,
+            )
+            is None
+        )
+
+    def test_capture_uses_updated_source_even_when_allowlist_is_cached(self, tmp_path, monkeypatch):
+        from hermes_cli.managed_uv import _capture_active_lazy_feature_specs
+        from tools.lazy_deps import LAZY_DEPS
+
+        monkeypatch.setitem(LAZY_DEPS, "platform.telegram", ("python-telegram-bot==1.0",))
+        allowlist = tmp_path / "tools/lazy_deps.py"
+        allowlist.parent.mkdir()
+        allowlist.write_text(
+            'LAZY_DEPS: dict = {"platform.telegram": ("python-telegram-bot==2.0",)}\n',
+            encoding="utf-8",
+        )
+        source_python = tmp_path / "venv/bin/python"
+        metadata = tmp_path / "venv/lib/python3.13/site-packages/telegram-1.0.dist-info/METADATA"
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text("Name: python-telegram-bot\nVersion: 1.0\n", encoding="utf-8")
+
+        assert _capture_active_lazy_feature_specs(source_python, project_root=tmp_path) == {
+            "platform.telegram": ("python-telegram-bot==2.0",),
+        }
+
+    @pytest.mark.parametrize("allowed", [True, False])
+    def test_candidate_restore_policy_reads_real_config(self, tmp_path, allowed):
+        from hermes_cli.managed_uv import _candidate_allows_lazy_restore
+
+        (tmp_path / "config.yaml").write_text(
+            f"security:\n  allow_lazy_installs: {str(allowed).lower()}\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ, HERMES_HOME=str(tmp_path))
+        env.pop("HERMES_DISABLE_LAZY_INSTALLS", None)
+        assert _candidate_allows_lazy_restore(
+            Path(sys.executable), project_root=Path(__file__).parents[2], env=env
+        ) is allowed
+
+    @pytest.mark.parametrize("allowed", [True, False])
+    def test_stage_candidate_restores_active_lazy_features(self, tmp_path, allowed):
+        from hermes_cli.managed_uv import _stage_candidate_venv
+
+        root = tmp_path / "checkout"
+        root.mkdir()
+        (root / "uv.lock").write_text("# lock\n", encoding="utf-8")
+        generation = root / ".hermes-runtime" / "python" / "gen"
+        python = generation / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.write_text("py", encoding="utf-8")
+        source_python = root / "source-venv" / "bin" / "python"
+        source_python.parent.mkdir(parents=True)
+        source_python.write_text("old", encoding="utf-8")
+        captured = {
+            "platform.telegram": ("python-telegram-bot[webhooks]==22.8",),
+        }
+        calls = []
+        environments = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            environments.append(kwargs.get("env", {}))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("hermes_cli.managed_uv.subprocess.run", side_effect=fake_run), \
+             patch(
+                 "hermes_cli.managed_uv._capture_active_lazy_feature_specs",
+                 side_effect=[captured, captured],
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._candidate_allows_lazy_restore",
+                 return_value=allowed,
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._smoke_candidate_venv",
+                 return_value=(True, "", None),
+             ):
+            candidate = _stage_candidate_venv(
+                "uv",
+                project_root=root,
+                generation=generation,
+                python=python,
+                source_python=source_python,
+            )
+
+        if not allowed:
+            assert candidate is None
+            assert len(calls) == 2
+            return
+        assert candidate is not None
+        assert len(calls) == 3
+        assert calls[2][:3] == ["uv", "pip", "install"]
+        assert "--no-config" not in calls[2]
+        assert "UV_NO_CONFIG" not in environments[2]
+        assert "python-telegram-bot[webhooks]==22.8" in calls[2]
 
     def test_failed_candidate_preserves_live_venv(self, tmp_path):
         from hermes_cli.managed_uv import (
@@ -1286,4 +1426,3 @@ class TestVenvPythonUpdateBoundary:
         expected = Path("/opt/hermes/venv/Scripts/python.exe") \
             if sys.platform == "win32" else Path("/opt/hermes/venv/bin/python")
         assert _venv_python(Path("/opt/hermes/venv")) == expected
-
