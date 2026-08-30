@@ -793,12 +793,78 @@ def _smoke_candidate_venv(venv_dir: Path) -> tuple[bool, str, SQLiteRuntimeInfo 
     return True, "", info
 
 
+def _capture_active_lazy_feature_specs(
+    source_python: Path,
+    *,
+    project_root: Path,
+) -> dict[str, tuple[str, ...]] | None:
+    """Capture active allowlisted lazy features from the venv being replaced.
+
+    Only feature names cross the old-interpreter boundary. Specs are resolved
+    again from the current source tree so a compromised or stale environment
+    cannot inject arbitrary package requirements into the replacement.
+    """
+    probe = r"""
+import importlib.metadata
+import json
+import re
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from tools.lazy_deps import LAZY_DEPS
+
+active = []
+for feature, specs in LAZY_DEPS.items():
+    if not specs:
+        continue
+    match = re.match(r"^([A-Za-z0-9_][A-Za-z0-9_.-]*)", specs[0])
+    if not match:
+        continue
+    try:
+        importlib.metadata.version(match.group(1))
+    except importlib.metadata.PackageNotFoundError:
+        continue
+    active.append(feature)
+print(json.dumps(active, separators=(",", ":")))
+"""
+    try:
+        result = subprocess.run(
+            [str(source_python), "-I", "-c", probe, str(project_root)],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        names = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        return None
+
+    try:
+        from tools.lazy_deps import LAZY_DEPS
+    except Exception:
+        return None
+    return {
+        name: tuple(LAZY_DEPS[name])
+        for name in sorted(set(names))
+        if name in LAZY_DEPS
+    }
+
+
 def _stage_candidate_venv(
     uv_bin: str,
     *,
     project_root: Path,
     generation: Path,
     python: Path,
+    source_python: Path,
 ) -> Path | None:
     runtime_root = project_root / _RUNTIME_DIR_NAME
     token = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
@@ -868,6 +934,59 @@ def _stage_candidate_venv(
         logger.warning("candidate dependency sync failed (rc=%d)", synced.returncode)
         _remove_tree(candidate, boundary=runtime_root)
         return None
+
+    active_lazy_features = _capture_active_lazy_feature_specs(
+        source_python,
+        project_root=project_root,
+    )
+    if active_lazy_features is None:
+        logger.warning("candidate dependency sync refused: active lazy features could not be captured")
+        _remove_tree(candidate, boundary=runtime_root)
+        return None
+    lazy_specs = list(
+        dict.fromkeys(
+            spec
+            for specs in active_lazy_features.values()
+            for spec in specs
+        )
+    )
+    if lazy_specs:
+        restored = subprocess.run(
+            [
+                uv_bin,
+                "pip",
+                "install",
+                "--python",
+                str(_venv_python(candidate)),
+                "--no-config",
+                *lazy_specs,
+            ],
+            cwd=project_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if restored.returncode != 0:
+            logger.warning(
+                "candidate lazy dependency restore failed (rc=%d): %s",
+                restored.returncode,
+                (restored.stderr or restored.stdout or "").strip(),
+            )
+            _remove_tree(candidate, boundary=runtime_root)
+            return None
+        restored_features = _capture_active_lazy_feature_specs(
+            _venv_python(candidate),
+            project_root=project_root,
+        )
+        missing_features = set(active_lazy_features) - set(restored_features or {})
+        if missing_features:
+            logger.warning(
+                "candidate lazy dependency restore verification failed: %s",
+                ", ".join(sorted(missing_features)),
+            )
+            _remove_tree(candidate, boundary=runtime_root)
+            return None
 
     healthy, detail, _ = _smoke_candidate_venv(candidate)
     if not healthy:
@@ -1257,6 +1376,7 @@ def repair_vulnerable_runtime(
             project_root=root,
             generation=generation,
             python=python,
+            source_python=live_python,
         )
         if candidate is None:
             _remove_tree(generation, boundary=managed_python_install_dir(root))

@@ -415,6 +415,10 @@ class TestRuntimeRepair:
 
         with patch("hermes_cli.managed_uv.subprocess.run", side_effect=fake_run), \
              patch(
+                 "hermes_cli.managed_uv._capture_active_lazy_feature_specs",
+                 return_value={},
+             ), \
+             patch(
                  "hermes_cli.managed_uv._smoke_candidate_venv",
                  return_value=(True, "", None),
              ):
@@ -423,6 +427,7 @@ class TestRuntimeRepair:
                 project_root=root,
                 generation=generation,
                 python=python,
+                source_python=root / "source-venv" / "bin" / "python",
             )
 
         assert candidate is not None
@@ -436,6 +441,89 @@ class TestRuntimeRepair:
         assert "--locked" in sync_argv
         assert "--no-config" not in sync_argv
         assert "UV_NO_CONFIG" not in sync_env
+
+    def test_capture_active_lazy_features_filters_to_current_allowlist(self, tmp_path):
+        from hermes_cli.managed_uv import _capture_active_lazy_feature_specs
+
+        source_python = tmp_path / "source-venv" / "bin" / "python"
+        result = MagicMock(
+            returncode=0,
+            stdout='["platform.telegram","attacker.injected","platform.telegram"]',
+        )
+
+        with patch("hermes_cli.managed_uv.subprocess.run", return_value=result) as run:
+            captured = _capture_active_lazy_feature_specs(
+                source_python,
+                project_root=tmp_path,
+            )
+
+        assert captured == {
+            "platform.telegram": ("python-telegram-bot[webhooks]==22.8",),
+        }
+        argv = run.call_args.args[0]
+        assert argv[:3] == [str(source_python), "-I", "-c"]
+        assert "from tools.lazy_deps import LAZY_DEPS" in argv[3]
+        assert argv[-1] == str(tmp_path)
+
+    def test_capture_active_lazy_features_fails_closed_on_invalid_probe(self, tmp_path):
+        from hermes_cli.managed_uv import _capture_active_lazy_feature_specs
+
+        with patch(
+            "hermes_cli.managed_uv.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="not-json"),
+        ):
+            assert (
+                _capture_active_lazy_feature_specs(
+                    tmp_path / "source-venv" / "bin" / "python",
+                    project_root=tmp_path,
+                )
+                is None
+            )
+
+    def test_stage_candidate_restores_active_lazy_features(self, tmp_path):
+        from hermes_cli.managed_uv import _stage_candidate_venv
+
+        root = tmp_path / "checkout"
+        root.mkdir()
+        (root / "uv.lock").write_text("# lock\n", encoding="utf-8")
+        generation = root / ".hermes-runtime" / "python" / "gen"
+        python = generation / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.write_text("py", encoding="utf-8")
+        source_python = root / "source-venv" / "bin" / "python"
+        source_python.parent.mkdir(parents=True)
+        source_python.write_text("old", encoding="utf-8")
+        captured = {
+            "platform.telegram": ("python-telegram-bot[webhooks]==22.8",),
+        }
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("hermes_cli.managed_uv.subprocess.run", side_effect=fake_run), \
+             patch(
+                 "hermes_cli.managed_uv._capture_active_lazy_feature_specs",
+                 side_effect=[captured, captured],
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._smoke_candidate_venv",
+                 return_value=(True, "", None),
+             ):
+            candidate = _stage_candidate_venv(
+                "uv",
+                project_root=root,
+                generation=generation,
+                python=python,
+                source_python=source_python,
+            )
+
+        assert candidate is not None
+        assert len(calls) == 3
+        assert calls[2][:3] == ["uv", "pip", "install"]
+        assert "--no-config" in calls[2]
+        assert "python-telegram-bot[webhooks]==22.8" in calls[2]
 
     def test_failed_candidate_preserves_live_venv(self, tmp_path):
         from hermes_cli.managed_uv import (
@@ -1286,4 +1374,3 @@ class TestVenvPythonUpdateBoundary:
         expected = Path("/opt/hermes/venv/Scripts/python.exe") \
             if sys.platform == "win32" else Path("/opt/hermes/venv/bin/python")
         assert _venv_python(Path("/opt/hermes/venv")) == expected
-
