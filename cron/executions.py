@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 EXECUTION_OWNER_LEASE_SECONDS = 300
+HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
@@ -41,8 +42,10 @@ _recovery_intent_ids: Set[str] = set()
 
 
 def _connect() -> sqlite3.Connection:
+    from cron.jobs import _ensure_cron_dir
+
     path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_cron_dir(path.parent)
     return sqlite3.connect(path, timeout=5)
 
 
@@ -68,6 +71,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
                ('claimed','running','completed','failed','unknown')),
+             handoff_pending INTEGER NOT NULL DEFAULT 0,
+             handoff_started_at REAL,
              claimed_at TEXT NOT NULL,
              started_at TEXT,
              finished_at TEXT,
@@ -84,6 +89,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("pid_namespace", "pid_namespace TEXT"),
         ("heartbeat_at", "heartbeat_at TEXT"),
         ("fire_claim_acquired", "fire_claim_acquired INTEGER NOT NULL DEFAULT 1"),
+        ("handoff_pending", "handoff_pending INTEGER NOT NULL DEFAULT 0"),
+        ("handoff_started_at", "handoff_started_at REAL"),
     )
     for column, ddl in migrations:
         if column not in columns:
@@ -347,7 +354,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
-             ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
+             ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (limit,),
     )
@@ -386,14 +393,64 @@ def create_execution(
     return record  # type: ignore[return-value]
 
 
+def mark_execution_handoff_pending(execution_id: str) -> Optional[Dict[str, Any]]:
+    """Fence restart recovery while an external worker is adopting a claim."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions
+               SET handoff_pending=1, handoff_started_at=?
+               WHERE id=? AND status='claimed'
+                 AND process_id=? AND pid=?""",
+            (time.time(), execution_id, _PROCESS_ID, os.getpid()),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+    _emit_execution_state(record)
+    return record
+
+
+def adopt_claimed_execution(execution_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically transfer and start an attempt in its worker process.
+
+    The dispatching gateway creates the row before spawning a restart-safe
+    worker.  Adoption is the single ``claimed`` → ``running`` gate: only the
+    winner may acknowledge ownership or run side effects.
+    """
+    pid = os.getpid()
+    process_started_at = _process_start_time(pid)
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions
+               SET process_id=?, pid=?, process_started_at=?,
+                   status='running', started_at=?, handoff_pending=0,
+                   handoff_started_at=NULL
+               WHERE id=? AND status='claimed' AND handoff_pending=1""",
+            (_PROCESS_ID, pid, process_started_at, now, execution_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+    _emit_execution_state(record)
+    return record
+
+
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()
     with _transaction() as conn:
         cur = conn.execute(
-            """UPDATE executions SET status='running', started_at=?, heartbeat_at=?
-               WHERE id=? AND status='claimed' AND fire_claim_acquired=1""",
-            (now, now, execution_id),
+            """UPDATE executions
+               SET status='running', started_at=?, heartbeat_at=?,
+                   handoff_pending=0, handoff_started_at=NULL
+               WHERE id=? AND status='claimed' AND fire_claim_acquired=1
+                 AND handoff_pending=0 AND process_id=? AND pid=?""",
+            (now, now, execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
@@ -414,9 +471,12 @@ def finish_execution(
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
         cur = conn.execute(
-            """UPDATE executions SET status=?, finished_at=?, error=?
-               WHERE id=? AND status IN ('claimed','running')""",
-            (status, now, detail, execution_id),
+            """UPDATE executions
+               SET status=?, finished_at=?, error=?, handoff_pending=0,
+                   handoff_started_at=NULL
+               WHERE id=? AND status IN ('claimed','running')
+                 AND process_id=? AND pid=?""",
+            (status, now, detail, execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
@@ -690,6 +750,18 @@ def interrupted_execution_candidates() -> List[Dict[str, Any]]:
             fire_claim_generation=fire_claim_generations.get(str(row["id"])),
         ):
             continue
+        # A row mid-handoff to an external worker gets a grace window before
+        # any recovery pass may reap it, so a concurrently-adopting worker
+        # always has time to win -- this predates fire-claim/lease liveness
+        # (#handoff-adoption), matching _recover_dead_owner_executions()'s
+        # own respect for the same grace period.
+        handoff_started_at = row["handoff_started_at"]
+        if (
+            row["handoff_pending"]
+            and handoff_started_at is not None
+            and time.time() - float(handoff_started_at) < HANDOFF_ADOPTION_GRACE_SECONDS
+        ):
+            continue
         record = _record(row)
         if record is not None:
             record["_fire_claim_generation"] = fire_claim_generations.get(execution_id)
@@ -830,8 +902,23 @@ def prune_orphaned_interrupted_retry_acks() -> int:
 def mark_interrupted_executions_unknown(
     execution_ids: Collection[str], *, retry_job_ids: Collection[str] = (),
     expected_heartbeats: Optional[Mapping[str, Optional[str]]] = None,
+    expected_snapshots: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """CAS abandoned attempts to unknown after any durable retry requeue."""
+    """CAS abandoned attempts to unknown after any durable retry requeue.
+
+    ``expected_snapshots``, keyed by execution_id, carries the exact
+    status/process_id/pid/handoff_pending/handoff_started_at each row had
+    when the CALLER determined abandonment (e.g.
+    interrupted_execution_candidates()'s own SELECT). Passing it closes a
+    race where this function's own fresh internal SELECT would otherwise
+    observe -- and then durably CAS-match against -- a DIFFERENT owner's
+    write (e.g. a concurrent adopt_claimed_execution()) that landed between
+    the caller's determination and this call. Without it, each row's CAS
+    values are read fresh from the row's current state here, which is the
+    right default for callers (like the fire-claim TTL retry-requeue path)
+    that intentionally do not care about an ownership change within the
+    same call window.
+    """
     ids = {str(value) for value in execution_ids if value}
     retry_ids = {str(value) for value in retry_job_ids if value}
     if not ids:
@@ -840,11 +927,44 @@ def mark_interrupted_executions_unknown(
     recovered: List[Dict[str, Any]] = []
     with _transaction() as conn:
         rows = conn.execute(
-            "SELECT id, job_id FROM executions WHERE status IN ('claimed','running')"
+            """SELECT id, job_id, status, process_id, pid, process_started_at,
+                      handoff_pending, handoff_started_at
+               FROM executions
+               WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
             if row["id"] not in ids:
                 continue
+            # Note: unlike recover_interrupted_executions() (the OS-liveness-
+            # based crash-recovery scan), this function is called AFTER the
+            # caller has already determined abandonment via the fire-claim
+            # TTL (requeue_interrupted_jobs / due-scan), not via process
+            # liveness. The owning process may well still be alive and busy
+            # elsewhere — that is irrelevant here, so no _owner_is_live or
+            # handoff-grace gate is applied; the caller's TTL determination
+            # is trusted and the CAS below is what keeps this race-safe.
+            if expected_snapshots is not None:
+                snapshot = expected_snapshots.get(str(row["id"]))
+                if snapshot is None:
+                    # The caller asked for snapshot-fenced CAS but did not
+                    # supply one for this row -- falling back to a fresh
+                    # re-select here would reopen exactly the race this
+                    # parameter exists to close (a concurrent owner change
+                    # landing between the caller's determination and this
+                    # call). Skip the row rather than risk it; the caller's
+                    # own next cycle will re-evaluate it from scratch.
+                    continue
+                cas_status = snapshot["status"]
+                cas_process_id = snapshot["process_id"]
+                cas_pid = snapshot["pid"]
+                cas_handoff_pending = snapshot["handoff_pending"]
+                cas_handoff_started_at = snapshot["handoff_started_at"]
+            else:
+                cas_status = row["status"]
+                cas_process_id = row["process_id"]
+                cas_pid = row["pid"]
+                cas_handoff_pending = row["handoff_pending"]
+                cas_handoff_started_at = row["handoff_started_at"]
             detail = (
                 "Scheduler restarted after this execution's owner exited before a durable "
                 "terminal state; whether side effects ran is unknown."
@@ -859,12 +979,19 @@ def mark_interrupted_executions_unknown(
             heartbeat_fence = (
                 " AND heartbeat_at IS ?" if expected_heartbeats is not None else ""
             )
+            params = (
+                now, detail, row["id"], cas_status, cas_process_id, cas_pid,
+                cas_handoff_pending, cas_handoff_started_at,
+            )
+            if expected_heartbeats is not None:
+                params = params + (expected_heartbeat,)
             cur = conn.execute(
-                f"""UPDATE executions SET status='unknown', finished_at=?, error=?
-                    WHERE id=? AND status IN ('claimed','running'){heartbeat_fence}""",
-                (now, detail, row["id"], expected_heartbeat)
-                if expected_heartbeats is not None
-                else (now, detail, row["id"]),
+                f"""UPDATE executions
+                    SET status='unknown', finished_at=?, error=?,
+                        handoff_pending=0, handoff_started_at=NULL
+                    WHERE id=? AND status=? AND process_id=? AND pid IS ?
+                      AND handoff_pending=? AND handoff_started_at IS ?{heartbeat_fence}""",
+                params,
             )
             if cur.rowcount:
                 if row["job_id"] in retry_ids:
@@ -976,8 +1103,153 @@ def reconcile_pre_run_abort_executions() -> int:
     return terminalized
 
 
+def _recover_dead_owner_executions(
+    *, exclude_ids: Collection[str] = ()
+) -> List[Dict[str, Any]]:
+    """General lease-staleness + handoff-adoption-grace dead-owner sweep.
+
+    Complements interrupted_execution_candidates()'s fire-claim/lease-based
+    detection below: that pass only ever considers jobs with an owed
+    fire-claim/interrupted-retry policy, gated behind fire_recovery_fence per
+    job. This pass instead walks every OTHER claimed/running row directly
+    and reaps any whose owner is provably dead, independent of
+    fire_claim_acquired or fence contention.
+
+    Reuses _owner_lease_is_stale() (the same host-affinity-aware check
+    interrupted_execution_candidates() itself uses) rather than calling
+    _owner_is_live() directly: a bare PID-liveness check has no concept of
+    which host a row's owner actually ran on, so on a multi-host deployment
+    it would look up a REMOTE host's PID in this host's own process table,
+    find nothing, and reap a perfectly healthy remote execution.
+
+    Every row belonging to a job with retry_interrupted=True is left alone
+    unconditionally, even if this sweep's own liveness check would call it
+    dead -- only interrupted_execution_candidates()'s fenced, requeue-aware
+    path may ever terminalize those rows (this sweep has no requeue logic,
+    so terminalizing one here would silently drop its at-least-once retry
+    guarantee). If that pass has not reached it yet this cycle, a later
+    cycle will.
+
+    A handoff-pending row gets a grace window before being reaped, so a
+    worker that is mid-adoption always wins the exact-row CAS below rather
+    than racing a premature recovery here.
+
+    ``exclude_ids`` additionally skips every row the fire-claim/interrupted-
+    retry pass already evaluated this cycle (whether or not it acted) --
+    that pass's heartbeat-fenced renewal check is the authoritative
+    liveness signal for those rows, and this sweep must not re-litigate it.
+
+    The liveness/staleness evaluation runs OUTSIDE any held transaction
+    (each row's OS/procfs check can be slow, and the ledger's write lock is
+    process-wide) -- only the read and the final per-row CAS write are
+    transaction-scoped, matching interrupted_execution_candidates()'s own
+    structure.
+    """
+    from cron.jobs import load_jobs
+
+    skip_ids = {str(value) for value in exclude_ids if value}
+    try:
+        stored_jobs = load_jobs()
+    except Exception:
+        logger.warning(
+            "Skipping generic dead-owner execution recovery because jobs "
+            "store ownership could not be verified",
+            exc_info=True,
+        )
+        return []
+    retry_interrupted_job_ids = {
+        str(job.get("id"))
+        for job in stored_jobs
+        if isinstance(job, dict) and job.get("retry_interrupted") is True
+    }
+    local_machine_id = _machine_id()
+    local_boot_id = _boot_id()
+    local_pid_namespace = _pid_namespace_id()
+
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT id, job_id, status, process_id, pid, process_started_at,
+                      machine_id, boot_id, pid_namespace, heartbeat_at, claimed_at,
+                      handoff_pending, handoff_started_at
+               FROM executions
+               WHERE status IN ('claimed','running')"""
+        ).fetchall()
+    snapshots = [dict(row) for row in rows]
+
+    to_reap: List[Dict[str, Any]] = []
+    for row in snapshots:
+        execution_id = str(row["id"])
+        if execution_id in skip_ids:
+            continue
+        if str(row["job_id"]) in retry_interrupted_job_ids:
+            continue
+        if row["process_id"] == _PROCESS_ID:
+            continue
+        if not _owner_lease_is_stale(
+            row,
+            local_machine_id=local_machine_id,
+            local_boot_id=local_boot_id,
+            local_pid_namespace=local_pid_namespace,
+        ):
+            continue
+        handoff_started_at = row["handoff_started_at"]
+        if (
+            row["handoff_pending"]
+            and handoff_started_at is not None
+            and time.time() - float(handoff_started_at)
+            < HANDOFF_ADOPTION_GRACE_SECONDS
+        ):
+            continue
+        to_reap.append(row)
+
+    if not to_reap:
+        return []
+
+    now = _hermes_now().isoformat()
+    detail = (
+        "Scheduler restarted after this execution's owner exited before a durable "
+        "terminal state; whether side effects ran is unknown."
+    )
+    recovered: List[Dict[str, Any]] = []
+    with _transaction() as conn:
+        for row in to_reap:
+            cur = conn.execute(
+                """UPDATE executions
+                   SET status='unknown', finished_at=?, error=?,
+                       handoff_pending=0, handoff_started_at=NULL
+                   WHERE id=? AND status=? AND process_id=? AND pid IS ?
+                     AND handoff_pending=? AND handoff_started_at IS ?
+                     AND heartbeat_at IS ?""",
+                (now, detail, row["id"], row["status"], row["process_id"], row["pid"],
+                 row["handoff_pending"], row["handoff_started_at"], row["heartbeat_at"]),
+            )
+            if cur.rowcount:
+                record = _record(conn.execute(
+                    "SELECT * FROM executions WHERE id=?", (row["id"],)
+                ).fetchone())
+                if record is not None:
+                    recovered.append(record)
+        if recovered:
+            _prune_unlocked(conn)
+    for record in recovered:
+        _emit_execution_state(record)
+    return recovered
+
+
 def recover_interrupted_executions() -> int:
-    """Classify abandoned attempts after durably applying explicit retry policy."""
+    """Classify abandoned attempts after durably applying explicit retry policy.
+
+    Two independent passes: interrupted_execution_candidates() below handles
+    jobs with an owed fire-claim/interrupted-retry policy (requeuing them
+    under the fence before terminalizing their execution row).
+    _recover_dead_owner_executions() then sweeps claimed/running rows whose
+    job does NOT have retry_interrupted enabled, reaping any with a provably
+    dead owner -- e.g. fire_claim_acquired=False rows, or rows with no retry
+    policy at all. A retry_interrupted=True row is never touched by the
+    second pass, even when fence contention or timing keeps it out of the
+    first pass's `candidates` this cycle: it is deferred to a later cycle of
+    the first pass, never reaped without its requeue guarantee.
+    """
     from cron.jobs import reconcile_interrupted_retry_markers
 
     pre_run_aborts = reconcile_pre_run_abort_executions()
@@ -1032,6 +1304,22 @@ def recover_interrupted_executions() -> int:
                         str(row["id"]): row.get("heartbeat_at")
                         for row in job_candidates
                     }
+                    # Snapshot each row's own ownership fields exactly as
+                    # interrupted_execution_candidates() observed them, so
+                    # the terminal CAS below cannot durably match a
+                    # DIFFERENT owner's write (e.g. a concurrent
+                    # adopt_claimed_execution()) that lands in the window
+                    # between that scan and this call.
+                    candidate_snapshots = {
+                        str(row["id"]): {
+                            "status": row.get("status"),
+                            "process_id": row.get("process_id"),
+                            "pid": row.get("pid"),
+                            "handoff_pending": row.get("handoff_pending"),
+                            "handoff_started_at": row.get("handoff_started_at"),
+                        }
+                        for row in job_candidates
+                    }
                     requeued = requeue_interrupted_jobs(
                         job_candidates, expected_heartbeats=candidate_heartbeats
                     )
@@ -1039,6 +1327,7 @@ def recover_interrupted_executions() -> int:
                         [row["id"] for row in job_candidates],
                         retry_job_ids=requeued,
                         expected_heartbeats=candidate_heartbeats,
+                        expected_snapshots=candidate_snapshots,
                     )
                     recovered.extend(job_recovered)
                     all_requeued.update(requeued)
@@ -1064,6 +1353,23 @@ def recover_interrupted_executions() -> int:
                 "Durably requeued %d interrupted cron job(s) under explicit at-least-once policy",
                 len(all_requeued),
             )
+
+    # General dead-owner sweep: catches every claimed/running row the
+    # fire-claim/interrupted-retry pass above does not reach at all --
+    # fire_claim_acquired=False rows, or rows whose job has no
+    # retry_interrupted policy. A row whose JOB has retry_interrupted=True
+    # is never touched by this sweep even when fence contention or timing
+    # kept it out of `candidates` this cycle: only the pass above may ever
+    # terminalize (with requeue) such a row, on this cycle or a later one --
+    # see _recover_dead_owner_executions()'s own docstring. `candidates`
+    # (rows the pass above evaluated, whether or not it acted on them) is
+    # excluded too, since that pass's decision is authoritative for them.
+    generic_recovered = _recover_dead_owner_executions(
+        exclude_ids=(str(row["id"]) for row in candidates)
+    )
+    if generic_recovered:
+        recovered.extend(generic_recovered)
+
     try:
         pruned = prune_orphaned_interrupted_retry_acks()
         if pruned:
@@ -1097,6 +1403,16 @@ def list_executions(
             params,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
+    """Return one exact execution attempt, or ``None`` when it is absent."""
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?",
+            (str(execution_id),),
+        ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def latest_execution(job_id: str) -> Optional[Dict[str, Any]]:
