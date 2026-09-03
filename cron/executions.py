@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 EXECUTION_OWNER_LEASE_SECONDS = 300
+HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
@@ -41,8 +42,10 @@ _recovery_intent_ids: Set[str] = set()
 
 
 def _connect() -> sqlite3.Connection:
+    from cron.jobs import _ensure_cron_dir
+
     path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_cron_dir(path.parent)
     return sqlite3.connect(path, timeout=5)
 
 
@@ -68,6 +71,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
                ('claimed','running','completed','failed','unknown')),
+             handoff_pending INTEGER NOT NULL DEFAULT 0,
+             handoff_started_at REAL,
              claimed_at TEXT NOT NULL,
              started_at TEXT,
              finished_at TEXT,
@@ -84,6 +89,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("pid_namespace", "pid_namespace TEXT"),
         ("heartbeat_at", "heartbeat_at TEXT"),
         ("fire_claim_acquired", "fire_claim_acquired INTEGER NOT NULL DEFAULT 1"),
+        ("handoff_pending", "handoff_pending INTEGER NOT NULL DEFAULT 0"),
+        ("handoff_started_at", "handoff_started_at REAL"),
     )
     for column, ddl in migrations:
         if column not in columns:
@@ -347,7 +354,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
-             ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
+             ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (limit,),
     )
@@ -386,14 +393,64 @@ def create_execution(
     return record  # type: ignore[return-value]
 
 
+def mark_execution_handoff_pending(execution_id: str) -> Optional[Dict[str, Any]]:
+    """Fence restart recovery while an external worker is adopting a claim."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions
+               SET handoff_pending=1, handoff_started_at=?
+               WHERE id=? AND status='claimed'
+                 AND process_id=? AND pid=?""",
+            (time.time(), execution_id, _PROCESS_ID, os.getpid()),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+    _emit_execution_state(record)
+    return record
+
+
+def adopt_claimed_execution(execution_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically transfer and start an attempt in its worker process.
+
+    The dispatching gateway creates the row before spawning a restart-safe
+    worker.  Adoption is the single ``claimed`` → ``running`` gate: only the
+    winner may acknowledge ownership or run side effects.
+    """
+    pid = os.getpid()
+    process_started_at = _process_start_time(pid)
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions
+               SET process_id=?, pid=?, process_started_at=?,
+                   status='running', started_at=?, handoff_pending=0,
+                   handoff_started_at=NULL
+               WHERE id=? AND status='claimed' AND handoff_pending=1""",
+            (_PROCESS_ID, pid, process_started_at, now, execution_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+    _emit_execution_state(record)
+    return record
+
+
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()
     with _transaction() as conn:
         cur = conn.execute(
-            """UPDATE executions SET status='running', started_at=?, heartbeat_at=?
-               WHERE id=? AND status='claimed' AND fire_claim_acquired=1""",
-            (now, now, execution_id),
+            """UPDATE executions
+               SET status='running', started_at=?, heartbeat_at=?,
+                   handoff_pending=0, handoff_started_at=NULL
+               WHERE id=? AND status='claimed' AND fire_claim_acquired=1
+                 AND handoff_pending=0 AND process_id=? AND pid=?""",
+            (now, now, execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
@@ -414,9 +471,12 @@ def finish_execution(
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
         cur = conn.execute(
-            """UPDATE executions SET status=?, finished_at=?, error=?
-               WHERE id=? AND status IN ('claimed','running')""",
-            (status, now, detail, execution_id),
+            """UPDATE executions
+               SET status=?, finished_at=?, error=?, handoff_pending=0,
+                   handoff_started_at=NULL
+               WHERE id=? AND status IN ('claimed','running')
+                 AND process_id=? AND pid=?""",
+            (status, now, detail, execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
@@ -840,11 +900,22 @@ def mark_interrupted_executions_unknown(
     recovered: List[Dict[str, Any]] = []
     with _transaction() as conn:
         rows = conn.execute(
-            "SELECT id, job_id FROM executions WHERE status IN ('claimed','running')"
+            """SELECT id, job_id, status, process_id, pid, process_started_at,
+                      handoff_pending, handoff_started_at
+               FROM executions
+               WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
             if row["id"] not in ids:
                 continue
+            # Note: unlike recover_interrupted_executions() (the OS-liveness-
+            # based crash-recovery scan), this function is called AFTER the
+            # caller has already determined abandonment via the fire-claim
+            # TTL (requeue_interrupted_jobs / due-scan), not via process
+            # liveness. The owning process may well still be alive and busy
+            # elsewhere — that is irrelevant here, so no _owner_is_live or
+            # handoff-grace gate is applied; the caller's TTL determination
+            # is trusted and the CAS below is what keeps this race-safe.
             detail = (
                 "Scheduler restarted after this execution's owner exited before a durable "
                 "terminal state; whether side effects ran is unknown."
@@ -859,12 +930,19 @@ def mark_interrupted_executions_unknown(
             heartbeat_fence = (
                 " AND heartbeat_at IS ?" if expected_heartbeats is not None else ""
             )
+            params = (
+                now, detail, row["id"], row["status"], row["process_id"], row["pid"],
+                row["handoff_pending"], row["handoff_started_at"],
+            )
+            if expected_heartbeats is not None:
+                params = params + (expected_heartbeat,)
             cur = conn.execute(
-                f"""UPDATE executions SET status='unknown', finished_at=?, error=?
-                    WHERE id=? AND status IN ('claimed','running'){heartbeat_fence}""",
-                (now, detail, row["id"], expected_heartbeat)
-                if expected_heartbeats is not None
-                else (now, detail, row["id"]),
+                f"""UPDATE executions
+                    SET status='unknown', finished_at=?, error=?,
+                        handoff_pending=0, handoff_started_at=NULL
+                    WHERE id=? AND status=? AND process_id=? AND pid=?
+                      AND handoff_pending=? AND handoff_started_at IS ?{heartbeat_fence}""",
+                params,
             )
             if cur.rowcount:
                 if row["job_id"] in retry_ids:
@@ -1097,6 +1175,16 @@ def list_executions(
             params,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
+    """Return one exact execution attempt, or ``None`` when it is absent."""
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?",
+            (str(execution_id),),
+        ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def latest_execution(job_id: str) -> Optional[Dict[str, Any]]:
