@@ -904,8 +904,11 @@ def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
     executions.latest_executions(["leak-check"])
     executions.recover_interrupted_executions()
 
-    assert len(opened) == 8
-    assert len(closed) == 8
+    # 9, not 8: recover_interrupted_executions() now runs a second,
+    # independent dead-owner sweep (_recover_dead_owner_executions) after
+    # the fire-claim/interrupted-retry pass, each with its own connection.
+    assert len(opened) == 9
+    assert len(closed) == 9
     assert set(opened) == set(closed)
 
 
