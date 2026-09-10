@@ -10,8 +10,9 @@ description: >-
         path: .
 
   The caller's job owns checkout; this action installs Python + hermes-agent
-  (git install — a supported CI-context install route) and runs the
-  validator against your plugin directory.
+  (an editable install from a fresh clone — the only pip-based install route
+  setup.py permits outside a Nix build sandbox) and runs the validator
+  against your plugin directory.
 
 inputs:
   path:
@@ -35,9 +36,15 @@ runs:
         _HERMES_REF: ${{ inputs.hermes-ref }}
       run: |
         set -euo pipefail
-        # CI-context install from git; the ref lets plugin authors validate
-        # against a pinned hermes release instead of main.
-        pip install "git+https://github.com/NousResearch/hermes-agent@${_HERMES_REF}"
+        # `pip install git+URL` (non-editable) invokes the PEP 517
+        # build_wheel hook, and setup.py deliberately raises from
+        # bdist_wheel outside a Nix build sandbox (HERMES_NIX_BUILD=1).
+        # An editable install from a clone calls build_editable instead,
+        # which setup.py's guard does not touch — the ref lets plugin
+        # authors validate against a pinned hermes release instead of main.
+        git clone --quiet https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent-src
+        git -C /tmp/hermes-agent-src checkout --quiet "$_HERMES_REF"
+        pip install --quiet -e /tmp/hermes-agent-src
 
     - name: Validate plugin
       shell: bash

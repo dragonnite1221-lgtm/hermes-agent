@@ -39,9 +39,7 @@ import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
 import { sessionAwaitingInput } from '@/store/prompts'
 import {
-  $cronSessions,
   $gatewayState,
-  $messagingSessions,
   $selectedStoredSessionId,
   $sessions,
   sessionMatchesStoredId,
