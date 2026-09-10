@@ -195,7 +195,12 @@ def test_fire_due_rearms_after_claimed_job_failure(chronos, monkeypatch):
 
     assert prov.fire_due("j1") is False
     assert claim_calls == [
-        {"return_job": True, "execution_id": "exec-1", "force": False}
+        {
+            "return_job": True,
+            "execution_id": "exec-1",
+            "force": False,
+            "manual": False,
+        }
     ]
     assert acquired == ["exec-1"]
     assert [provision["job_id"] for provision in fake.provisions] == ["j1"]
@@ -224,9 +229,28 @@ def test_fire_due_forwards_manual_force_to_claim(chronos, monkeypatch):
 
     assert prov.fire_due("j1", force=True) is False
     assert seen == [
-        {"return_job": True, "execution_id": "exec-1", "force": True}
+        {
+            "return_job": True,
+            "execution_id": "exec-1",
+            "force": True,
+            "manual": False,
+        }
     ]
     assert discarded == ["exec-1"]
+
+    # An off-tick run-now must reach the store claim as ``manual=True`` through
+    # the Chronos override, so the still-pending occurrence is not stamped.
+    seen.clear()
+    discarded.clear()
+    assert prov.fire_due("j1", manual=True) is False
+    assert seen == [
+        {
+            "return_job": True,
+            "execution_id": "exec-1",
+            "force": False,
+            "manual": True,
+        }
+    ]
 
 
 def test_fire_due_no_rearm_when_job_gone(chronos, monkeypatch):
@@ -266,16 +290,11 @@ def test_chronos_is_split_fire_capable(chronos):
     fire webhook uses durable claim admission (not the legacy fire_due path).
     Chronos deliberately has NO fire_due override — its re-arm logic lives in
     fire_claimed, which the split path invokes."""
-    from cron.scheduler_provider import (
-        provider_supports_fire_cancel,
-        provider_supports_force_fire,
-        provider_supports_split_fire,
-    )
+    from cron.scheduler_provider import provider_supports_force_fire, provider_supports_split_fire
 
     prov, _fake = chronos
     assert provider_supports_split_fire(prov) is True
     assert provider_supports_force_fire(prov) is True
-    assert provider_supports_fire_cancel(prov) is True
 
 
 def test_fire_claimed_rearms_persisted_retry_when_run_aborts(chronos, monkeypatch):

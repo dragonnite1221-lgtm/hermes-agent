@@ -22,3 +22,9 @@ tests/run_agent/test_92450_outer_error_retry_bound.py:generic-api-key:50
 tests/tools/test_delegate_request_overrides.py:generic-api-key:30
 tests/tui_gateway/test_composite_carrier_rewind.py:generic-api-key:458
 tests/tui_gateway/test_groups_methods.py:generic-api-key:247
+hermes_cli/auth_constants.py:generic-api-key:68
+hermes_cli/auth_constants.py:generic-api-key:94
+hermes_cli/auth_constants.py:generic-api-key:101
+hermes_cli/setup_migration.py:generic-api-key:94
+tests/agent/test_length_continuation_window_headroom.py:generic-api-key:29
+tests/run_agent/test_export_current_turn_boundary.py:generic-api-key:74

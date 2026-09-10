@@ -8,6 +8,9 @@ from unittest.mock import ANY, patch
 import pytest
 
 from hermes_cli.main import cmd_update, PROJECT_ROOT
+from hermes_cli import main_web_build
+from hermes_cli import main_install_repair
+from hermes_cli import update_cmd
 
 
 pytestmark = pytest.mark.usefixtures("isolate_update_host_runtime")
@@ -53,8 +56,22 @@ def mock_args():
 # ``shutil.which`` so the existing test setup keeps working without
 # per-test changes.
 @pytest.fixture(autouse=True)
-def _patch_managed_uv(request):
-    """Make managed_uv helpers follow shutil.which mocking in tests."""
+def _patch_managed_uv(request, monkeypatch):
+    """Make managed_uv helpers follow shutil.which mocking in tests.
+
+    These stubs MUST be installed through the shared function-scoped
+    ``monkeypatch`` rather than ``mock.patch``. A conftest autouse fixture
+    (``_suppress_concurrent_hermes_gate``) already requests ``monkeypatch``,
+    so that fixture — and therefore its undo stack — is created *before* this
+    one and torn down *after* it. With ``mock.patch`` here, a test that does
+    ``monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", ...)`` records
+    the MagicMock as the "original"; ``mock.patch`` then restores the real
+    function at this fixture's teardown, and ``monkeypatch.undo()`` afterwards
+    re-installs the MagicMock permanently — leaking a stubbed ``resolve_uv``
+    into every later test module (it broke tests/hermes_cli/test_managed_uv.py).
+    Routing everything through the one ``monkeypatch`` keeps a single LIFO
+    undo stack, so nested overrides unwind in the right order.
+    """
     import shutil
 
     # resolve_uv delegates to shutil.which("uv") so that test patches
@@ -68,14 +85,19 @@ def _patch_managed_uv(request):
     def _fake_update_managed_uv(**_kwargs):
         return None  # never actually self-update in tests
 
-    with patch("hermes_cli.managed_uv.resolve_uv", side_effect=_fake_resolve_uv), \
-         patch("hermes_cli.managed_uv.ensure_uv", side_effect=_fake_ensure_uv), \
-         patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv), \
-         patch(
-             "hermes_cli.update_cmd._post_update_sqlite_runtime_status",
-             return_value=(True, None),
-         ):
-        yield
+    monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", _fake_resolve_uv)
+    monkeypatch.setattr("hermes_cli.managed_uv.ensure_uv", _fake_ensure_uv)
+    monkeypatch.setattr("hermes_cli.managed_uv.update_managed_uv", _fake_update_managed_uv)
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd._post_update_sqlite_runtime_status",
+        lambda *a, **k: (True, None),
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _patch_gateway_discovery(isolated_update_runtime):
+    pass
 
 
 class TestCmdUpdateNpmLockfileCache:
@@ -92,11 +114,11 @@ class TestCmdUpdateNpmLockfileCache:
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}')
 
-        hm._record_npm_lockfile_hash(tmp_path)
+        update_cmd._record_npm_lockfile_hash(tmp_path)
 
         assert (
             self._cache_file(tmp_path, tmp_path).read_text()
-            == hm._npm_manifests_digest()
+            == update_cmd._npm_manifests_digest()
         )
 
     def test_package_json_only_edit_defeats_skip(self, tmp_path, monkeypatch):
@@ -109,7 +131,7 @@ class TestCmdUpdateNpmLockfileCache:
         (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}')
         (tmp_path / "package.json").write_text('{"dependencies": {}}')
         (tmp_path / "node_modules").mkdir()
-        hm._record_npm_lockfile_hash(tmp_path)
+        update_cmd._record_npm_lockfile_hash(tmp_path)
         assert hm._npm_lockfile_changed(tmp_path) is False
 
         (tmp_path / "package.json").write_text(
@@ -150,10 +172,10 @@ class TestCmdUpdateNpmLockfileCache:
             side_effect=lambda root: cache_roots.append(root) or False,
         ):
             monkeypatch.setenv("HERMES_HOME", str(shared_root))
-            hm._update_node_dependencies()
+            update_cmd._update_node_dependencies()
 
             monkeypatch.setenv("HERMES_HOME", str(named_profile))
-            hm._update_node_dependencies()
+            update_cmd._update_node_dependencies()
 
         assert cache_roots == [shared_root, shared_root]
 
@@ -171,7 +193,7 @@ class TestCmdUpdateTermuxUvBootstrap:
         mock_run.return_value = subprocess.CompletedProcess([], 1, stdout="", stderr="")
         monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: True)
 
-        uv_bin = hm._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
+        uv_bin = update_cmd._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
 
         assert uv_bin is None
         assert mock_run.call_count == 1
@@ -199,7 +221,7 @@ class TestCmdUpdateTermuxUvBootstrap:
         monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: None)
         monkeypatch.setattr("shutil.which", lambda name: pkg_uv if name == "uv" else None)
 
-        uv_bin = hm._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
+        uv_bin = update_cmd._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
 
         assert uv_bin == pkg_uv
         mock_run.assert_not_called()
@@ -996,7 +1018,7 @@ class TestCmdUpdateZipBranchRefusal:
     """
 
     def test_zip_fallback_refuses_non_main_branch(self, capsys):
-        from hermes_cli.main import _update_via_zip
+        from hermes_cli.update_cmd import _update_via_zip
 
         args = SimpleNamespace(branch="bb/gui")
         with pytest.raises(SystemExit) as exc_info:
@@ -1035,8 +1057,8 @@ termux = ["rich>=14"]
     )
     monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
 
-    assert hm._load_installable_optional_extras(group="all") == ["mcp"]
-    assert hm._load_installable_optional_extras(group="termux-all") == ["termux", "mcp"]
+    assert main_install_repair._load_installable_optional_extras(group="all") == ["mcp"]
+    assert main_install_repair._load_installable_optional_extras(group="termux-all") == ["termux", "mcp"]
 
 
 class TestNodeRuntimeNpmResolution:
@@ -1063,9 +1085,9 @@ class TestNodeRuntimeNpmResolution:
         )
 
         with patch(
-            "tools.browser_tool.warm_agent_browser_npx_cache", return_value=True
+            "tools.browser_tool_install.warm_agent_browser_npx_cache", return_value=True
         ):
-            failed = hm._update_node_dependencies()
+            failed = update_cmd._update_node_dependencies()
         assert failed == ["ui-tui, web workspaces"]
         out = capsys.readouterr().out
         assert "mixed state" in out
@@ -1091,11 +1113,11 @@ class TestNodeRuntimeNpmResolution:
         monkeypatch.setenv("PATH", "/mnt/c/Program Files/nodejs")
 
         with patch("subprocess.run") as mock_run, \
-             patch.object(hm, "_web_ui_build_needed", return_value=True), \
+             patch.object(main_web_build, "_web_ui_build_needed", return_value=True), \
              patch.object(hm, "_desktop_packaged_executable", return_value=None), \
              patch.object(hm, "_desktop_dist_exists", return_value=True), \
              patch.object(hm, "_run_npm_install_deterministic") as mock_npm_install, \
-             patch.object(hm, "_run_with_idle_timeout") as mock_idle_build, \
+             patch.object(main_web_build, "_run_with_idle_timeout") as mock_idle_build, \
              patch.object(hm, "_run_logged_subprocess") as mock_desktop_build:
             mock_run.side_effect = _make_run_side_effect(
                 branch="main", verify_ok=True, commit_count="1"
@@ -1116,6 +1138,7 @@ class TestNodeRuntimeNpmResolution:
         from hermes_cli import update_cmd
 
         desktop_dir = PROJECT_ROOT / "apps" / "desktop"
+        (desktop_dir / "package.json").write_text("{}", encoding="utf-8")
         packaged_exe = desktop_dir / "release" / "win-unpacked" / "Hermes.exe"
         build_ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
 
@@ -1265,7 +1288,7 @@ class TestUpdateNodeDependencies:
         """The npx cache warm-up is covered by its own dedicated test below;
         stub it out everywhere else so it doesn't add a spurious npm/npx
         call to the workspace-install assertions in this class."""
-        with patch("tools.browser_tool.warm_agent_browser_npx_cache", return_value=True):
+        with patch("tools.browser_tool_install.warm_agent_browser_npx_cache", return_value=True):
             yield
 
     def _npm_calls(self, mock_run):
@@ -1317,7 +1340,7 @@ class TestUpdateNodeDependencies:
         popen_calls = []
         mock_popen.side_effect = self._make_popen(popen_calls)
 
-        hm._update_node_dependencies()
+        update_cmd._update_node_dependencies()
 
         calls = self._popen_npm_calls(popen_calls)
         assert len(calls) == 1, f"expected exactly 1 npm call, got: {calls}"
@@ -1354,7 +1377,7 @@ class TestUpdateNodeDependencies:
         popen_calls = []
         mock_popen.side_effect = self._make_popen(popen_calls)
 
-        hm._update_node_dependencies()
+        update_cmd._update_node_dependencies()
 
         calls = self._popen_npm_calls(popen_calls)
         assert len(calls) == 1
@@ -1375,7 +1398,7 @@ class TestUpdateNodeDependencies:
         popen_calls = []
         mock_popen.side_effect = self._make_popen(popen_calls)
 
-        hm._update_node_dependencies()
+        update_cmd._update_node_dependencies()
 
         calls = self._popen_npm_calls(popen_calls)
         assert len(calls) == 1
@@ -1394,7 +1417,7 @@ class TestUpdateNodeDependencies:
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: False)
 
-        hm._update_node_dependencies()
+        update_cmd._update_node_dependencies()
 
         assert not self._npm_calls(mock_run), (
             "npm must not run when _npm_lockfile_changed reports no change"
@@ -1413,7 +1436,7 @@ class TestUpdateNodeDependencies:
         popen_calls = []
         mock_popen.side_effect = self._make_popen(popen_calls)
 
-        hm._update_node_dependencies()
+        update_cmd._update_node_dependencies()
 
         calls = self._popen_npm_calls(popen_calls)
         assert len(calls) == 1, f"expected npm to run when lockfile changed; got: {calls}"
@@ -1430,10 +1453,13 @@ class TestUpdateNodeDependencies:
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: True)
         recorded = []
-        monkeypatch.setattr(hm, "_record_npm_lockfile_hash", lambda root: recorded.append(root))
+        # _update_node_dependencies lives in update_cmd_deps and calls its own module-level
+        # _record_npm_lockfile_hash, so that binding is the real seam (update_cmd's is dead).
+        from hermes_cli import update_cmd_deps
+        monkeypatch.setattr(update_cmd_deps, "_record_npm_lockfile_hash", lambda root: recorded.append(root))
         mock_popen.side_effect = self._make_popen([], returncode=1, stderr_lines=["npm ERR!\n"])
 
-        hm._update_node_dependencies()
+        update_cmd._update_node_dependencies()
 
         assert not recorded, "lockfile hash must not be recorded when npm install fails"
 
@@ -1453,9 +1479,9 @@ class TestUpdateNodeDependencies:
         mock_popen.side_effect = self._make_popen([], returncode=1, stderr_lines=["npm ERR!\n"])
 
         with patch(
-            "tools.browser_tool.warm_agent_browser_npx_cache", return_value=True
+            "tools.browser_tool_install.warm_agent_browser_npx_cache", return_value=True
         ) as mock_warm:
-            hm._update_node_dependencies()
+            update_cmd._update_node_dependencies()
 
         mock_warm.assert_called_once()
 
@@ -1468,7 +1494,7 @@ class TestUpdateNodeDependencies:
         (tmp_path / "package.json").write_text("{}")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
 
-        hm._update_node_dependencies()
+        update_cmd._update_node_dependencies()
 
         mock_run.assert_not_called()
 
@@ -1480,7 +1506,7 @@ class TestUpdateNodeDependencies:
 
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
 
-        hm._update_node_dependencies()
+        update_cmd._update_node_dependencies()
 
         mock_run.assert_not_called()
 
@@ -1497,7 +1523,7 @@ class TestUpdateNodeDependencies:
         popen_calls = []
         mock_popen.side_effect = self._make_popen(popen_calls)
 
-        hm._update_node_dependencies()
+        update_cmd._update_node_dependencies()
 
         cwd_calls = [
             c["kwargs"].get("cwd")
