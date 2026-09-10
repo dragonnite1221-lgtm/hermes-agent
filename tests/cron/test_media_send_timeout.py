@@ -12,11 +12,8 @@ Covers two salvaged fixes:
   cron.media_send_timeout_seconds → 300s.
 """
 
-from cron.scheduler import (
-    _DEFAULT_MEDIA_SEND_TIMEOUT,
-    _get_media_send_timeout,
-    _send_media_via_adapter,
-)
+from cron.scheduler_script import _DEFAULT_MEDIA_SEND_TIMEOUT, _get_media_send_timeout
+from cron.scheduler_delivery import _send_media_via_adapter
 
 
 class TestMediaSendTimeoutResolution:

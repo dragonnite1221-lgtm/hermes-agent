@@ -28,3 +28,5 @@ hermes_cli/auth_constants.py:generic-api-key:101
 hermes_cli/setup_migration.py:generic-api-key:94
 tests/agent/test_length_continuation_window_headroom.py:generic-api-key:29
 tests/run_agent/test_export_current_turn_boundary.py:generic-api-key:74
+agent/anthropic_credentials.py:generic-api-key:34
+agent/context_compressor.py:generic-api-key:3215

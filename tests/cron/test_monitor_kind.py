@@ -65,6 +65,7 @@ def _install_agent_stubs(monkeypatch, observed: dict):
     ``observed["agent_runs"]`` counts real agent invocations.
     """
     import cron.scheduler as sched
+    from cron import scheduler_delivery as sched_delivery
 
     observed.setdefault("prompts", [])
     observed.setdefault("agent_runs", 0)
@@ -97,7 +98,7 @@ def _install_agent_stubs(monkeypatch, observed: dict):
         },
     )
 
-    monkeypatch.setattr(sched, "_resolve_origin", lambda job: None)
+    monkeypatch.setattr(sched_delivery, "_resolve_origin", lambda job: None)
     monkeypatch.setattr(sched, "_resolve_delivery_target", lambda job: None)
     monkeypatch.setattr(sched, "_resolve_cron_enabled_toolsets", lambda job, cfg: None)
     monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
@@ -251,7 +252,7 @@ def test_hash_is_exact_bytes(hermes_env):
 
 
 def test_monitor_script_forwards_per_job_timeout(hermes_env, monkeypatch):
-    import cron.scheduler as scheduler
+    import cron.scheduler_script as scheduler_script
     from cron.monitor import _run_monitor_source
 
     captured = {}
@@ -261,7 +262,7 @@ def test_monitor_script_forwards_per_job_timeout(hermes_env, monkeypatch):
         captured.update(kwargs)
         return True, "stable"
 
-    monkeypatch.setattr(scheduler, "_run_job_script", fake_run)
+    monkeypatch.setattr(scheduler_script, "_run_job_script", fake_run)
 
     result = _run_monitor_source(
         {
