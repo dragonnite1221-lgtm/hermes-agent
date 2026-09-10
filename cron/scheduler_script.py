@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from cron.jobs import _ensure_cron_dir
+from cron.jobs import MAX_SCRIPT_TIMEOUT_SECONDS, _ensure_cron_dir
 from pathlib import Path
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -335,14 +335,24 @@ def _run_job_script(
     Absolute and ~-prefixed paths are also validated to ensure they stay within the scripts dir. workdir:
     Optional absolute path to use as the script's cwd. When set, the subprocess runs in this directory
     instead of the scripts-dir parent. See #69396. timeout_seconds: Optional per-job override
-    (``job["script_timeout_seconds"]``, already bounded to ``MAX_SCRIPT_TIMEOUT_SECONDS`` by
-    ``cron.jobs._normalize_script_timeout_seconds`` at create/update time). When None, falls back to
-    the env/config/module-level default via ``_get_script_timeout()``.
+    (``job["script_timeout_seconds"]``, normally already bounded to ``MAX_SCRIPT_TIMEOUT_SECONDS`` by
+    ``cron.jobs._normalize_script_timeout_seconds`` at create/update time). Re-validated here since this
+    is the runtime execution path and the value may come from a legacy or hand-edited job record that
+    predates that validation; an invalid value falls back to the env/config/module-level default via
+    ``_get_script_timeout()`` rather than raising, so a bad persisted value degrades gracefully instead
+    of crashing an otherwise-legitimate scheduled run.
     """
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
-    script_timeout = timeout_seconds if timeout_seconds is not None else _get_script_timeout()
+    if (
+        isinstance(timeout_seconds, int)
+        and not isinstance(timeout_seconds, bool)
+        and 0 < timeout_seconds <= MAX_SCRIPT_TIMEOUT_SECONDS
+    ):
+        script_timeout = timeout_seconds
+    else:
+        script_timeout = _get_script_timeout()
     argv, env_overlay, err = _script_argv(path)
     if argv is None:
         return False, err

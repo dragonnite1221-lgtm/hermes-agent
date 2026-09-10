@@ -3365,7 +3365,9 @@ def claim_job_for_fire(
         # Clearing this marker is the commit point of the cross-store handoff: the ledger check
         # above proved the abandoned attempts terminal before this retry could be acquired.
         job.pop("interrupted_retry", None)
-        if _job_schedule_kind(job) in {"cron", "interval"}:
+        # manual = off-tick run-now: the pending next_run_at slot must survive this claim
+        # (see the docstring) so completion doesn't skip the occurrence that was actually due.
+        if not manual and _job_schedule_kind(job) in {"cron", "interval"}:
             nxt = compute_next_run(job["schedule"], now.isoformat())
             if nxt:
                 job["next_run_at"] = nxt
