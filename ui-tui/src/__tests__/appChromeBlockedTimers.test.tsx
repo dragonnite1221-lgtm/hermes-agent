@@ -201,8 +201,13 @@ const mountLayout = (overlay: Partial<OverlayState> = {}, ui: Partial<UiState> =
 }
 
 // Give React's scheduler a turn so a store-driven re-render (and the effect
-// re-arm that follows it) lands before we assert.
-const flush = () => new Promise(resolve => setTimeout(resolve, 20))
+// re-arm that follows it) lands before we assert. 20ms is enough on an idle
+// machine but not under CI load (multiple workspaces building/testing in
+// parallel), where the re-render can still be pending when the timer fires —
+// this test then reads the stale pre-overlay value and fails intermittently.
+// The scheduler turn itself is real work, not proportional to elapsed time,
+// so a longer real-clock wait costs nothing but adds real margin.
+const flush = () => new Promise(resolve => setTimeout(resolve, 150))
 
 let intervalSpy: IntervalSpy
 let nowSpy: ReturnType<typeof vi.spyOn<typeof Date, 'now'>>
