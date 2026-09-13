@@ -9,6 +9,7 @@ from pathlib import Path
 from acp_adapter.edit_approval import (
     EditProposal,
     build_acp_edit_tool_call,
+    build_edit_proposal,
     clear_edit_approval_requester,
     set_edit_approval_requester,
     should_auto_approve_edit,
@@ -122,3 +123,39 @@ def test_workspace_auto_approval_allows_workspace_and_tmp_but_not_sensitive(tmp_
         "session",
         str(tmp_path),
     )
+
+
+def test_multi_target_v4a_patch_with_outside_path_is_not_auto_approved(tmp_path, monkeypatch):
+    # Keep the global-tmp exemption out of the way so only the workspace
+    # boundary check matters for this test.
+    fake_tmp_root = tmp_path / "unrelated-tmp-root"
+    fake_tmp_root.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp_root))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    inside = workspace / "a.txt"
+    inside.write_text("inside\n", encoding="utf-8")
+
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside = outside_dir / "b.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+
+    # A V4A patch touching an in-workspace file first and an out-of-workspace
+    # file second. The display string joins both paths with ", "; a decision
+    # based on that joined string (instead of the real, individually resolved
+    # targets) can misclassify the whole patch as workspace-local.
+    patch_body = (
+        f"*** Update File: {inside}\n"
+        "@@\n"
+        "-inside\n"
+        "+inside changed\n"
+        f"*** Update File: {outside}\n"
+        "@@\n"
+        "-outside\n"
+        "+outside changed\n"
+    )
+    proposal = build_edit_proposal("patch", {"mode": "patch", "patch": patch_body})
+
+    assert should_auto_approve_edit(proposal, "workspace_session", str(workspace)) is False
