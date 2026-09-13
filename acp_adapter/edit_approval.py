@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import tempfile
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextvars import ContextVar, Token
@@ -137,26 +136,23 @@ def _proposal_for_patch_replace(arguments: dict[str, Any]) -> EditProposal:
 
 
 def _extract_v4a_patch_paths(patch_body: str) -> list[str]:
+    # Reuse the same parser that actually executes the patch (tools/
+    # patch_parser.py, via tools/file_operations.py) instead of a second,
+    # independently-maintained regex: a prior version of this function had
+    # its own `\s+`-after-`***` regex that was stricter than the parser's
+    # `\s*`, so a no-space header (`***Update File:`) that the parser still
+    # executed could slip past approval extraction entirely, letting an
+    # out-of-workspace target hide behind an in-workspace one. Deriving the
+    # paths from the real parser makes that class of drift impossible.
+    from tools.patch_parser import parse_v4a_patch
+
+    operations, _error = parse_v4a_patch(patch_body)
     paths: list[str] = []
-    for match in re.finditer(
-        r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$',
-        patch_body,
-        re.MULTILINE,
-    ):
-        path = match.group(1).strip()
-        if path:
-            paths.append(path)
-    for match in re.finditer(
-        r'^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$',
-        patch_body,
-        re.MULTILINE,
-    ):
-        src = match.group(1).strip()
-        dst = match.group(2).strip()
-        if src:
-            paths.append(src)
-        if dst:
-            paths.append(dst)
+    for op in operations:
+        if op.file_path:
+            paths.append(op.file_path)
+        if op.new_path:
+            paths.append(op.new_path)
     return paths
 
 

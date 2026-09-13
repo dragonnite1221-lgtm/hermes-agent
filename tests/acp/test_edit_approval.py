@@ -159,3 +159,42 @@ def test_multi_target_v4a_patch_with_outside_path_is_not_auto_approved(tmp_path,
     proposal = build_edit_proposal("patch", {"mode": "patch", "patch": patch_body})
 
     assert should_auto_approve_edit(proposal, "workspace_session", str(workspace)) is False
+
+
+def test_multi_target_v4a_patch_with_no_space_header_is_not_auto_approved(tmp_path, monkeypatch):
+    # tools/patch_parser.py's real executor matches headers with `\s*` after
+    # `***` (zero or more spaces), so a no-space header like
+    # "***Update File:" still runs. Target extraction must use the exact
+    # same parser, or a stricter regex here (e.g. requiring `\s+`) would
+    # silently drop a no-space-header target from `target_paths` while the
+    # patch still executes against it -- reopening the same auto-approval
+    # bypass this module exists to close.
+    fake_tmp_root = tmp_path / "unrelated-tmp-root"
+    fake_tmp_root.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp_root))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    inside = workspace / "a.txt"
+    inside.write_text("inside\n", encoding="utf-8")
+
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside = outside_dir / "b.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+
+    patch_body = (
+        f"***Update File: {inside}\n"
+        "@@\n"
+        "-inside\n"
+        "+inside changed\n"
+        f"***Update File: {outside}\n"
+        "@@\n"
+        "-outside\n"
+        "+outside changed\n"
+    )
+    proposal = build_edit_proposal("patch", {"mode": "patch", "patch": patch_body})
+
+    assert proposal.target_paths is not None
+    assert str(outside) in proposal.target_paths
+    assert should_auto_approve_edit(proposal, "workspace_session", str(workspace)) is False
