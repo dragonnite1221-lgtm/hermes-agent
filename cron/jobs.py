@@ -3783,9 +3783,27 @@ def _mark_job_run_locked(
                         # firing/delivering on schedule but doctor's
                         # hermes-cron-missed-daily false-alarms every day
                         # after, since nothing else ever advances the stamp.
-                        job["last_run_at"] = _hermes_now().isoformat()
-                        jobs[i] = job
-                        save_jobs(jobs)
+                        # Take the max against the already-persisted value
+                        # (not an unconditional overwrite): this callback's
+                        # ``now`` comes from the STALE owner's clock, which in
+                        # a multi-machine deployment can lag behind whatever a
+                        # newer claim owner already recorded — an unconditional
+                        # assignment could shove last_run_at backward and defeat
+                        # the whole point of this fix.
+                        candidate_last_run_at = _hermes_now()
+                        try:
+                            existing_last_run_at = _ensure_aware(
+                                datetime.fromisoformat(job["last_run_at"])
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            existing_last_run_at = None
+                        if (
+                            existing_last_run_at is None
+                            or candidate_last_run_at > existing_last_run_at
+                        ):
+                            job["last_run_at"] = candidate_last_run_at.isoformat()
+                            jobs[i] = job
+                            save_jobs(jobs)
                         return False
                 interrupted_retry = job.pop("interrupted_retry", None)
                 now = _hermes_now().isoformat()

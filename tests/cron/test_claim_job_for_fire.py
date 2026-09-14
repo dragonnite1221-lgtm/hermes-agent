@@ -187,6 +187,45 @@ def test_stale_fire_owner_cannot_mark_replacement_run(temp_home):
     assert persisted.get("last_status") == last_status_before
 
 
+def test_stale_fire_owner_cannot_move_last_run_at_backward(temp_home, monkeypatch):
+    """A stale claim owner's completion must not regress last_run_at.
+
+    In a multi-machine deployment the stale owner's ``_hermes_now()`` reads
+    its OWN clock, which can lag behind whatever a newer claim owner already
+    persisted (cross-host clock skew — the same condition claim_job_for_fire
+    already treats as expected, see the future-dated-claim handling there).
+    Bumping last_run_at unconditionally on discard would let a lagging host
+    shove the timestamp backward, defeating the fix's purpose of keeping it
+    monotonically advancing for hermes-cron-missed-daily.
+    """
+    from datetime import datetime, timedelta
+
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="skewed")
+    assert jobs.claim_job_for_fire(job["id"]) is True
+    original = dict(jobs.get_job(job["id"])["fire_claim"])
+
+    later_run_at = datetime.fromisoformat(original["at"]) + timedelta(minutes=10)
+    records = jobs.load_jobs()
+    records[0]["fire_claim"] = {"at": original["at"], "by": "replacement"}
+    records[0]["last_run_at"] = later_run_at.isoformat()
+    jobs.save_jobs(records)
+
+    # The stale owner's own clock is BEHIND the already-persisted last_run_at.
+    monkeypatch.setattr(
+        jobs, "_hermes_now", lambda: datetime.fromisoformat(original["at"])
+    )
+
+    assert jobs.mark_job_run(
+        job["id"],
+        success=True,
+        expected_fire_owner=original["by"],
+    ) is False
+    persisted = jobs.get_job(job["id"])
+    assert persisted.get("last_run_at") == later_run_at.isoformat()
+
+
 def test_fire_claim_fence_serializes_terminal_revocation(temp_home):
     """A side effect authorized by owner linearizes before terminal revocation."""
     from cron.jobs import (
