@@ -3771,6 +3771,39 @@ def _mark_job_run_locked(
                             "discarding stale completion",
                             job_id,
                         )
+                        # Still bump last_run_at: a run genuinely happened just
+                        # now (this callback firing proves it), even though we
+                        # can no longer trust it belongs to the CURRENT claim
+                        # and must not overwrite last_status/failure_streak/
+                        # fire_claim with a possibly-misattributed outcome.
+                        # Without this, a gateway restart mid-run (fire_claim
+                        # re-issued to the new instance before the old
+                        # instance's completion lands) permanently strands
+                        # last_run_at at its previous value: the job keeps
+                        # firing/delivering on schedule but doctor's
+                        # hermes-cron-missed-daily false-alarms every day
+                        # after, since nothing else ever advances the stamp.
+                        # Take the max against the already-persisted value
+                        # (not an unconditional overwrite): this callback's
+                        # ``now`` comes from the STALE owner's clock, which in
+                        # a multi-machine deployment can lag behind whatever a
+                        # newer claim owner already recorded — an unconditional
+                        # assignment could shove last_run_at backward and defeat
+                        # the whole point of this fix.
+                        candidate_last_run_at = _hermes_now()
+                        try:
+                            existing_last_run_at = _ensure_aware(
+                                datetime.fromisoformat(job["last_run_at"])
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            existing_last_run_at = None
+                        if (
+                            existing_last_run_at is None
+                            or candidate_last_run_at > existing_last_run_at
+                        ):
+                            job["last_run_at"] = candidate_last_run_at.isoformat()
+                            jobs[i] = job
+                            save_jobs(jobs)
                         return False
                 interrupted_retry = job.pop("interrupted_retry", None)
                 now = _hermes_now().isoformat()
