@@ -206,6 +206,67 @@ def test_desktop_owned_backend_is_accounted_for_without_kill():
     assert report_unaccounted_runtimes(outcomes) is False
 
 
+def test_launchd_named_profile_gateway_restart_matches():
+    # _restart_macos_launchd_gateways() records "ai.hermes.gateway-work",
+    # not systemd's "hermes-gateway-work" — a systemd-only check
+    # misclassifies a successfully restarted launchd gateway as unaccounted.
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("work", 500, supervisor="launchd")),
+        restarted_services=["ai.hermes.gateway-work"], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "restarted"
+    assert report_unaccounted_runtimes(outcomes) is False
+
+
+def test_launchd_default_profile_gateway_restart_matches():
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("default", 501, supervisor="launchd")),
+        restarted_services=["ai.hermes.gateway"], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "restarted"
+
+
+def test_desktop_survivor_probe_overrides_supervision():
+    # A confirmed survivor (still the pre-update incarnation) must not be
+    # masked as "safely supervised" just because it's desktop-owned — the
+    # update never terminates desktop backends, so nothing will respawn it
+    # onto the new checkout.
+    desktop_serve = RuntimeRecord(
+        kind="serve", profile="work", pid=406,
+        supervisor="desktop", restart_via="desktop",
+    )
+    survived = match_runtime_outcomes(
+        _plan(desktop_serve),
+        restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+        stale_serve_pids={406},
+    )
+    assert survived[0]["outcome"] == "unaccounted"
+    assert report_unaccounted_runtimes(survived) is True
+
+    # Same desktop backend, but the probe confirms it's a fresh incarnation
+    # (not in the stale set) — the probe still overrides, now confirming
+    # health instead of merely assuming it.
+    replaced = match_runtime_outcomes(
+        _plan(desktop_serve),
+        restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+        stale_serve_pids=set(),
+    )
+    assert replaced[0]["outcome"] == "restarted"
+
+    # No survivor probe at all (None) falls back to the prior default.
+    no_probe = match_runtime_outcomes(
+        _plan(desktop_serve),
+        restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+        stale_serve_pids=None,
+    )
+    assert no_probe[0]["outcome"] == "externally-supervised"
+
+
 def test_manual_backend_without_bookkeeping_remains_unaccounted():
     manual_serve = RuntimeRecord(
         kind="serve",

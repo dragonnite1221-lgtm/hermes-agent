@@ -543,13 +543,18 @@ def _gateway_unit_matches_profile(profile: str, unit: object) -> bool:
     bare substring check lets an unrelated unit whose name happens to
     contain the profile (``hermes-gateway-mywork.service`` for profile
     ``work``) falsely claim the match.
+
+    Both service vocabularies are accepted: systemd's ``hermes-gateway*``
+    and launchd's ``ai.hermes.gateway*`` (``_restart_macos_launchd_gateways()``
+    records the latter) — a systemd-only check misclassifies a successfully
+    restarted named-profile launchd gateway as unaccounted.
     """
     name = str(unit).removesuffix(".service")
     if "/" in name:
         name = name.rsplit("/", 1)[-1]
     if profile == "default":
-        return name == "hermes-gateway"
-    return name == f"hermes-gateway-{profile}"
+        return name in ("hermes-gateway", "ai.hermes.gateway")
+    return name in (f"hermes-gateway-{profile}", f"ai.hermes.gateway-{profile}")
 
 
 # Mechanisms whose restart phase populates the generic restarted_services /
@@ -570,11 +575,17 @@ def _serve_runtime_outcome(
     stale_serves: "set | None",
 ) -> str:
     """Outcome for one serve/dashboard runtime — never the gateway's."""
-    if r.restart_via == "desktop":
+    if r.restart_via == "desktop" and stale_serves is None:
         # The Desktop app owns this backend's entire lifecycle (start,
         # stop, respawn) outside the update's own restart bookkeeping —
         # there is nothing here to confirm against restarted_set/killed,
-        # and there never will be.
+        # and there never will be. But when the survivor probe DID run
+        # (stale_serves is not None) and shows this exact PID is still the
+        # pre-update incarnation, that is a confirmed unsafe survivor: the
+        # update deliberately never terminates desktop-owned backends, so
+        # nothing will respawn it onto the new checkout. Let the probe
+        # override this default instead of masking a real survivor as
+        # "safely supervised."
         return "externally-supervised"
     if r.pid is not None and r.pid in killed:
         return "stopped"
