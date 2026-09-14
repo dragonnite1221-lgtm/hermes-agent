@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import tempfile
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -23,13 +22,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class EditProposal:
-    """A proposed single-file edit that can be shown to an ACP client."""
+    """A proposed edit that can be shown to an ACP client.
+
+    ``path`` is a display string only (for multi-file V4A patches it is a
+    comma-joined summary and must never be parsed back into a filesystem
+    path). ``target_paths`` holds the real, individual target paths so
+    approval logic can check each one; it defaults to ``(path,)`` for the
+    single-target proposal kinds.
+    """
 
     tool_name: str
     path: str
     old_text: str | None
     new_text: str
     arguments: dict[str, Any]
+    target_paths: tuple[str, ...] | None = None
 
 
 EditApprovalRequester = Callable[[EditProposal], bool]
@@ -41,9 +48,6 @@ SENSITIVE_AUTO_APPROVE_NAMES = {".env", ".env.local", ".env.production", "id_rsa
 AUTO_APPROVE_ASK = "ask"
 AUTO_APPROVE_WORKSPACE = "workspace_session"
 AUTO_APPROVE_SESSION = "session"
-
-_V4A_FILE_RE = re.compile(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', re.MULTILINE)
-_V4A_MOVE_RE = re.compile(r'^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$', re.MULTILINE)
 
 
 def set_edit_approval_requester(requester: EditApprovalRequester | None) -> Token:
@@ -99,10 +103,24 @@ def _proposal_for_patch_replace(arguments: dict[str, Any]) -> EditProposal:
 
 
 def _extract_v4a_patch_paths(patch_body: str) -> list[str]:
-    paths = [m.group(1).strip() for m in _V4A_FILE_RE.finditer(patch_body)]
-    for match in _V4A_MOVE_RE.finditer(patch_body):
-        paths.extend(match.group(i).strip() for i in (1, 2))
-    return [p for p in paths if p]
+    # Reuse the same parser that actually executes the patch (tools/
+    # patch_parser.py, via tools/file_operations.py) instead of a second,
+    # independently-maintained regex: a prior version of this function had
+    # its own `\s+`-after-`***` regex that was stricter than the parser's
+    # `\s*`, so a no-space header (`***Update File:`) that the parser still
+    # executed could slip past approval extraction entirely, letting an
+    # out-of-workspace target hide behind an in-workspace one. Deriving the
+    # paths from the real parser makes that class of drift impossible.
+    from tools.patch_parser import parse_v4a_patch
+
+    operations, _error = parse_v4a_patch(patch_body)
+    paths: list[str] = []
+    for op in operations:
+        if op.file_path:
+            paths.append(op.file_path)
+        if op.new_path:
+            paths.append(op.new_path)
+    return paths
 
 
 def _proposal_for_patch_v4a(arguments: dict[str, Any]) -> EditProposal:
@@ -113,11 +131,20 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any]) -> EditProposal:
     if not paths:
         raise ValueError("no file paths found in V4A patch")
     single = len(paths) == 1
-    # ACP only supports a single diff payload: surface the exact V4A patch as new_text so
-    # patch-mode calls are permissioned and denied patches cannot mutate.
+    proposal_path = paths[0] if single else ", ".join(paths)
+    old_text = _read_text_if_exists(paths[0]) if single else None
     return EditProposal(
-        "patch", paths[0] if single else ", ".join(paths),
-        _read_text_if_exists(paths[0]) if single else None, patch_body, dict(arguments),
+        tool_name="patch",
+        path=proposal_path,
+        old_text=old_text,
+        # ACP only supports a single diff payload here.  Surface the exact V4A
+        # patch content before execution so patch-mode calls are permissioned
+        # and denied patches cannot mutate.
+        new_text=patch_body,
+        arguments=dict(arguments),
+        # Keep the real per-file targets alongside the joined display string
+        # so approval decisions never parse `path` back into a filesystem path.
+        target_paths=tuple(paths),
     )
 
 
@@ -140,14 +167,10 @@ def _is_sensitive_auto_approve_path(path: str) -> bool:
     return bool(lowered & {".git", ".ssh"}) or Path(path).name.lower() in SENSITIVE_AUTO_APPROVE_NAMES
 
 
-def should_auto_approve_edit(proposal: EditProposal, policy: str, cwd: str | None = None) -> bool:
-    """Return whether an ACP edit proposal may bypass the prompt for this session.
-
-    Session-scoped and conservative: sensitive paths still ask under autonomous policies."""
-    policy = str(policy or AUTO_APPROVE_ASK).strip()
-    if policy == AUTO_APPROVE_ASK or _is_sensitive_auto_approve_path(proposal.path):
+def _is_single_path_auto_approvable(raw_path: str, policy: str, cwd: str | None) -> bool:
+    if _is_sensitive_auto_approve_path(raw_path):
         return False
-    path = Path(proposal.path).expanduser().resolve(strict=False)
+    path = Path(raw_path).expanduser().resolve(strict=False)
     if policy == AUTO_APPROVE_SESSION:
         return True
     if policy == AUTO_APPROVE_WORKSPACE:
@@ -156,6 +179,24 @@ def should_auto_approve_edit(proposal: EditProposal, policy: str, cwd: str | Non
         return path.is_relative_to(Path(tempfile.gettempdir()).resolve(strict=False)) or (
             bool(cwd) and path.is_relative_to(Path(cwd).expanduser().resolve(strict=False)))
     return False
+
+
+def should_auto_approve_edit(proposal: EditProposal, policy: str, cwd: str | None = None) -> bool:
+    """Return whether an ACP edit proposal may bypass the prompt for this session.
+
+    This is intentionally session-scoped and conservative: sensitive paths still
+    ask even under autonomous policies. For multi-file V4A patches, ``proposal.path``
+    is only a comma-joined display string and must never be parsed back into a
+    filesystem path — every real target in ``proposal.target_paths`` is checked
+    individually, and the whole patch is denied auto-approval unless all of them
+    qualify.
+    """
+
+    policy = str(policy or AUTO_APPROVE_ASK).strip()
+    if policy == AUTO_APPROVE_ASK:
+        return False
+    targets = proposal.target_paths or (proposal.path,)
+    return all(_is_single_path_auto_approvable(target, policy, cwd) for target in targets)
 
 
 def _denied(message: str) -> str:
