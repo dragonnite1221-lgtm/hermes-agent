@@ -539,7 +539,15 @@ describe('useVirtualHistory offset cache reuse', () => {
 
       staleHeights.set(items[0]!.key, 1)
       instance.rerender(React.createElement(Harness, { expose, initialHeights: staleHeights, items }))
-      await delay(40)
+      // 40ms is enough on an idle machine but not under CI load (multiple
+      // workspaces building/testing in parallel), where the rerender's
+      // compensation effect can still be pending when the timer fires — the
+      // spy then reads as never-called (same class of flake fixed for
+      // appChromeBlockedTimers.test.tsx's flush() helper; #fa0431de92 called
+      // this file out by name as the next one to hit it). The scheduler turn
+      // is real work, not proportional to elapsed time, so more real-clock
+      // margin costs nothing here.
+      await delay(150)
 
       expect(adjustScrollTop).toHaveBeenCalledOnce()
       expect(adjustScrollTop).toHaveBeenCalledWith(1)
