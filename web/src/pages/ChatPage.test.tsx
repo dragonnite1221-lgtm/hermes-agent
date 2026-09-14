@@ -255,25 +255,37 @@ afterEach(async () => {
 });
 
 describe("ChatPage", () => {
-  it("treats loopback 4401 closes as stale-token reload candidates", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
+  it(
+    "treats loopback 4401 closes as stale-token reload candidates",
+    async () => {
+      const { default: ChatPage } = await import("./ChatPage");
 
-    await render(
-      <MemoryRouter initialEntries={["/chat"]}>
-        <ChatPage isActive />
-      </MemoryRouter>,
-    );
+      await render(
+        <MemoryRouter initialEntries={["/chat"]}>
+          <ChatPage isActive />
+        </MemoryRouter>,
+      );
 
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+      await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
 
-    FakeWebSocket.instances[0].onclose?.({
-      code: 4401,
-      reason: "auth: token_mismatch",
-      wasClean: true,
-    });
+      FakeWebSocket.instances[0].onclose?.({
+        code: 4401,
+        reason: "auth: token_mismatch",
+        wasClean: true,
+      });
 
-    expect(maybeReloadForLoopbackWsAuthFailure).toHaveBeenCalledWith(4401);
-  });
+      expect(maybeReloadForLoopbackWsAuthFailure).toHaveBeenCalledWith(4401);
+    },
+    // This file's shared transform/import cost (component render + router +
+    // WebSocket fixtures) runs once per test under vitest's isolation, and
+    // under CI load (multiple workspaces building/testing in parallel) that
+    // shared overhead alone can eat past the 5s default before this test's
+    // own render()/waitFor() even start (same CI-load timing-margin class as
+    // SessionsPage.test.tsx's fix). Explicit headroom instead of trimming
+    // the render+waitFor steps this test needs to actually exercise the
+    // reload-candidate path.
+    15000,
+  );
 
   it("attaches visualViewport keyboard-inset listeners only while the chat tab is active", async () => {
     // NS-434 follow-up: ChatPage stays mounted (hidden) on every dashboard
