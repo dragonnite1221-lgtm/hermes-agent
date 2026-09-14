@@ -99,11 +99,21 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     )
     monkeypatch.setattr(hermes_main, "_write_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
+    # _finish_dashboard_update_cleanup is declared `-> dict` and always
+    # returns one (even the "nothing to do" branches) — the caller's
+    # _fold_dashboard_cleanup_runtime_bookkeeping() unconditionally calls
+    # .get() on it. Returning None here (as this mock used to) raises
+    # AttributeError, which the caller's except-block turns into an
+    # unconditional gateway_fleet_restart_incomplete = True (fail-closed),
+    # making every test through this helper spuriously exit 1.
+    _no_dashboard_cleanup = lambda *a, **k: {
+        "matched": [], "killed": [], "failed": [], "unrecovered": [],
+    }
     monkeypatch.setattr(
-        hermes_main, "_finish_dashboard_update_cleanup", lambda *a, **k: None
+        hermes_main, "_finish_dashboard_update_cleanup", _no_dashboard_cleanup
     )
     monkeypatch.setattr(
-        update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **k: None
+        update_cmd, "_finish_dashboard_update_cleanup", _no_dashboard_cleanup
     )
     monkeypatch.setattr(hermes_main, "_build_web_ui", lambda *a, **k: None)
     monkeypatch.setattr(

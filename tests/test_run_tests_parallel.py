@@ -31,6 +31,23 @@ from pathlib import Path
 import pytest
 
 
+def _clean_env(**overrides: str) -> dict[str, str]:
+    """Base env for a subprocess that exercises run_tests_parallel.py directly.
+
+    Strips this suite's own HERMES_TEST_* orchestration knobs (workers,
+    slice, timeouts, ...) before copying the environment: a CI job running
+    *this* file already has HERMES_TEST_SLICE/HERMES_TEST_WORKERS set for
+    its own outer run_tests.sh invocation (see #tests.yml's fork sharding
+    matrix), and inheriting those into the runner-under-test here changes
+    the exact stdout these tests assert on — e.g. HERMES_TEST_SLICE leaking
+    in prints "Slice 2/4: 1 files" where a test expects the unsliced,
+    every-file output.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_TEST_")}
+    env.update(overrides)
+    return env
+
+
 # Both tests share the same handoff file: the leaker writes here, the
 # verifier reads here. We park it in $TMPDIR with a unique-per-run name
 # so concurrent invocations of the suite don't clobber each other.
@@ -73,8 +90,7 @@ def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> Non
     probe = probe_dir / "test_probe_smoke.py"
     probe.write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
 
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "cp1252:strict"
+    env = _clean_env(PYTHONIOENCODING="cp1252:strict")
 
     proc = subprocess.run(
         [
@@ -188,6 +204,7 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
         # text=True alone would decode with the locale codec (cp1252).
         encoding="utf-8",
         errors="replace",
+        env=_clean_env(),
         timeout=60,
     )
 
@@ -266,6 +283,7 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
         # text=True alone would decode with the locale codec (cp1252).
         encoding="utf-8",
         errors="replace",
+        env=_clean_env(),
         timeout=60,
     )
 
@@ -304,7 +322,7 @@ def test_positional_path_not_treated_as_flag(tmp_path: Path) -> None:
         [sys.executable, str(runner), str(probe_dir), "-j", "1",
          "--file-timeout", "30", "-q"],
         cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        encoding="utf-8", errors="replace", timeout=60,
+        encoding="utf-8", errors="replace", env=_clean_env(), timeout=60,
     )
     assert proc.returncode == 0, proc.stdout
     # Discovery found the probe file (2 tests), proving the positional path
@@ -350,6 +368,7 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=_clean_env(),
         timeout=60,
     )
 
@@ -391,7 +410,7 @@ def test_node_id_selector_runs_the_named_test(tmp_path: Path) -> None:
         [sys.executable, str(repo_root / "scripts" / "run_tests_parallel.py"),
          f"{target}::test_alpha", "-j", "1", "--file-timeout", "30"],
         cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=60,
+        text=True, env=_clean_env(), timeout=60,
     )
     assert proc.returncode == 0, proc.stdout
     assert "No test files to run" not in proc.stdout
@@ -410,7 +429,7 @@ def test_explicit_k_wins_over_node_id_inference(tmp_path: Path) -> None:
          f"{target}::test_alpha", "-k", "test_beta",
          "-j", "1", "--file-timeout", "30"],
         cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=60,
+        text=True, env=_clean_env(), timeout=60,
     )
     # -k test_beta wins: one test ran, and it wasn't filtered to nothing.
     assert proc.returncode == 0, proc.stdout
@@ -437,7 +456,7 @@ def test_multiple_absolute_paths_split_on_pathsep(tmp_path: Path) -> None:
          "--paths", os.pathsep.join([str(dir_a), str(dir_b)]),
          "-j", "1", "--file-timeout", "30", "-q"],
         cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        encoding="utf-8", errors="replace", timeout=60,
+        encoding="utf-8", errors="replace", env=_clean_env(), timeout=60,
     )
     assert proc.returncode == 0, proc.stdout
     assert "Discovered 2 test files" in proc.stdout, proc.stdout
