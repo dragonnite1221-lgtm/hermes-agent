@@ -89,13 +89,21 @@ _SPLAT_RE = re.compile(r"\*\*\s*([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def _splat_carries_stdin(call_text: str, content: str) -> bool:
-    """True when the call splats ``**name`` / ``**name(...)`` and ``name`` is defined in
-    the same file (assignment or ``def``) whose OWN expression/body sets ``stdin=``.
+    """True when the call splats ``**name`` / ``**name(...)`` and ANY splatted ``name`` is
+    defined in the same file (assignment or ``def``) whose OWN expression/body sets ``stdin=``.
 
     Shared kwargs helpers (``_RUN_KW = dict(..., stdin=DEVNULL)``, ``def _run_kwargs(): return
     dict(..., stdin=DEVNULL)``) legitimately carry the guard; we only accept them when the
     definition provably sets stdin= — never on the helper's name alone, and never because an
     unrelated later call in the file happens to pass ``stdin=``.
+
+    A call may splat more than one name, e.g. ``Popen(cmd, **_SUBPROCESS_KW, **popen_kwargs)``
+    where only ``_SUBPROCESS_KW`` sets stdin= and ``popen_kwargs`` carries unrelated
+    platform-specific flags. Requiring EVERY splatted name to independently set stdin= false-
+    positived on exactly this shape (#PR7 CI). It only takes one: two ``**`` unpacks in a single
+    call can't both define the same key without Python itself raising "got multiple values for
+    keyword argument" at call time, so a second splat can never silently clobber the first's
+    stdin= back to inherited.
     """
     names = set(_SPLAT_RE.findall(call_text))
     if not names:
@@ -116,7 +124,7 @@ def _splat_carries_stdin(call_text: str, content: str) -> bool:
                     node = n.value if n.value is not None else n
                     break
         if node is None:
-            return False
+            continue
         # stdin appears as a keyword (dict(stdin=...)) or as a dict-literal key ({"stdin": ...})
         # somewhere INSIDE this definition — not merely nearby in the file.
         has = any(
@@ -124,9 +132,9 @@ def _splat_carries_stdin(call_text: str, content: str) -> bool:
             or (isinstance(sub, ast.Constant) and sub.value == "stdin")
             for sub in ast.walk(node)
         )
-        if not has:
-            return False
-    return True
+        if has:
+            return True
+    return False
 
 
 def find_subprocess_calls(content: str, filepath: str) -> list[dict]:

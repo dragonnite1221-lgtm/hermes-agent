@@ -112,8 +112,29 @@ def test_splatted_kwargs_helper_counts_only_when_it_sets_stdin():
         "subprocess.run(['child'], **kwargs)\n"
         "subprocess.run(['other'], stdin=subprocess.DEVNULL)\n"
     )
+    # A call may splat more than one name — e.g. shared stdin= kwargs plus a
+    # second, platform-specific dict that never mentions stdin. Only one of
+    # the two needs to carry it: Python itself raises "got multiple values
+    # for keyword argument" if both splats defined stdin=, so the second
+    # splat can never silently claw back an inherited stdin (real shape from
+    # agent/verify/runner.py's _run_phase_command, caught as a false
+    # positive when the guard required every splatted name to prove safety).
+    multi_splat_one_safe = (
+        "import subprocess\n"
+        "_KW = dict(stdin=subprocess.DEVNULL)\n"
+        "popen_kwargs = {'process_group': 0}\n"
+        "subprocess.Popen(['ls'], **_KW, **popen_kwargs)\n"
+    )
+    multi_splat_none_safe = (
+        "import subprocess\n"
+        "_KW = dict(capture_output=True)\n"
+        "popen_kwargs = {'process_group': 0}\n"
+        "subprocess.Popen(['ls'], **_KW, **popen_kwargs)\n"
+    )
     assert guard.find_subprocess_calls(safe_const, "x.py") == []
     assert guard.find_subprocess_calls(safe_fn, "x.py") == []
     assert len(guard.find_subprocess_calls(unsafe_const, "x.py")) == 1
     assert len(guard.find_subprocess_calls(undefined, "x.py")) == 1
     assert [v["line"] for v in guard.find_subprocess_calls(unrelated_later, "x.py")] == [3]
+    assert guard.find_subprocess_calls(multi_splat_one_safe, "x.py") == []
+    assert len(guard.find_subprocess_calls(multi_splat_none_safe, "x.py")) == 1

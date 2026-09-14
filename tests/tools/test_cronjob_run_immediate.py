@@ -34,7 +34,7 @@ class TestCronjobRunExecutesImmediately:
             return_value=True,
         ) as m_claim:
             assert claim_job_for_fire("job-run-1") is True
-        m_claim.assert_called_once_with("job-run-1", force=False)
+        m_claim.assert_called_once_with("job-run-1", force=False, manual=False)
 
     def test_direct_claim_compatibility_forwards_force(self):
         from tools.cronjob_tools import claim_job_for_fire
@@ -48,7 +48,7 @@ class TestCronjobRunExecutesImmediately:
                 "job-run-1", return_job=True, force=True
             ) is claimed
         m_claim.assert_called_once_with(
-            "job-run-1", source="direct", force=True
+            "job-run-1", source="direct", force=True, manual=False
         )
 
     def test_direct_claim_compatibility_forwards_claim_ttl(self):
@@ -62,7 +62,7 @@ class TestCronjobRunExecutesImmediately:
                 "job-run-1", claim_ttl_seconds=0
             ) is True
         m_claim.assert_called_once_with(
-            "job-run-1", force=False, claim_ttl_seconds=0
+            "job-run-1", force=False, manual=False, claim_ttl_seconds=0
         )
 
         claimed = {**_JOB, "execution_id": "exec-ttl"}
@@ -77,6 +77,7 @@ class TestCronjobRunExecutesImmediately:
             "job-run-1",
             source="direct",
             force=False,
+            manual=False,
             claim_ttl_seconds=0,
         )
 
