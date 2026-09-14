@@ -14,15 +14,25 @@ concurrency:
 jobs:
   test:
     name: Run tests
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
+    # NousResearch's own runs use one 96-core runner for the whole suite,
+    # unsliced: 96 cores clear the floor that the slowest single test file
+    # sets (about 82s), so a second slice would only divide work that is
+    # already at that floor and add a second setup (hence the matrix here
+    # collapses to a single slice — 1/1, every file — for that org, and
+    # nothing about its runtime changes).
     #
-    # 96 cores clear the floor that the slowest single test file sets (about
-    # 82s). A second slice divides work that is already at that floor, and
-    # adds a second setup.
-    # Larger runners are configured only in the upstream organization. Forks
-    # must use a standard hosted runner or this job remains queued forever.
+    # Larger runners are configured only in the upstream organization. A
+    # fork gets a standard hosted runner instead, where the ~39k-test suite
+    # blows past the 30-minute timeout before finishing (observed: canceled
+    # at 86.5% after 30m16s). Fan a fork's run out across a small matrix of
+    # standard runners via scripts/run_tests_parallel.py's built-in
+    # ``--slice I/N`` (LPT-balanced; falls back to an even count-based split
+    # when no duration cache exists, which is the case here) instead of
+    # requesting hardware only the upstream org has.
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ${{ github.repository_owner == 'NousResearch' && fromJSON('[1]') || fromJSON('[1, 2, 3, 4]') }}
     runs-on: ${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-96-core' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
@@ -95,12 +105,16 @@ jobs:
         # with bounded parallelism. No xdist, no shared workers, no
         # module-level state leakage between files.
         #
-        # No --files: the runner discovers the suite itself. The discovered
-        # set is identical to the list the removed matrix job used to pass in.
+        # No --files: the runner discovers the suite itself, then
+        # HERMES_TEST_SLICE (below) narrows it to this matrix leg's share.
         run: |
           source .venv/bin/activate
           scripts/run_tests.sh
         env:
+          # I/N for this matrix leg. NousResearch's matrix has one leg
+          # (1/1), which run_tests_parallel.py treats as "no slicing" —
+          # every file, exactly like before this matrix existed.
+          HERMES_TEST_SLICE: ${{ format('{0}/{1}', matrix.slice, (github.repository_owner == 'NousResearch' && 1 || 4)) }}
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file
           # from a single ThreadPoolExecutor, so this value IS the limit. The
