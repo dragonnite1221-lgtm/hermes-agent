@@ -536,6 +536,31 @@ def _serve_unit_matches_profile(profile: str, unit: object) -> bool:
     return name in {f"hermes-serve-{profile}", f"hermes-dashboard-{profile}"}
 
 
+def _gateway_unit_matches_profile(profile: str, unit: object) -> bool:
+    """Does *unit* name the ``hermes-gateway*`` unit for *profile*?
+
+    Exact names only, mirroring :func:`_serve_unit_matches_profile` — a
+    bare substring check lets an unrelated unit whose name happens to
+    contain the profile (``hermes-gateway-mywork.service`` for profile
+    ``work``) falsely claim the match.
+    """
+    name = str(unit).removesuffix(".service")
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    if profile == "default":
+        return name == "hermes-gateway"
+    return name == f"hermes-gateway-{profile}"
+
+
+# Mechanisms whose restart phase populates the generic restarted_services /
+# failed_units bookkeeping passed into match_runtime_outcomes. "desktop",
+# "manual", "respawn-argv" and "windows-service" restart through entirely
+# different channels (or not at all, for manual) and must never borrow a
+# systemd/launchd unit's outcome just because it happens to share a profile
+# name (#91277 Phase 2 follow-up).
+_SERVICE_BACKED_MECHANISMS = ("systemd", "launchd")
+
+
 def _serve_runtime_outcome(
     r: RuntimeRecord,
     *,
@@ -545,6 +570,12 @@ def _serve_runtime_outcome(
     stale_serves: "set | None",
 ) -> str:
     """Outcome for one serve/dashboard runtime — never the gateway's."""
+    if r.restart_via == "desktop":
+        # The Desktop app owns this backend's entire lifecycle (start,
+        # stop, respawn) outside the update's own restart bookkeeping —
+        # there is nothing here to confirm against restarted_set/killed,
+        # and there never will be.
+        return "externally-supervised"
     if r.pid is not None and r.pid in killed:
         return "stopped"
     if any(_serve_unit_matches_profile(r.profile, u) for u in failed_set):
@@ -631,32 +662,24 @@ def match_runtime_outcomes(
                 )
                 continue
             outcome = "unaccounted"
-            # The bare "hermes-gateway" unit name is gateway-specific: a
-            # serve/dashboard runtime that merely shares the default
-            # profile is a different process the gateway restart never
-            # touched, and must not borrow its outcome (#100479).
+            # Exact unit-name matching only (_gateway_unit_matches_profile):
+            # a bare substring check let "work" claim
+            # "hermes-gateway-mywork.service". And only mechanisms that
+            # actually populate restarted_services/failed_units
+            # (_SERVICE_BACKED_MECHANISMS) may match against them — a
+            # manual/desktop-supervised runtime must not borrow an
+            # unrelated systemd/launchd unit's outcome just because it
+            # shares a profile name (#91277 Phase 2 follow-up).
             if r.profile in relaunched or r.profile in external:
                 outcome = "restarted"
             elif r.pid is not None and r.pid in killed:
                 outcome = "stopped"
-            elif any(
-                r.profile in unit
-                or (
-                    r.kind == "gateway"
-                    and r.profile == "default"
-                    and "hermes-gateway" in unit
-                )
-                for unit in failed_set
+            elif r.restart_via in _SERVICE_BACKED_MECHANISMS and any(
+                _gateway_unit_matches_profile(r.profile, unit) for unit in failed_set
             ):
                 outcome = "failed"
-            elif any(
-                r.profile in svc
-                or (
-                    r.kind == "gateway"
-                    and r.profile == "default"
-                    and "hermes-gateway" in svc
-                )
-                for svc in restarted_set
+            elif r.restart_via in _SERVICE_BACKED_MECHANISMS and any(
+                _gateway_unit_matches_profile(r.profile, svc) for svc in restarted_set
             ):
                 outcome = "restarted"
             outcomes.append(

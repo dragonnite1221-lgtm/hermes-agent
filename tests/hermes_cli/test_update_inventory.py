@@ -101,33 +101,56 @@ class TestCollectInventory:
         assert "legacy" in profiles
 
     def test_collects_serve_and_dashboard_without_gateway_state(self, fleet, monkeypatch):
-        """Every long-lived backend enters the plan, not only gateways."""
+        """Every long-lived backend enters the plan, not only gateways.
+
+        Serve/dashboard runtimes are collected from the spawn ledger
+        (#63206), not by scanning process cmdlines — dashboard_procs's
+        _scan_dashboard_processes()/_hermes_home_for_pid() are a stale
+        interface collect_runtime_inventory() no longer calls at all;
+        mocking them here made this test silently assert on an empty
+        plan.runtimes (KeyError, not a real failure signal).
+        """
         monkeypatch.setattr(
-            "hermes_cli.dashboard_procs._scan_dashboard_processes",
-            lambda: [
-                (300, "python -m hermes_cli.main --profile work serve --port 9119"),
-                (400, "hermes dashboard --port 8300"),
+            "hermes_cli.process_identity.ledger_entries",
+            lambda **kwargs: [
+                {
+                    "pid": 300,
+                    "purpose": "serve",
+                    "profile": "work",
+                    "argv": "python -m hermes_cli.main --profile work serve --port 9119",
+                    "host": "",
+                    "port": 9119,
+                    "create_time": 111.0,
+                    "spawner_pid": None,
+                    "spawner_create": None,
+                },
+                {
+                    "pid": 400,
+                    "purpose": "dashboard",
+                    "profile": "default",
+                    "argv": "hermes dashboard --port 8300",
+                    "host": "",
+                    "port": 8300,
+                    "create_time": 222.0,
+                    "spawner_pid": None,
+                    "spawner_create": None,
+                },
             ],
         )
         monkeypatch.setattr(
-            "hermes_cli.dashboard_procs._hermes_home_for_pid",
-            lambda pid: None,
-        )
-        monkeypatch.setattr(
-            ui,
-            "_systemd_service_for_pid",
-            lambda pid: "hermes-serve-work.service" if pid == 300 else None,
+            "hermes_cli.process_identity.spawner_is_dead",
+            lambda entry: None,  # no spawner recorded -> manually launched
         )
 
         plan = ui.collect_runtime_inventory()
         by_pid = {runtime.pid: runtime for runtime in plan.runtimes}
         assert by_pid[300].kind == "serve"
         assert by_pid[300].profile == "work"
-        assert by_pid[300].supervisor == "systemd"
-        assert by_pid[300].detail["service"] == "hermes-serve-work.service"
+        assert by_pid[300].supervisor == "manual-serve"
+        assert by_pid[300].detail["port"] == 9119
         assert by_pid[400].kind == "dashboard"
         assert by_pid[400].profile == "default"
-        assert by_pid[400].supervisor == "manual"
+        assert by_pid[400].supervisor == "manual-serve"
 
     def test_never_raises_when_everything_fails(self, monkeypatch):
         def _boom(*a, **k):
