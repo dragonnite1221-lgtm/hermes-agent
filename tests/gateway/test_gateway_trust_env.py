@@ -39,9 +39,27 @@ def test_gateway_trust_env_reads_config(tmp_path, monkeypatch, yaml_body, expect
 def test_no_bare_trust_env_literal_in_adapters():
     """Every aiohttp session in gateway/ + plugins/platforms/ must go through gateway_trust_env()."""
     bare = re.compile(r"trust_env\s*=\s*(True|False)\b")
+    constructor = re.compile(r"\b(aiohttp\.ClientSession|httpx\.(?:Async)?Client)\s*\(")
     offenders = []
     for path in _ADAPTER_FILES:
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if bare.search(line) and "httpx" not in line:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for lineno, line in enumerate(lines, 1):
+            if not bare.search(line):
+                continue
+            # trust_env is a constructor kwarg; the call can open several
+            # lines above it in a multi-line
+            # aiohttp.ClientSession(...)/httpx.Client(...), so a same-line
+            # "httpx" check misses e.g. a2a/security.py's trust_env=False on
+            # its own line inside a wrapped httpx.Client(...). Scan backward
+            # (from this line, since a single-line call opens and sets the
+            # kwarg on the same line) for the nearest opening constructor to
+            # learn which library actually owns this literal.
+            owner = None
+            for prev in range(lineno, max(lineno - 25, 0), -1):
+                match = constructor.search(lines[prev - 1])
+                if match:
+                    owner = match.group(1)
+                    break
+            if owner is None or owner.startswith("aiohttp"):
                 offenders.append(f"{path.relative_to(REPO)}:{lineno}: {line.strip()}")
     assert not offenders, "hard-coded aiohttp trust_env literal(s); use gateway_trust_env():\n" + "\n".join(offenders)
