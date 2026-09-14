@@ -367,11 +367,17 @@ def match_runtime_outcomes(
             if r.kind in _SERVE_KINDS:
                 if killed_here:
                     return "stopped"
-                if r.supervisor == "desktop":
+                if r.supervisor == "desktop" and stale_serves is None:
                     # HERMES_DESKTOP_CHILD_PID marks backends owned by the Electron lifecycle.
                     # The cleanup phase deliberately excludes their PIDs instead of stopping or
                     # relaunching a child out from under its owner, so an unchanged PID is an
-                    # accounted-for outcome, not a silent miss. See d78200c7.
+                    # accounted-for outcome, not a silent miss. See d78200c7. But when the
+                    # survivor probe DID run (stale_serves is not None) and shows this exact
+                    # PID is still the pre-update incarnation, that is a confirmed unsafe
+                    # survivor: the update never terminates desktop-owned backends, so nothing
+                    # will respawn it onto the new checkout. Let the probe override this default
+                    # instead of masking a real survivor as "safely supervised" (falls through
+                    # to the stale_serves check below).
                     return "externally-supervised"
                 if any(_serve_unit_matches_profile(r.profile, u) for u in failed_set):
                     return "failed"
