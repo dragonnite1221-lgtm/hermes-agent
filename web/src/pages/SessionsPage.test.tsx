@@ -119,6 +119,13 @@ afterEach(async () => {
 });
 
 describe("SessionsPage per-row profile routing (#99387)", () => {
+  // This exercises five sequential UI interactions (expand, export, rename,
+  // delete-confirm), each wrapped in its own act()/waitFor(): ~3.8s locally
+  // with nothing else running. That leaves too little margin under the
+  // default 5s timeout on a loaded CI runner (multiple workspaces building
+  // in parallel), where it intermittently times out despite every assertion
+  // passing. Give it real headroom instead of trimming steps out of a test
+  // that is deliberately covering the whole per-row flow end to end.
   it("sends every per-row request to the row's owning profile, not the management default", async () => {
     await renderSessionsPage([
       { id: "sid-guanli", profile: "guanli", source: "cli", model: null, title: "Managed", started_at: 1, ended_at: null,
@@ -150,5 +157,5 @@ describe("SessionsPage per-row profile routing (#99387)", () => {
     );
     await act(async () => click(confirm ?? null));
     expect(apiMocks.deleteSession).toHaveBeenCalledWith("sid-guanli", "guanli");
-  });
+  }, 15000);
 });
