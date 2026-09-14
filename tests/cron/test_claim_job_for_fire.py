@@ -167,6 +167,8 @@ def test_stale_fire_owner_cannot_mark_replacement_run(temp_home):
     records[0]["fire_claim"] = {"at": original["at"], "by": "replacement"}
     jobs.save_jobs(records)
 
+    last_status_before = jobs.get_job(job["id"]).get("last_status")
+
     assert jobs.mark_job_run(
         job["id"],
         success=True,
@@ -174,7 +176,15 @@ def test_stale_fire_owner_cannot_mark_replacement_run(temp_home):
     ) is False
     persisted = jobs.get_job(job["id"])
     assert persisted["fire_claim"]["by"] == "replacement"
-    assert persisted.get("last_run_at") is None
+    # The completion itself is discarded (wrong claim owner, so last_status/
+    # failure_streak/fire_claim must not be overwritten with a possibly
+    # misattributed outcome) — but last_run_at IS bumped, because a run
+    # genuinely happened just now. Without this, a job whose fire_claim gets
+    # reclaimed mid-run (e.g. a gateway restart) never advances last_run_at
+    # again until its next scheduled fire, permanently false-alarming
+    # doctor's hermes-cron-missed-daily check even though delivery succeeded.
+    assert persisted.get("last_run_at") is not None
+    assert persisted.get("last_status") == last_status_before
 
 
 def test_fire_claim_fence_serializes_terminal_revocation(temp_home):

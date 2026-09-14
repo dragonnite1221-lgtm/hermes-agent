@@ -3771,6 +3771,21 @@ def _mark_job_run_locked(
                             "discarding stale completion",
                             job_id,
                         )
+                        # Still bump last_run_at: a run genuinely happened just
+                        # now (this callback firing proves it), even though we
+                        # can no longer trust it belongs to the CURRENT claim
+                        # and must not overwrite last_status/failure_streak/
+                        # fire_claim with a possibly-misattributed outcome.
+                        # Without this, a gateway restart mid-run (fire_claim
+                        # re-issued to the new instance before the old
+                        # instance's completion lands) permanently strands
+                        # last_run_at at its previous value: the job keeps
+                        # firing/delivering on schedule but doctor's
+                        # hermes-cron-missed-daily false-alarms every day
+                        # after, since nothing else ever advances the stamp.
+                        job["last_run_at"] = _hermes_now().isoformat()
+                        jobs[i] = job
+                        save_jobs(jobs)
                         return False
                 interrupted_retry = job.pop("interrupted_retry", None)
                 now = _hermes_now().isoformat()
