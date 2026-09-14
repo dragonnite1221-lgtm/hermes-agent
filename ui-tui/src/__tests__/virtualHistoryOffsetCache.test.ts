@@ -539,17 +539,15 @@ describe('useVirtualHistory offset cache reuse', () => {
 
       staleHeights.set(items[0]!.key, 1)
       instance.rerender(React.createElement(Harness, { expose, initialHeights: staleHeights, items }))
-      // 40ms is enough on an idle machine but not under CI load (multiple
-      // workspaces building/testing in parallel), where the rerender's
-      // compensation effect can still be pending when the timer fires — the
-      // spy then reads as never-called (same class of flake fixed for
-      // appChromeBlockedTimers.test.tsx's flush() helper; #fa0431de92 called
-      // this file out by name as the next one to hit it). The scheduler turn
-      // is real work, not proportional to elapsed time, so more real-clock
-      // margin costs nothing here.
-      await delay(150)
-
-      expect(adjustScrollTop).toHaveBeenCalledOnce()
+      // A fixed delay here (even a generous one) is exactly the flake class
+      // fixed for appChromeBlockedTimers.test.tsx's flush() helper — under
+      // CI load the rerender's compensation effect can still be pending
+      // when any fixed timer fires, no matter how long, so the spy reads as
+      // never-called (#fa0431de92 called this file out by name as the next
+      // one to hit it; even a widened 150ms delay still flaked once actual
+      // CI load was heavy enough). Poll instead: succeed the instant the
+      // effect lands, and tolerate however long that actually takes.
+      await vi.waitFor(() => expect(adjustScrollTop).toHaveBeenCalledOnce(), { timeout: 2000 })
       expect(adjustScrollTop).toHaveBeenCalledWith(1)
       expect(scroll.getScrollTop()).toBe(6)
       expect(scroll.isSticky()).toBe(false)
