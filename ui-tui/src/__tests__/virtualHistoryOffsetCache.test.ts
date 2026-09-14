@@ -546,8 +546,13 @@ describe('useVirtualHistory offset cache reuse', () => {
       // never-called (#fa0431de92 called this file out by name as the next
       // one to hit it; even a widened 150ms delay still flaked once actual
       // CI load was heavy enough). Poll instead: succeed the instant the
-      // effect lands, and tolerate however long that actually takes.
-      await vi.waitFor(() => expect(adjustScrollTop).toHaveBeenCalledOnce(), { timeout: 2000 })
+      // effect lands, and tolerate however long that actually takes. Even a
+      // 2000ms poll window flaked once under a particularly loaded runner
+      // (observed on a run where an identical, unmodified copy of this test
+      // passed cleanly minutes earlier — pure scheduling variance, not this
+      // effect's own logic) — widened further since polling costs nothing
+      // extra on the happy path.
+      await vi.waitFor(() => expect(adjustScrollTop).toHaveBeenCalledOnce(), { timeout: 8000 })
       expect(adjustScrollTop).toHaveBeenCalledWith(1)
       expect(scroll.getScrollTop()).toBe(6)
       expect(scroll.isSticky()).toBe(false)
