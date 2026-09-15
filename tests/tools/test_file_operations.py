@@ -418,6 +418,34 @@ class TestShellFileOpsHelpers:
         assert result.error is None
         assert result.content == "alpha\n"
 
+    def test_read_file_raw_strip_fence_leaks_false_preserves_content(self, mock_env):
+        """``strip_fence_leaks=False`` must return the shell's ``cat`` output
+        byte-for-byte (BOM stripping still applies -- that is a separate
+        transform). ``acp_adapter/edit_approval.py``'s patch-replace preview
+        relies on this to match ``patch_replace()``'s own real read of OLD
+        content, which applies no fence-leak stripping at all."""
+        leaked = (
+            "__HERMES_FENCE_a9f7b3__\x07'\n"
+            "alpha\n"
+            "\x1b]0;cat '/tmp/test/a.txt'\x07__HERMES_FENCE_a9f7b3__\n"
+        )
+
+        def side_effect(command, **kwargs):
+            if command.startswith("if [ -f ") or command.startswith("wc -c"):
+                return {"output": "6\n", "returncode": 0}
+            if command.startswith("head -c"):
+                return {"output": "alpha\n", "returncode": 0}
+            if command.startswith("cat "):
+                return {"output": leaked, "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file_raw("/tmp/test/a.txt", strip_fence_leaks=False)
+
+        assert result.error is None
+        assert result.content == leaked
+
     def test_newline_terminated_content_has_no_phantom_line(self, file_ops):
         # A file ending in a newline (the normal, well-formed case) has its
         # last line terminated, NOT followed by an empty line. The gutter must

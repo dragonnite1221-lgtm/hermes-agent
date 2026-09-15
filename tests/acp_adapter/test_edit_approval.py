@@ -449,3 +449,183 @@ def test_multi_target_v4a_patch_with_no_space_header_is_not_auto_approved(tmp_pa
     assert proposal.target_paths is not None
     assert str(outside) in proposal.target_paths
     assert should_auto_approve_edit(proposal, "workspace_session", str(workspace)) is False
+
+
+def test_v4a_delete_only_preview_allows_deleting_an_image(monkeypatch):
+    """A V4A delete-only patch targeting an image must not be denied by the
+    preview's binary/image guard (added for #5's "don't mask an existing
+    image as an empty new file ahead of a content-overwriting write"
+    protection -- see test_preview_denies_existing_image_instead_of_showing_it_as_empty).
+
+    The real V4A executor's delete path (tools/patch_parser.py's
+    _apply_delete) already deletes binary/image targets fine -- it only
+    checks read_file_raw()'s .error, never .is_binary/.is_image -- so
+    requiring a successful TEXT preview before a pure delete can run would
+    deny a delete the real executor allows.
+    """
+    from tools.file_operations import ReadResult
+
+    class FakeBackendImage:
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(is_image=True, is_binary=True, file_size=54321)
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeBackendImage()
+    )
+
+    patch_body = "*** Delete File: photo.png\n"
+    proposal = build_edit_proposal("patch", {"mode": "patch", "patch": patch_body}, task_id="some-task")
+
+    assert proposal is not None
+    assert proposal.old_text is not None
+    assert "image" in proposal.old_text
+    assert "54321" in proposal.old_text
+
+
+def test_v4a_update_on_image_still_denied(monkeypatch):
+    """The delete-only relaxation above must not weaken #5's protection for
+    an operation that DOES overwrite content: a single-target V4A UPDATE
+    against an existing image must still deny, exactly like
+    test_preview_denies_existing_image_instead_of_showing_it_as_empty does
+    for write_file.
+    """
+    from tools.file_operations import ReadResult
+
+    class FakeBackendImage:
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(is_image=True, is_binary=True, file_size=54321)
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeBackendImage()
+    )
+
+    patch_body = "*** Update File: photo.png\n@@\n-old\n+new\n"
+
+    import pytest
+
+    with pytest.raises(OSError):
+        build_edit_proposal("patch", {"mode": "patch", "patch": patch_body}, task_id="some-task")
+
+
+def test_patch_replace_preview_reads_unstripped_content_like_the_real_write(monkeypatch):
+    """patch_replace()'s real write (tools/file_operations.py) reads OLD
+    content via a bare shell ``cat`` with no ``_strip_terminal_fence_leaks``
+    cleanup applied -- unlike the default (stripped) ``read_file_raw()``
+    every other proposal kind uses. If the "replace" patch-mode preview read
+    the default stripped content, a file whose real bytes happen to match
+    the stripper's regexes (an OSC escape sequence, or a
+    ``__HERMES_FENCE_<id>__``-looking marker) would preview -- and fuzzy-match
+    old_string against -- a laundered version of the file, computing a
+    new_text that diverges from what patch_replace() actually produces once
+    approved.
+    """
+    from tools.file_operations import ReadResult
+
+    # Content containing a literal substring the fence-marker regex treats
+    # as leaked terminal wrapper noise -- nothing in the codebase emits this
+    # marker today, but the file's real on-disk bytes can still
+    # coincidentally contain it (this very fixture file does).
+    real_content = "before __HERMES_FENCE_deadbeef__ after\n"
+
+    class FakeBackend:
+        def read_file_raw(self, path, **kwargs):
+            assert kwargs.get("strip_fence_leaks") is False, (
+                "patch-replace preview must request the UNSTRIPPED read"
+            )
+            return ReadResult(content=real_content)
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeBackend()
+    )
+
+    proposal = build_edit_proposal(
+        "patch",
+        {"mode": "replace", "path": "sample.txt", "old_string": "after", "new_string": "AFTER"},
+        task_id="some-task",
+    )
+
+    assert proposal.old_text == real_content
+    assert "__HERMES_FENCE_deadbeef__" in proposal.old_text
+
+
+def test_workspace_auto_approval_judges_relative_target_against_task_cwd_not_process_cwd(
+    tmp_path, monkeypatch
+):
+    """should_auto_approve_edit must judge a RELATIVE target against the
+    task's own live/registered cwd (the same resolver _resolve_edit_path/
+    _resolve_path_for_task the real write uses) -- not this ACP process's own
+    ``os.getcwd()``.
+
+    Before the fix, should_auto_approve_edit resolved the raw target path
+    with a bare ``Path(raw_path).resolve()``, which falls back to
+    ``os.getcwd()``. If the ACP server process happens to have been launched
+    from a directory that coincides with the configured workspace boundary
+    while the task's REAL live/registered cwd is a different, out-of-
+    workspace directory (e.g. after a `cd`, or a session registered
+    elsewhere), a relative write that actually lands OUTSIDE the workspace
+    could be misjudged as workspace-local and silently skip the approval
+    prompt -- the exact class of bug this PR fixes for the preview, one
+    layer down in the auto-approval policy check.
+    """
+    import tools.terminal_tool as terminal_tool
+
+    # Keep the global-tmp auto-approve exemption out of the way (both
+    # tmp_path and "outside" below otherwise live under the real system
+    # temp root and would auto-qualify regardless of the workspace check --
+    # see test_multi_target_v4a_patch_with_outside_path_is_not_auto_approved
+    # for the same setup).
+    fake_tmp_root = tmp_path / "unrelated-tmp-root"
+    fake_tmp_root.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp_root))
+
+    task_id = "auto-approve-cwd-test"
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # The ACP process's own os.getcwd() coincides with the workspace
+    # boundary -- exactly the situation that made the bug invisible to a
+    # naive Path(raw_path).resolve().
+    monkeypatch.chdir(workspace)
+
+    outside = tmp_path / "outside-the-workspace"
+    outside.mkdir()
+
+    terminal_tool.register_task_env_overrides(task_id, {"cwd": str(outside)})
+    try:
+        proposal = build_edit_proposal(
+            "write_file", {"path": "relative.txt", "content": "x"}, task_id=task_id,
+        )
+        assert should_auto_approve_edit(proposal, "workspace_session", str(workspace)) is False
+    finally:
+        terminal_tool.clear_task_env_overrides(task_id)
+
+
+def test_preview_reads_through_a_real_unmocked_shell_backend(tmp_path, monkeypatch):
+    """The only prior coverage claiming backend routing
+    (test_preview_reads_through_the_selected_file_backend_not_local_fs)
+    fully mocks ``_get_file_ops``, so it cannot catch a regression that
+    bypasses ``ShellFileOperations`` entirely (e.g. a stray direct
+    ``pathlib.Path`` read reintroduced somewhere in the call chain) -- the
+    exact class of bug this PR fixes. Wire a REAL ``ShellFileOperations``
+    over a REAL ``LocalEnvironment`` (the same construction
+    ``tests/tools/test_file_tools_live.py`` uses for its own no-mocks
+    coverage), rooted in an isolated ``tmp_path``, and drive the preview
+    through it end-to-end: real shell ``cat``, real existence probe, real
+    resolver.
+    """
+    from tools.environments.local import LocalEnvironment
+    from tools.file_operations import ShellFileOperations
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+    real_ops = ShellFileOperations(env, cwd=str(tmp_path))
+
+    target = tmp_path / "real_backend.txt"
+    target.write_text("real content on disk\n", encoding="utf-8")
+
+    monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": real_ops)
+
+    proposal = build_edit_proposal(
+        "write_file", {"path": str(target), "content": "new content\n"}, task_id="real-backend-task",
+    )
+
+    assert proposal.old_text == "real content on disk\n"

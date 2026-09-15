@@ -88,16 +88,21 @@ def make_tool_progress_cb(
     relays a child's tool-started event to this SAME callback as event type
     ``"subagent.tool"``, not ``"tool.started"`` -- so it is filtered out
     below and never reaches ``ToolCallStart``/the auto-approval preview at
-    all today. Also accepting ``"subagent.tool"`` here was tried and
-    reverted: ``make_step_cb``'s completion pairing pops IDs from the SAME
-    name-keyed FIFO queue driven only by the ROOT agent's own
-    ``prev_tools``, so a child's queued id would get silently completed by
-    an unrelated root call of the same tool name (or never completed at
-    all), corrupting ACP tool-call lifecycle tracking for BOTH the child
-    and whatever root call popped its id. Surfacing delegated children's
-    tool calls correctly needs their own start/complete correlation (e.g.
-    keyed by ``subagent_id`` + tool name), which is a separate feature from
-    the cwd/task-id preview fix this module exists for.
+    all today. Accepting ``"subagent.tool"`` here was tried and reverted:
+    ``make_step_cb``'s completion pairing pops IDs from the SAME name-keyed
+    FIFO queue driven only by the ROOT agent's own ``prev_tools``, so a
+    child's queued id would get silently completed by an unrelated root call
+    of the same tool name (or never completed at all), corrupting ACP
+    tool-call lifecycle tracking for BOTH the child and whatever root call
+    popped its id. Because of that, this callback -- and the edit-approval
+    preview it builds below -- only ever runs for the ROOT agent's own calls,
+    so ``task_id`` is always ``session_id``. Surfacing delegated children's
+    tool calls (and their own edit-approval previews) correctly needs their
+    own start/complete correlation (e.g. keyed by ``subagent_id`` + tool
+    name) -- a separate, not-yet-built feature; do not thread a per-event
+    ``subagent_id`` through here as groundwork for it without that real
+    correlation, since it would never actually run (see above) and is
+    untestable against the real relay path.
     """
 
     def _tool_progress(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
@@ -126,19 +131,11 @@ def make_tool_progress_cb(
                 from acp_adapter.edit_approval import build_edit_proposal, should_auto_approve_edit
 
                 # session_id doubles as the ACP task id for the root call
-                # (see acp_adapter/session.py's _register_task_cwd). A
-                # delegate_task child runs its terminal session under
-                # task_id == subagent_id instead (a different cwd, e.g. an
-                # isolated worktree), and every event tools/delegate_tool.py
-                # relays for a child carries that subagent_id in kwargs --
-                # so prefer it here if present. As of today this function is
-                # never actually invoked for a child event (see the NOTE in
-                # make_tool_progress_cb's docstring for why extending the
-                # event-type filter to include those isn't safe yet), so
-                # kwargs never has subagent_id in production; this is
-                # forward-compatible groundwork, not a behavior change.
-                effective_task_id = kwargs.get("subagent_id") or session_id
-                proposal = build_edit_proposal(name, args, task_id=effective_task_id)
+                # (see acp_adapter/session.py's _register_task_cwd). This
+                # callback only ever fires for the root agent's own calls
+                # (see the NOTE in make_tool_progress_cb's docstring), so
+                # session_id is always the right task id here.
+                proposal = build_edit_proposal(name, args, task_id=session_id)
                 if proposal is not None:
                     policy, cwd = edit_approval_policy_getter()
                     if should_auto_approve_edit(proposal, policy, cwd):

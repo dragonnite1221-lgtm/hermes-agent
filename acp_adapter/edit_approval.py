@@ -28,7 +28,12 @@ class EditProposal:
     comma-joined summary and must never be parsed back into a filesystem
     path). ``target_paths`` holds the real, individual target paths so
     approval logic can check each one; it defaults to ``(path,)`` for the
-    single-target proposal kinds.
+    single-target proposal kinds. ``resolved_target_paths`` holds the SAME
+    targets after running through ``_resolve_edit_path`` (task-live-cwd-aware,
+    matching what the real write will touch) -- policy checks must prefer
+    these over the raw ``target_paths``/``path`` so a relative target is
+    judged against the same location the write actually lands on, not this
+    ACP process's own cwd; see ``should_auto_approve_edit``.
     """
 
     tool_name: str
@@ -37,6 +42,7 @@ class EditProposal:
     new_text: str
     arguments: dict[str, Any]
     target_paths: tuple[str, ...] | None = None
+    resolved_target_paths: tuple[str, ...] | None = None
 
 
 EditApprovalRequester = Callable[[EditProposal], bool]
@@ -97,7 +103,9 @@ def _resolve_edit_path(path: str, task_id: str = "default") -> str:
     return str(_resolve_path_for_task(path, task_id))
 
 
-def _read_text_if_exists(path: str, task_id: str = "default") -> str | None:
+def _read_text_if_exists(
+    path: str, task_id: str = "default", *, strip_fence_leaks: bool = True, deny_binary: bool = True,
+) -> str | None:
     """Read ``path``'s current content for the approval diff.
 
     Reads through ``tools.file_tools._get_file_ops(task_id)`` -- the same
@@ -109,13 +117,46 @@ def _read_text_if_exists(path: str, task_id: str = "default") -> str | None:
     for a path that only exists in the remote/container namespace, or read
     an unrelated file that happens to exist at that same-looking path on
     the ACP server's own host.
+
+    ``strip_fence_leaks=False`` (used only by ``_proposal_for_patch_replace``)
+    opts out of ``ShellFileOperations``'s ``_strip_terminal_fence_leaks``
+    cleanup. That cleanup is applied by ``read_file_raw()`` (used here, and by
+    the real V4A apply path in ``tools/patch_parser.py``, so preview and
+    write already agree there) but NOT by ``patch_replace()``'s own internal
+    read (``tools/file_operations.py`` reads via a bare ``self._cat()`` for
+    the "replace" patch mode). If the file's real content happens to contain
+    text the stripper's regexes treat as leaked terminal wrapper noise (an
+    OSC sequence, or a ``__HERMES_FENCE_<id>__`` marker), the default
+    (stripped) preview would show -- and fuzzy-match old_string against -- a
+    laundered version of the file while the real ``patch_replace()`` matches
+    against the untouched bytes, computing a different result than what the
+    approval diff showed the user.
+
+    ``deny_binary=False`` (used only by ``_proposal_for_patch_v4a`` for a
+    delete-only operation) trades the binary/image raise below for a
+    descriptive placeholder instead. That guard exists to stop an
+    existing image/binary file from being previewed as an empty/new one
+    ahead of a CONTENT-OVERWRITING write -- irrelevant to a pure delete,
+    which never derives new content from old and whose real V4A executor
+    (``tools/patch_parser.py``'s ``_apply_delete``) already deletes
+    binary/image targets just fine (it only checks ``.error``, never
+    ``.is_binary``/``.is_image``). Requiring a successful TEXT preview
+    before a delete-only V4A patch on an image/binary file could run
+    would deny a delete the real executor allows.
     """
     resolved = _resolve_edit_path(path, task_id)
 
     from tools.file_tools import _get_file_ops
 
-    result = _get_file_ops(task_id).read_file_raw(resolved)
+    file_ops = _get_file_ops(task_id)
+    # Only pass the kwarg when non-default so a minimal test double that
+    # implements read_file_raw(self, path) (no extra kwarg) keeps working.
+    result = file_ops.read_file_raw(resolved) if strip_fence_leaks else file_ops.read_file_raw(
+        resolved, strip_fence_leaks=False)
     if result.is_binary or result.is_image:
+        if not deny_binary:
+            kind = "image" if result.is_image else "binary"
+            return f"[existing {kind} file, {result.file_size} bytes -- content not shown]"
         # An existing image sets NO .error at all -- just is_image=True,
         # is_binary=True, and empty (default) .content -- so checking only
         # .error below would fall through to `return result.content` and
@@ -139,22 +180,20 @@ def _read_text_if_exists(path: str, task_id: str = "default") -> str | None:
         # of masquerading as one, so maybe_require_edit_approval's
         # fail-closed default kicks in.
         if result.error.startswith("File not found: "):
-            # NOTE: this prefix is not a perfectly reliable "confirmed
-            # absent" signal by itself. It comes from
-            # ShellFileOperations._suggest_similar_files(), reached
-            # whenever read_file_raw()'s existence probe command exits
-            # non-zero -- which is also what happens if the probe itself
-            # fails to run at all (a dropped SSH connection, a container
-            # that died, ...), not only when the shell's own `[ -e ... ]`
-            # check says the path is missing. That ambiguity is inherent
-            # to read_file_raw()'s exit-code contract and pre-dates this
-            # module: write_file_tool/patch_tool read through the exact
-            # same function and have the same blind spot before writing.
-            # Fixing it for real means giving read_file_raw() a way to
-            # report "could not determine existence" distinctly from
-            # "confirmed absent", which is a change to the shared
-            # tools.file_operations backend, not something to smuggle into
-            # this preview-only module.
+            # This prefix IS a reliable "confirmed absent" signal, not an
+            # ambiguous one: read_file_raw() reaches _suggest_similar_files()
+            # (the sole producer of this exact prefix) only when
+            # _probe_regular_file()'s existence probe echoes its MISSING
+            # sentinel -- i.e. the shell ran and the `[ -e ... ]` check
+            # itself said the path is absent. A probe that fails to run at
+            # all (dropped SSH connection, a died container, ...) is a
+            # DIFFERENT status ("env_unavailable"), reported as "Terminal
+            # environment unavailable: ... Retry shortly." -- a different
+            # message that does not start with "File not found: " and so
+            # falls through to the `raise OSError` below, failing the
+            # proposal closed exactly like every other unreadable-for-a-
+            # different-reason case. See tools/file_operations.py's
+            # _probe_regular_file/read_file_raw.
             return None
         raise OSError(f"Cannot read current content of {path!r}: {result.error}")
     return result.content
@@ -172,7 +211,11 @@ def _proposal_for_write_file(arguments: dict[str, Any], task_id: str = "default"
     content = arguments.get("content")
     if content is None:
         raise ValueError("content required")
-    return EditProposal("write_file", path, _read_text_if_exists(path, task_id), str(content), dict(arguments))
+    resolved = _resolve_edit_path(path, task_id)
+    return EditProposal(
+        "write_file", path, _read_text_if_exists(path, task_id), str(content), dict(arguments),
+        resolved_target_paths=(resolved,),
+    )
 
 
 def _proposal_for_patch_replace(arguments: dict[str, Any], task_id: str = "default") -> EditProposal:
@@ -180,7 +223,13 @@ def _proposal_for_patch_replace(arguments: dict[str, Any], task_id: str = "defau
     old_string, new_string = arguments.get("old_string"), arguments.get("new_string")
     if old_string is None or new_string is None:
         raise ValueError("old_string and new_string required")
-    old_text = _read_text_if_exists(path, task_id)
+    # strip_fence_leaks=False: the real patch_replace() fuzzy-matches
+    # old_string against UNSTRIPPED content (tools/file_operations.py reads
+    # it via a bare self._cat(), not read_file_raw()); matching here against
+    # the default stripped read could compute a new_text that diverges from
+    # what patch_replace() actually produces once approved. See
+    # _read_text_if_exists's docstring.
+    old_text = _read_text_if_exists(path, task_id, strip_fence_leaks=False)
     if old_text is None:
         raise ValueError(f"Failed to read file: {path}")
 
@@ -190,10 +239,11 @@ def _proposal_for_patch_replace(arguments: dict[str, Any], task_id: str = "defau
         old_text, str(old_string), str(new_string), bool(arguments.get("replace_all", False)))
     if error or match_count == 0:
         raise ValueError(error or f"Could not find match for old_string in {path}")
-    return EditProposal("patch", path, old_text, new_text, dict(arguments))
+    resolved = _resolve_edit_path(path, task_id)
+    return EditProposal("patch", path, old_text, new_text, dict(arguments), resolved_target_paths=(resolved,))
 
 
-def _extract_v4a_patch_paths(patch_body: str) -> list[str]:
+def _extract_v4a_patch_paths(patch_body: str) -> tuple[list[str], bool]:
     # Reuse the same parser that actually executes the patch (tools/
     # patch_parser.py, via tools/file_operations.py) instead of a second,
     # independently-maintained regex: a prior version of this function had
@@ -202,7 +252,7 @@ def _extract_v4a_patch_paths(patch_body: str) -> list[str]:
     # executed could slip past approval extraction entirely, letting an
     # out-of-workspace target hide behind an in-workspace one. Deriving the
     # paths from the real parser makes that class of drift impossible.
-    from tools.patch_parser import parse_v4a_patch
+    from tools.patch_parser import OperationType, parse_v4a_patch
 
     operations, _error = parse_v4a_patch(patch_body)
     paths: list[str] = []
@@ -211,14 +261,18 @@ def _extract_v4a_patch_paths(patch_body: str) -> list[str]:
             paths.append(op.file_path)
         if op.new_path:
             paths.append(op.new_path)
-    return paths
+    # Whether this is a single DELETE operation -- the sole V4A op kind whose
+    # real executor (tools/patch_parser.py's _apply_delete) never derives new
+    # content from old and already deletes binary/image targets just fine.
+    is_delete_only = len(operations) == 1 and operations[0].operation is OperationType.DELETE
+    return paths, is_delete_only
 
 
 def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default") -> EditProposal:
     patch_body = arguments.get("patch")
     if not isinstance(patch_body, str) or not patch_body:
         raise ValueError("patch content required")
-    paths = _extract_v4a_patch_paths(patch_body)
+    paths, is_delete_only = _extract_v4a_patch_paths(patch_body)
     if not paths:
         raise ValueError("no file paths found in V4A patch")
     single = len(paths) == 1
@@ -227,7 +281,11 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
     return EditProposal(
         tool_name="patch",
         path=paths[0] if single else ", ".join(paths),
-        old_text=_read_text_if_exists(paths[0], task_id) if single else None,
+        # deny_binary=False only for a delete-only operation (never derives
+        # new content from old, so #5's overwrite-masking protection does
+        # not apply) -- see _read_text_if_exists's docstring and
+        # tools/patch_parser.py's _apply_delete.
+        old_text=_read_text_if_exists(paths[0], task_id, deny_binary=not is_delete_only) if single else None,
         # ACP only supports a single diff payload here.  Surface the exact V4A
         # patch content before execution so patch-mode calls are permissioned
         # and denied patches cannot mutate.
@@ -236,6 +294,10 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
         # Keep the real per-file targets alongside the joined display string
         # so approval decisions never parse `path` back into a filesystem path.
         target_paths=tuple(paths),
+        # Same targets resolved through the task-live-cwd-aware resolver, so
+        # should_auto_approve_edit judges each one against where the real
+        # V4A apply will touch, not this process's own cwd.
+        resolved_target_paths=tuple(_resolve_edit_path(p, task_id) for p in paths),
     )
 
 
@@ -289,12 +351,23 @@ def should_auto_approve_edit(proposal: EditProposal, policy: str, cwd: str | Non
     filesystem path — every real target in ``proposal.target_paths`` is checked
     individually, and the whole patch is denied auto-approval unless all of them
     qualify.
+
+    Targets are read from ``proposal.resolved_target_paths`` when the builder
+    populated it (every builder does) — these already ran through
+    ``_resolve_edit_path`` (the task's live-cwd-aware resolver, same as the
+    preview and the real write), so a RELATIVE target is judged against the
+    location the write actually lands on. Falling back to the raw
+    ``target_paths``/``path`` (kept only for callers constructing an
+    ``EditProposal`` directly, e.g. tests) would instead resolve a relative
+    path against this ACP process's own ``os.getcwd()`` — wrong whenever the
+    task's live/registered cwd differs, which could misjudge an
+    out-of-workspace write as workspace-local and skip the approval prompt.
     """
 
     policy = str(policy or AUTO_APPROVE_ASK).strip()
     if policy == AUTO_APPROVE_ASK:
         return False
-    targets = proposal.target_paths or (proposal.path,)
+    targets = proposal.resolved_target_paths or proposal.target_paths or (proposal.path,)
     return all(_is_single_path_auto_approvable(target, policy, cwd) for target in targets)
 
 

@@ -101,8 +101,16 @@ class FileOperations(ABC):
         """Read a file with pagination support."""
 
     @abstractmethod
-    def read_file_raw(self, path: str) -> ReadResult:
-        """Whole file as a plain string: no pagination, line numbers or clamping."""
+    def read_file_raw(self, path: str, *, strip_fence_leaks: bool = True) -> ReadResult:
+        """Whole file as a plain string: no pagination, line numbers or clamping.
+
+        ``strip_fence_leaks=False`` skips ``_strip_terminal_fence_leaks``'s
+        cleanup of leaked terminal wrapper noise (OSC sequences, fence
+        markers) so callers that must match the real ``patch_replace()``
+        write path -- which reads OLD content via a bare shell read with no
+        such stripping -- see identical bytes to what will actually be
+        matched/written. Default True preserves the normal read-tool/V4A
+        behavior."""
 
     @abstractmethod
     def write_file(self, path: str, content: str, pre_content: Optional[str] = None) -> WriteResult:
@@ -980,8 +988,13 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         scored.sort(key=lambda x: -x[0])
         return ReadResult(error=f"File not found: {path}", similar_files=[fp for _, fp in scored[:5]])
 
-    def read_file_raw(self, path: str) -> ReadResult:
-        """Whole file as a plain string (no pagination/line numbers/clamping)."""
+    def read_file_raw(self, path: str, *, strip_fence_leaks: bool = True) -> ReadResult:
+        """Whole file as a plain string (no pagination/line numbers/clamping).
+
+        ``strip_fence_leaks=False``: see the abstract method's docstring --
+        used when a caller must match ``patch_replace()``'s own unstripped
+        read of OLD content (that method reads via a bare shell command, not
+        this one, and applies no such stripping)."""
         path = self._expand_path(path)
         file_size, status = self._probe_regular_file(path)
         if status == "missing":
@@ -1000,7 +1013,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             return ReadResult(error=f"Failed to read file: {cat_result.stdout}")
         # Strip a leading BOM (a phantom U+FEFF defeats an exact first-line match);
         # write_file re-probes disk and restores it.
-        raw_content, _ = _strip_bom(_strip_terminal_fence_leaks(cat_result.stdout))
+        stdout = _strip_terminal_fence_leaks(cat_result.stdout) if strip_fence_leaks else cat_result.stdout
+        raw_content, _ = _strip_bom(stdout)
         return ReadResult(content=raw_content, file_size=file_size)
 
     def read_file_bytes(self, path: str, max_bytes: Optional[int] = None) -> ReadResult:

@@ -99,56 +99,6 @@ class TestToolProgressCallback:
 
         assert captured["task_id"] == "root-session"
 
-    def test_edit_preview_prefers_subagent_id_when_present_in_kwargs(
-        self, mock_conn, event_loop_fixture
-    ):
-        """Unit-level check of _tool_progress's task-id preference only.
-
-        This is groundwork for delegated (delegate_task) children, NOT a
-        test of the real relay path: tools/delegate_tool.py currently
-        relays a child's tool call as event type "subagent.tool", which
-        _tool_progress filters out before reaching this logic at all (see
-        the NOTE in make_tool_progress_cb's docstring for why simply
-        also accepting "subagent.tool" here was tried and reverted -- it
-        corrupts make_step_cb's root-call completion pairing). So in
-        production kwargs never actually carries subagent_id today; this
-        test only pins the preference _tool_progress would apply if it
-        ever did, using a synthetic "tool.started" + subagent_id
-        combination that does not occur in practice yet.
-        """
-        loop = event_loop_fixture
-        captured = {}
-
-        def fake_build_edit_proposal(name, args, task_id="default"):
-            captured["task_id"] = task_id
-            return None
-
-        cb = make_tool_progress_cb(
-            mock_conn, "root-session", loop, {}, {},
-            edit_approval_policy_getter=lambda: ("session", None),
-        )
-
-        with (
-            patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts,
-            patch(
-                "acp_adapter.edit_approval.build_edit_proposal",
-                side_effect=fake_build_edit_proposal,
-            ),
-        ):
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
-            cb(
-                "tool.started",
-                "write_file",
-                None,
-                {"path": "x.txt", "content": "y"},
-                subagent_id="sa-42",
-            )
-
-        assert captured["task_id"] == "sa-42"
-
-
     def test_duplicate_same_name_tool_calls_use_fifo_ids(self, mock_conn, event_loop_fixture):
         """Multiple same-name tool calls should be tracked independently in order."""
         tool_call_ids = {}
