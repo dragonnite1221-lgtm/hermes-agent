@@ -1,7 +1,9 @@
 """Tests for acp_adapter.server — HermesACPAgent ACP server."""
 
 import asyncio
+import json
 import os
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -17,10 +19,12 @@ from acp.schema import (
     AuthenticateResponse,
     AvailableCommandsUpdate,
     Implementation,
+    ImageContentBlock,
     InitializeResponse,
     LoadSessionResponse,
     NewSessionResponse,
     PromptResponse,
+    ResourceContentBlock,
     ResumeSessionResponse,
     SessionModelState,
     SessionModeState,
@@ -442,6 +446,268 @@ class TestPrompt:
         resp = await agent.prompt(prompt=prompt, session_id="nonexistent")
         assert isinstance(resp, PromptResponse)
         assert resp.stop_reason == "refusal"
+
+    @pytest.mark.asyncio
+    async def test_audio_only_prompt_actually_reaches_the_agent(self, agent, mock_manager):
+        """An audio-only prompt must still invoke run_conversation.
+
+        _extract_text(prompt) is "" for an audio-only prompt (it only sees
+        real TextContentBlocks), and _content_blocks_to_openai_user_content
+        collapses an audio placeholder-only result to a plain string, not a
+        list. The prompt() empty-content guard checked
+        "isinstance(user_content, list) and user_content", which is False
+        for that string -- so an audio-only prompt was rejected as empty
+        and never reached run_conversation at all, even after the
+        placeholder fix made the CONVERTER stop returning a truly empty
+        string.
+        """
+        from acp.schema import AudioContentBlock
+
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+
+        run_calls = []
+
+        def _run(*args, **kwargs):
+            run_calls.append(kwargs)
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt_resp = await agent.prompt(
+            prompt=[AudioContentBlock(type="audio", data="aGVsbG8=", mimeType="audio/wav")],
+            session_id=resp.session_id,
+        )
+
+        assert isinstance(prompt_resp, PromptResponse)
+        assert len(run_calls) == 1
+        assert "audio/wav" in str(run_calls[0].get("user_message"))
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_text_prompt_is_rejected_not_dispatched(self, agent, mock_manager):
+        """A prompt made of nothing but a whitespace-only TextContentBlock must not reach
+        run_conversation. _content_blocks_to_openai_user_content collapses an all-text prompt
+        to a joined string built straight from block.text, so a "   " block yields a
+        truthy-but-blank user_content -- the guard that lets a real non-text placeholder
+        (e.g. the audio-only one) through despite an empty user_text must not also let this
+        blank text-only turn through.
+        """
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+
+        run_calls = []
+
+        def _run(*args, **kwargs):
+            run_calls.append(kwargs)
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt_resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="   ")],
+            session_id=resp.session_id,
+        )
+
+        assert isinstance(prompt_resp, PromptResponse)
+        assert prompt_resp.stop_reason == "end_turn"
+        assert run_calls == []
+
+    @pytest.mark.asyncio
+    async def test_queued_image_prompt_preserves_attachment_data(self, agent):
+        """A prompt that arrives while a turn is already running gets
+        queued for the next turn. If it carries an image, the queued item
+        must retain the actual image bytes -- not just a "[Image
+        attachment]" text placeholder -- or the attachment is silently
+        dropped once the queued turn finally runs (see the drain loop that
+        replays ``state.queued_prompts`` as a fresh ``self.prompt(...)``
+        call).
+        """
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.is_running = True  # simulate an in-flight turn
+
+        image_block = ImageContentBlock(type="image", data="aGVsbG8=", mimeType="image/png")
+        prompt = [
+            TextContentBlock(type="text", text="look at this"),
+            image_block,
+        ]
+
+        resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert isinstance(resp, PromptResponse)
+        assert len(state.queued_prompts) == 1
+        queued = state.queued_prompts[0]
+        assert queued != "[Image attachment]"
+        # The queued item must still carry the actual image data somewhere,
+        # not just a text summary that stands in for it.
+        blocks = queued if isinstance(queued, list) else [queued]
+        assert any(
+            getattr(block, "data", None) == "aGVsbG8="
+            or (isinstance(block, dict) and block.get("data") == "aGVsbG8=")
+            for block in blocks
+        )
+
+    @pytest.mark.asyncio
+    async def test_queued_resource_link_is_snapshotted_not_reread_later(self, agent, tmp_path):
+        """A resource_link block only carries a URI. If it's queued as-is,
+        the drain loop's replay re-reads that URI whenever the queued turn
+        actually runs -- possibly long after the file was modified. The
+        queued item must instead be a self-contained snapshot of the
+        file's content AT THE TIME IT WAS QUEUED.
+        """
+        attached = tmp_path / "notes.md"
+        attached.write_text("original content", encoding="utf-8")
+
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.is_running = True  # simulate an in-flight turn
+
+        prompt = [
+            TextContentBlock(type="text", text="read this"),
+            ResourceContentBlock(
+                type="resource_link",
+                name="notes.md",
+                uri=attached.as_uri(),
+                mimeType="text/markdown",
+            ),
+        ]
+
+        resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+        assert isinstance(resp, PromptResponse)
+        assert len(state.queued_prompts) == 1
+
+        # The file changes AFTER queuing but BEFORE the queued turn runs.
+        attached.write_text("MUTATED AFTER QUEUING", encoding="utf-8")
+
+        queued = state.queued_prompts[0]
+        blocks = queued if isinstance(queued, list) else [queued]
+        resource_blocks = [b for b in blocks if hasattr(b, "resource")]
+        assert resource_blocks, "queued resource_link was not snapshotted into an embedded resource"
+        snapshotted_text = resource_blocks[0].resource.text
+        assert snapshotted_text == "original content"
+        assert "MUTATED" not in snapshotted_text
+
+    @pytest.mark.asyncio
+    async def test_queued_post_interrupt_correction_keeps_the_rewritten_text(
+        self, agent, monkeypatch
+    ):
+        """A post-cancel correction ("stop and send") gets its text rewritten
+        to include the cancelled request BEFORE the turn-claim lock is
+        taken. If another prompt starts running in that gap, this one is
+        queued instead of run immediately -- and the queued item must still
+        carry the REWRITTEN text (cancelled request + correction), not just
+        the bare new text, or the attached context from the salvage path is
+        silently dropped once the queued turn replays.
+        """
+        import acp_adapter.server as server_module
+
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        original_take = server_module._take_interrupted_prompt
+
+        def _take_and_race(state_arg):
+            # Simulate another request claiming the turn in the gap
+            # between this consuming the interrupted prompt (while still
+            # idle) and _claim_turn_or_queue's later lock acquisition.
+            idle, interrupted = original_take(state_arg)
+            state_arg.is_running = True
+            return idle, interrupted
+
+        monkeypatch.setattr(server_module, "_take_interrupted_prompt", _take_and_race)
+
+        state.interrupted_prompt_text = "please refactor the auth module"
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="actually use the new schema")],
+            session_id=new_resp.session_id,
+        )
+
+        assert isinstance(resp, PromptResponse)
+        assert len(state.queued_prompts) == 1
+        queued = state.queued_prompts[0]
+        assert isinstance(queued, str)
+        assert "please refactor the auth module" in queued
+        assert "actually use the new schema" in queued
+
+    @pytest.mark.asyncio
+    async def test_queued_image_prompt_replay_actually_delivers_attachment(self, agent):
+        """End-to-end: the queued image prompt must reach ``run_conversation``
+        with its attachment intact when the drain loop replays it, not just
+        sit unmodified in ``state.queued_prompts``.
+
+        A test that only inspects the queue would stay green even if the
+        drain loop's replay path silently converted the content back to
+        text before calling ``run_conversation`` again. Drive a real first
+        turn, queue the image prompt while it is genuinely in flight, let
+        the first turn finish, and assert the SECOND ``run_conversation``
+        call actually received the image data.
+        """
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        calls: list[dict] = []
+        first_call_started = threading.Event()
+        release_first_call = threading.Event()
+
+        def _run(*args, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                first_call_started.set()
+                assert release_first_call.wait(timeout=5), "test deadlocked"
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        first_task = asyncio.create_task(
+            agent.prompt(
+                prompt=[TextContentBlock(type="text", text="first turn")],
+                session_id=new_resp.session_id,
+            )
+        )
+        await asyncio.get_event_loop().run_in_executor(None, first_call_started.wait, 5)
+        assert state.is_running is True  # the first turn is genuinely in flight
+
+        image_block = ImageContentBlock(type="image", data="aGVsbG8=", mimeType="image/png")
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="look at this"), image_block],
+            session_id=new_resp.session_id,
+        )
+        assert isinstance(resp, PromptResponse)
+        assert len(state.queued_prompts) == 1
+
+        release_first_call.set()
+        await first_task
+        # The drain loop's recursive self.prompt(...) call runs on the same
+        # event loop but still dispatches through run_in_executor; give it a
+        # turn to complete.
+        for _ in range(50):
+            if len(calls) >= 2:
+                break
+            await asyncio.sleep(0.05)
+
+        assert len(calls) == 2
+        # Whatever shape run_conversation's user_message takes (OpenAI-style
+        # multimodal content), the base64 image payload must survive into it.
+        assert "aGVsbG8=" in json.dumps(calls[1].get("user_message"), default=str)
 
     @pytest.mark.asyncio
     async def test_prompt_binds_session_id_into_subprocess_env(self, agent, mock_manager):

@@ -19,7 +19,18 @@ import time
 import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    # Only for the queued_prompts type below -- keep this module importable
+    # without the optional `agent-client-protocol` extra installed.
+    from acp.schema import (
+        AudioContentBlock,
+        EmbeddedResourceContentBlock,
+        ImageContentBlock,
+        ResourceContentBlock,
+        TextContentBlock,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +164,24 @@ class SessionState:
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
-    queued_prompts: List[str] = field(default_factory=list)
+    # Each entry is either a plain ``str`` (queued via /steer or /queue,
+    # which are always text-only) or the full list of ACP content blocks
+    # from a rich prompt that arrived while a turn was already running.
+    # The list form must be preserved as-is -- collapsing it down to a text
+    # summary at queue time would silently drop any image/audio/resource
+    # attachments before the queued turn ever runs. Kept as an explicit
+    # union (rather than widened to ``Any``) so a static type checker can
+    # still catch a producer/consumer drifting from this contract.
+    queued_prompts: List[
+        str
+        | list[
+            TextContentBlock
+            | ImageContentBlock
+            | AudioContentBlock
+            | ResourceContentBlock
+            | EmbeddedResourceContentBlock
+        ]
+    ] = field(default_factory=list)
     runtime_lock: Any = field(default_factory=threading.Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
