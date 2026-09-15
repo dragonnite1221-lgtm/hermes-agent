@@ -11,17 +11,18 @@ The fix: _strip_optional_systemd_directives() removes those directives
 from both the installed and expected text before comparison.
 
 Separately, generate_systemd_unit() bakes _build_wsl_interop_paths()'s
-/mnt/... entries -- scraped straight from the invoking shell's live PATH --
-into the unit's Environment="PATH=..." directive. Two shells on the same
-WSL host routinely carry different /mnt/... segments (per-Windows-session
-interop PATH), so re-running `hermes gateway status`/`restart` from a
-different shell than whichever last wrote the unit made a perfectly
-healthy install look outdated forever. _normalize_systemd_unit_for_comparison()
-drops only those /mnt/... entries before comparing -- NOT the whole PATH
-payload, since the rest of it (managed Node, ~/.local/bin, etc.) reflects
-real deployment state a genuine change to which must still trigger a
-refresh (see #35240 review: masking everything let a moved/removed managed
-Node directory go unrepaired forever too).
+/mnt/... entries -- scraped straight from the invoking shell's live PATH,
+only when is_wsl() -- into the unit's Environment="PATH=..." directive. Two
+shells on the same WSL host routinely carry different /mnt/... segments
+(per-Windows-session interop PATH), so re-running `hermes gateway
+status`/`restart` from a different shell than whichever last wrote the unit
+made a perfectly healthy install look outdated forever.
+hermes_cli.gateway_service_staleness.normalize_systemd_unit_for_comparison()
+drops only those /mnt/... entries, and only under is_wsl() -- never the whole
+PATH payload (a moved/removed managed Node directory must still trigger a
+refresh, #35240 review), and never on a non-WSL host (there /mnt/... entries
+are never interop noise -- they're real mounts a managed Node install or a
+mounted toolchain can legitimately live under, #16 review).
 """
 
 from __future__ import annotations
@@ -171,110 +172,70 @@ WantedBy=default.target
         monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
         assert gw.systemd_unit_is_current(system=False) is False
 
-    def test_unit_differing_only_by_path_is_current(self, tmp_path, monkeypatch):
-        """A unit installed from one shell, then checked from another shell with a
-        different PATH, must still read as current -- see module docstring (#35240
-        follow-up)."""
+    def test_unit_is_current_ignores_wsl_interop_drift_but_not_real_changes(
+        self, tmp_path, monkeypatch,
+    ):
+        """On WSL, /mnt/... PATH drift from a different invoking shell is ignored (#35240
+        follow-up); a real change -- elsewhere, or a non-/mnt/... PATH entry such as a moved
+        managed Node install -- must still be caught (#16 review)."""
         from hermes_cli import gateway as gw
 
-        installed = (
-            '[Service]\n'
-            'ExecStart=/usr/bin/python -m hermes_cli.main gateway run\n'
-            'Environment="PATH=/home/user/.hermes/current/.venv/bin:/usr/bin:/bin"\n'
-            'Environment="VIRTUAL_ENV=/home/user/.hermes/current/.venv"\n'
-        )
-        # A different invoking shell would regenerate the same unit with a
-        # differently-ordered/differently-populated PATH -- everything else is identical.
-        expected = (
-            '[Service]\n'
-            'ExecStart=/usr/bin/python -m hermes_cli.main gateway run\n'
-            'Environment="PATH=/home/user/.hermes/current/.venv/bin:/mnt/c/some/other/tool:/usr/bin:/bin"\n'
-            'Environment="VIRTUAL_ENV=/home/user/.hermes/current/.venv"\n'
-        )
+        monkeypatch.setattr("hermes_constants.is_wsl", lambda: True)
         unit_file = tmp_path / "hermes-gateway.service"
-        unit_file.write_text(installed)
-
         monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
-        monkeypatch.setattr(gw, "generate_systemd_unit", lambda system=False, run_as_user=None: expected)
-
-        assert gw.systemd_unit_is_current(system=False) is True
-
-    def test_unit_differing_by_more_than_path_is_still_stale(self, tmp_path, monkeypatch):
-        """/mnt/... noise is ignored, but a real difference elsewhere must still be caught."""
-        from hermes_cli import gateway as gw
 
         installed = (
-            '[Service]\n'
-            'ExecStart=/usr/bin/python -m hermes_cli.main gateway run\n'
-            'Environment="PATH=/usr/bin:/bin"\n'
-        )
-        expected = (
-            '[Service]\n'
-            'ExecStart=/usr/bin/python -m hermes_cli.main gateway run --profile jarvis\n'
-            'Environment="PATH=/mnt/c/some/other/tool:/usr/bin:/bin"\n'
-        )
-        unit_file = tmp_path / "hermes-gateway.service"
-        unit_file.write_text(installed)
-
-        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
-        monkeypatch.setattr(gw, "generate_systemd_unit", lambda system=False, run_as_user=None: expected)
-
-        assert gw.systemd_unit_is_current(system=False) is False
-
-    def test_unit_with_real_managed_node_path_change_is_stale(self, tmp_path, monkeypatch):
-        """#35240 review: a genuine, non-/mnt/... PATH change (managed Node moved/added) must
-        still be repaired -- only shell-ambient /mnt/... noise may be ignored."""
-        from hermes_cli import gateway as gw
-
-        installed = (
-            '[Service]\n'
-            'ExecStart=/usr/bin/python -m hermes_cli.main gateway run\n'
-            'Environment="PATH=/usr/bin:/bin"\n'
-        )
-        # A managed Node runtime just got provisioned -- a real, on-disk deployment change.
-        expected = (
             '[Service]\n'
             'ExecStart=/usr/bin/python -m hermes_cli.main gateway run\n'
             'Environment="PATH=/home/user/.hermes/node/bin:/usr/bin:/bin"\n'
         )
-        unit_file = tmp_path / "hermes-gateway.service"
         unit_file.write_text(installed)
 
-        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
-        monkeypatch.setattr(gw, "generate_systemd_unit", lambda system=False, run_as_user=None: expected)
+        # A different invoking shell regenerates the same deployment with different /mnt/...
+        # interop noise -- everything that actually matters is unchanged.
+        monkeypatch.setattr(
+            gw, "generate_systemd_unit",
+            lambda system=False, run_as_user=None: installed.replace(
+                "PATH=", "PATH=/mnt/c/some/other/tool:"
+            ),
+        )
+        assert gw.systemd_unit_is_current(system=False) is True
 
+        # The managed Node directory itself changed -- a real deployment change, not noise.
+        monkeypatch.setattr(
+            gw, "generate_systemd_unit",
+            lambda system=False, run_as_user=None: installed.replace(
+                "/home/user/.hermes/node/bin", "/home/user/.hermes/node/v2/bin"
+            ),
+        )
+        assert gw.systemd_unit_is_current(system=False) is False
+
+        # ExecStart itself changed -- unrelated to PATH, must still be caught.
+        monkeypatch.setattr(
+            gw, "generate_systemd_unit",
+            lambda system=False, run_as_user=None: installed.replace(
+                "gateway run", "gateway run --profile jarvis"
+            ),
+        )
         assert gw.systemd_unit_is_current(system=False) is False
 
 
 # ---------------------------------------------------------------------------
-# _normalize_systemd_unit_for_comparison
+# hermes_cli.gateway_service_staleness.normalize_systemd_unit_for_comparison
 # ---------------------------------------------------------------------------
 
 
 class TestNormalizeSystemdUnitForComparison:
-    def test_drops_only_mnt_entries_from_path(self):
-        from hermes_cli.gateway import _normalize_systemd_unit_for_comparison
+    def test_masks_mnt_entries_only_under_is_wsl(self, monkeypatch):
+        """The /mnt/... masking is WSL-interop-specific: on a non-WSL host, `_build_wsl_interop_paths()`
+        never contributes anything, so a /mnt/... entry there is a real mount (e.g. a managed Node
+        install or mounted toolchain) that must be compared verbatim, not masked away (#16 review)."""
+        from hermes_cli.gateway_service_staleness import normalize_systemd_unit_for_comparison
 
-        text = (
-            '[Service]\n'
-            'Environment="PATH=/a:/mnt/c/windows/thing:/b:/c"\n'
-            'Environment="VIRTUAL_ENV=/venv"\n'
-        )
-        result = _normalize_systemd_unit_for_comparison(text)
-        assert "/mnt/c/windows/thing" not in result
-        assert 'Environment="PATH=/a:/b:/c"' in result
-        assert 'Environment="VIRTUAL_ENV=/venv"' in result
+        text = '[Service]\nEnvironment="PATH=/a:/mnt/c/windows/thing:/b"\n'
 
-    def test_paths_differing_only_by_mnt_entries_normalize_identically(self):
-        from hermes_cli.gateway import _normalize_systemd_unit_for_comparison
+        monkeypatch.setattr("hermes_constants.is_wsl", lambda: True)
+        assert "/mnt/c/windows/thing" not in normalize_systemd_unit_for_comparison(text)
 
-        a = '[Service]\nEnvironment="PATH=/a:/mnt/c/one:/b"\n'
-        b = '[Service]\nEnvironment="PATH=/a:/mnt/c/two:/mnt/d/three:/b"\n'
-        assert _normalize_systemd_unit_for_comparison(a) == _normalize_systemd_unit_for_comparison(b)
-
-    def test_paths_differing_by_non_mnt_entries_normalize_differently(self):
-        from hermes_cli.gateway import _normalize_systemd_unit_for_comparison
-
-        a = '[Service]\nEnvironment="PATH=/a:/b"\n'
-        b = '[Service]\nEnvironment="PATH=/a:/b:/home/user/.hermes/node/bin"\n'
-        assert _normalize_systemd_unit_for_comparison(a) != _normalize_systemd_unit_for_comparison(b)
+        monkeypatch.setattr("hermes_constants.is_wsl", lambda: False)
+        assert "/mnt/c/windows/thing" in normalize_systemd_unit_for_comparison(text)

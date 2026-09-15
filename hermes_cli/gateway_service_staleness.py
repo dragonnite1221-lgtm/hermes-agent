@@ -1,0 +1,41 @@
+"""WSL-interop-aware PATH normalization for the systemd unit staleness check.
+
+Split out of ``hermes_cli.gateway`` per AGENTS.md's god-file rule (that facade
+is already ~6,500 lines) instead of appending new behaviour to it -- see
+``hermes_cli.gateway.systemd_unit_is_current``, the sole caller.
+"""
+
+from __future__ import annotations
+
+import re
+
+
+def normalize_systemd_unit_for_comparison(text: str) -> str:
+    """Normalize unit text for staleness checks, dropping only the WSL-interop entries from the PATH
+    payload: ``_build_wsl_interop_paths()`` scrapes ``/mnt/...`` entries straight out of the invoking
+    shell's live ``PATH`` (plus ``shutil.which()`` hits for powershell.exe/cmd.exe/etc., which resolve
+    under the same ``/mnt/...`` prefix) only when ``is_wsl()`` is true, so those entries genuinely
+    differ across Windows sessions and would flag a perfectly current unit as outdated forever.
+
+    On a non-WSL host ``_build_wsl_interop_paths()`` never contributes anything, so any ``/mnt/...``
+    entry there comes from a real source (a managed Node install, a mounted toolchain resolved via
+    ``shutil.which()``) and must still be compared verbatim -- masking it there would let a genuine
+    change go unrepaired by ``gateway start``/``restart``/``install``. Gating on ``is_wsl()`` keeps
+    that path fully verbatim; every other PATH entry -- managed Node, ``~/.local/bin`` and friends
+    from ``_append_node_dir_for_service()``/``_build_user_local_paths()`` -- is compared verbatim on
+    every platform for the same reason. (This still assumes ``$HOME`` itself isn't under
+    ``/mnt/...`` on WSL, true for a standard distro install; that combination isn't supported here.)
+    """
+    from hermes_constants import is_wsl
+    from hermes_cli.gateway import _normalize_service_definition
+
+    normalized = _normalize_service_definition(text)
+    if not is_wsl():
+        return normalized
+
+    def _drop_wsl_interop_entries(match: "re.Match[str]") -> str:
+        prefix, path_value, suffix = match.group(1), match.group(2), match.group(3)
+        kept = [entry for entry in path_value.split(":") if not entry.startswith("/mnt/")]
+        return f"{prefix}{':'.join(kept)}{suffix}"
+
+    return re.sub(r'(Environment="PATH=)(.*?)(")', _drop_wsl_interop_entries, normalized)
