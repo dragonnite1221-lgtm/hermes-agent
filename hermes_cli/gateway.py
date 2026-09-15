@@ -2966,6 +2966,18 @@ def _normalize_launchd_plist_for_comparison(text: str) -> str:
     )
 
 
+def _normalize_systemd_unit_for_comparison(text: str) -> str:
+    """Normalize unit text for staleness checks, ignoring the PATH payload: like the launchd plist
+    case above, the generated PATH is captured from the invoking shell and varies across shells (e.g.
+    WSL interop entries differ per Windows session), so comparing it verbatim flags a perfectly current
+    unit as outdated forever, once from any shell whose PATH doesn't match the one last used to install it."""
+    import re
+    return re.sub(
+        r'(Environment="PATH=)(.*?)(")', r"\1__HERMES_PATH__\3",
+        _normalize_service_definition(text),
+    )
+
+
 def systemd_unit_is_current(system: bool = False) -> bool:
     # HERMES_HOME sync chokepoint for every compare/regenerate path: under `sudo … --system` it is often
     # stripped to /root/.hermes, so refresh would rewrite a correct unit and status warn forever.
@@ -2980,7 +2992,7 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     expected_user = _read_systemd_user_from_unit(unit_path) if system else None
     expected = generate_systemd_unit(system=system, run_as_user=expected_user)
     # Ignore directives older systemd drops (RestartMaxDelaySec, RestartSteps) to avoid a perpetual "outdated" flag.
-    norm = lambda text: _normalize_service_definition(_strip_optional_systemd_directives(text))  # noqa: E731
+    norm = lambda text: _normalize_systemd_unit_for_comparison(_strip_optional_systemd_directives(text))  # noqa: E731
     return norm(installed) == norm(expected)
 
 
