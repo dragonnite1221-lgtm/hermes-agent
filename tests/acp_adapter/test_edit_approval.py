@@ -1212,6 +1212,123 @@ def test_v4a_auto_approval_denies_a_non_host_symlink_escape(tmp_path, monkeypatc
         terminal_tool.clear_task_env_overrides(task_id)
 
 
+def test_verify_realpath_within_any_keeps_the_targets_own_symlink_literal_when_dereference_final_is_false():
+    """``dereference_final=False`` (set for a V4A ``Delete`` target or a
+    ``Move``'s source -- see ``EditProposal.target_dereference_final``)
+    must resolve only the target's PARENT chain and reattach its own
+    final path component literally, never invoking ``readlink -f``/
+    ``realpath`` on the target itself even when it is a real symlink.
+
+    ``ShellFileOperations.delete_file()``/``move_file()`` act on the
+    filesystem ENTRY (``Path.unlink()``/``mv``), not on whatever a
+    symlink there points to, so a workspace-local symlink pointing
+    outside every boundary must still verify as in-workspace for these
+    two operations -- the opposite of the default ``dereference_final=
+    True`` behaviour, which correctly denies such a target for a
+    write-through op (see
+    ``test_v4a_auto_approval_denies_a_non_host_symlink_escape``).
+    """
+    from tools.file_operations import ExecuteResult
+    from tools.file_tools import _verify_realpath_within_any
+
+    class FakeBackend:
+        def _escape_shell_arg(self, arg):
+            return f"'{arg}'"
+
+        def _exec(self, command, **kwargs):
+            # A real backend filesystem where /workspace is an ordinary
+            # directory and /workspace/link is a real symlink to
+            # /outside. The dereference_final=False script never assigns
+            # the raw target to `p` directly (it goes through `full=` /
+            # `dirname` first) -- distinguishing on that is exactly the
+            # code-path difference this fix introduces.
+            if "full=" in command:
+                target_line = "T\t/workspace/link"
+            else:
+                target_line = "T\t/outside"
+            return ExecuteResult(stdout=f"{target_line}\nB0\t/workspace\n", exit_code=0)
+
+    backend = FakeBackend()
+
+    assert _verify_realpath_within_any(
+        "/workspace/link", ("/workspace",), backend, dereference_final=False,
+    ) is True
+    assert _verify_realpath_within_any(
+        "/workspace/link", ("/workspace",), backend, dereference_final=True,
+    ) is False
+
+
+def test_v4a_delete_auto_approval_does_not_dereference_a_workspace_symlink_target(tmp_path, monkeypatch):
+    """A V4A ``Delete`` targeting a workspace-local symlink that points
+    OUTSIDE every boundary must still auto-approve under
+    ``AUTO_APPROVE_WORKSPACE``: ``ShellFileOperations.delete_file()``
+    calls ``Path.unlink()`` on the entry itself, removing the symlink
+    without ever touching whatever it points to. ``_extract_v4a_patch_paths``
+    marks a Delete target's ``target_dereference_final`` as False, so the
+    live verification must resolve only the target's parent chain and
+    keep "link" as its own (in-workspace) name, instead of following it
+    to /outside and wrongly denying auto-approval the way a write-through
+    Update correctly does (see
+    ``test_v4a_auto_approval_denies_a_non_host_symlink_escape``).
+    """
+    import re
+
+    import tools.terminal_tool as terminal_tool
+    from tools.file_operations import ExecuteResult, ReadResult
+
+    task_id = "non-host-symlink-delete-task"
+    host_workspace = tmp_path / "host-workspace"
+    host_workspace.mkdir()
+
+    class FakeDockerEnv:
+        cwd = "/workspace"
+
+    class FakeDockerBackend:
+        env = FakeDockerEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+        def _escape_shell_arg(self, arg):
+            return f"'{arg}'"
+
+        def _exec(self, command, **kwargs):
+            tags = re.findall(r"printf '(\w+)\\t", command)
+            # /workspace/link is a REAL symlink to /outside on the
+            # backend's filesystem. The correct dereference_final=False
+            # script (used for a Delete target) resolves only its parent
+            # ("/workspace", an ordinary directory) and reattaches "link"
+            # literally, so it must never surface "/outside" here.
+            target_line = "T\t/outside" if "p='/workspace/link';" in command else "T\t/workspace/link"
+            lines = [target_line] + [f"{tag}\t/workspace" for tag in tags if tag != "T"]
+            return ExecuteResult(stdout="\n".join(lines) + "\n", exit_code=0)
+
+    monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeDockerBackend())
+    monkeypatch.setattr(
+        "tools.terminal_tool._get_env_config",
+        lambda: {"env_type": "docker", "cwd": "/workspace", "host_cwd": str(host_workspace)},
+    )
+    monkeypatch.setattr(
+        "tools.terminal_tool._resolve_task_host_cwd",
+        lambda config, task_id: config.get("host_cwd"),
+    )
+
+    terminal_tool.register_task_env_overrides(task_id, {"cwd": str(host_workspace)})
+    try:
+        proposal = build_edit_proposal(
+            "patch", {"mode": "patch", "patch": "*** Delete File: link\n"},
+            task_id=task_id,
+        )
+        assert proposal.resolved_target_paths == ("/workspace/link",)
+        assert proposal.target_dereference_final == (False,)
+
+        assert should_auto_approve_edit(
+            proposal, "workspace_session", cwd=str(host_workspace), task_id=task_id,
+        ) is True
+    finally:
+        terminal_tool.clear_task_env_overrides(task_id)
+
+
 def test_write_file_preview_line_ending_uses_the_same_byte_window_as_the_real_write(monkeypatch):
     """The preview's line-ending detection must agree with the real write's
     own probe even for a UTF-8 file whose first newline sits after byte

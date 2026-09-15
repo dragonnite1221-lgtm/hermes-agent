@@ -227,7 +227,9 @@ def _resolve_v4a_policy_target(path: str, file_ops) -> str | None:
     return posixpath.normpath(posixpath.join(str(cwd), path))
 
 
-def _verify_realpath_within_any(resolved_path: str, boundaries: tuple, file_ops) -> bool:
+def _verify_realpath_within_any(
+    resolved_path: str, boundaries: tuple, file_ops, *, dereference_final: bool = True,
+) -> bool:
     """Confirm ``resolved_path`` -- a LEXICALLY workspace-local V4A policy
     target on a non-host (SSH/container/sandbox) backend, from
     ``_resolve_v4a_policy_target`` -- ALSO stays within one of
@@ -280,6 +282,23 @@ def _verify_realpath_within_any(resolved_path: str, boundaries: tuple, file_ops)
     the unresolved ``/workspace`` string, failing every legitimate
     ``workspace_session`` edit closed and defeating the auto-approval
     feature entirely for that (common) setup.
+
+    ``dereference_final`` -- when False (a V4A ``Delete`` target or a
+    ``Move``'s source: see ``EditProposal.target_dereference_final`` and
+    ``_extract_v4a_patch_paths``) -- resolves only ``resolved_path``'s
+    PARENT chain and reattaches its own basename literally, WITHOUT ever
+    following a symlink that sits at the target's own final path
+    component. ``Path.unlink()`` and a ``mv`` source operate on the
+    filesystem entry itself, never on whatever it points to, so verifying
+    via the fully-dereferenced target (the default, correct for a
+    write-through op like ``write_file``/``patch_replace``/V4A
+    ``Update``/``Add``) would check the WRONG location here: a
+    workspace-local symlink pointing outside the workspace must still
+    count as an in-workspace target for a delete or move-source, since
+    removing or moving away the link itself never touches whatever it
+    points to. Every boundary is still fully dereferenced regardless of
+    this flag -- it only changes how the TARGET's own final component is
+    treated.
     """
     exec_fn = getattr(file_ops, "_exec", None)
     quote = getattr(file_ops, "_escape_shell_arg", None)
@@ -296,10 +315,29 @@ def _verify_realpath_within_any(resolved_path: str, boundaries: tuple, file_ops)
             f'[ -n "$real" ] && printf \'{tag}\\t%s%s\\n\' "$real" "$suffix"'
         )
 
+    def _walkup_snippet_no_final_deref(tag: str, value: str) -> str:
+        # Same walk-up, but seeded from the PARENT of `value` with the
+        # target's own basename pre-loaded into `suffix` -- so `readlink
+        # -f`/`realpath` is only ever invoked on an ancestor, never on
+        # `value` itself, even when `value` exists and is itself a symlink.
+        arg = quote(value)
+        return (
+            f'full={arg}; base="$(basename "$full")"; p="$(dirname "$full")"; suffix="/$base"; '
+            'while [ ! -e "$p" ] && [ ! -L "$p" ] && [ "$p" != "/" ] && [ -n "$p" ]; do '
+            'suffix="/$(basename "$p")$suffix"; p="$(dirname "$p")"; done; '
+            'real="$(readlink -f "$p" 2>/dev/null || realpath "$p" 2>/dev/null)"; '
+            f'[ -n "$real" ] && printf \'{tag}\\t%s%s\\n\' "$real" "$suffix"'
+        )
+
+    target_snippet = (
+        _walkup_snippet("T", resolved_path)
+        if dereference_final
+        else _walkup_snippet_no_final_deref("T", resolved_path)
+    )
     named_boundaries = [(f"B{i}", b) for i, b in enumerate(boundaries) if b]
     try:
         script = "; ".join(
-            [_walkup_snippet("T", resolved_path)]
+            [target_snippet]
             + [_walkup_snippet(tag, str(b)) for tag, b in named_boundaries]
         )
         result = exec_fn(script)

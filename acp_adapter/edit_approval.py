@@ -52,6 +52,18 @@ class EditProposal:
     arguments: dict[str, Any]
     target_paths: tuple[str, ...] | None = None
     resolved_target_paths: tuple[str | None, ...] | None = None
+    # Parallel to target_paths/resolved_target_paths (same length when set);
+    # per-target whether the live non-host symlink verification
+    # (tools.file_tools._verify_realpath_within_any) should follow a
+    # symlink at the target's OWN final path component. True (the default
+    # via should_auto_approve_edit when this is None) for write_file,
+    # patch_replace, and V4A Update/Add, which write THROUGH a final
+    # symlink to its real target. False for V4A Delete and a Move's
+    # source: ShellFileOperations.delete_file()/move_file() operate on the
+    # filesystem ENTRY itself (Path.unlink()/`mv`), never following it
+    # elsewhere, so verifying containment must resolve only the target's
+    # PARENT chain and leave its own (in-workspace) name as the answer.
+    target_dereference_final: tuple[bool, ...] | None = None
 
 
 EditApprovalRequester = Callable[[EditProposal], bool]
@@ -412,7 +424,7 @@ def _proposal_for_patch_replace(arguments: dict[str, Any], task_id: str = "defau
     return EditProposal("patch", path, old_text, new_text, dict(arguments), resolved_target_paths=(resolved,))
 
 
-def _extract_v4a_patch_paths(patch_body: str) -> tuple[list[str], bool]:
+def _extract_v4a_patch_paths(patch_body: str) -> tuple[list[str], list[bool], bool]:
     # Reuse the same parser that actually executes the patch (tools/
     # patch_parser.py, via tools/file_operations.py) instead of a second,
     # independently-maintained regex: a prior version of this function had
@@ -425,23 +437,37 @@ def _extract_v4a_patch_paths(patch_body: str) -> tuple[list[str], bool]:
 
     operations, _error = parse_v4a_patch(patch_body)
     paths: list[str] = []
+    dereference_final: list[bool] = []
     for op in operations:
         if op.file_path:
             paths.append(op.file_path)
+            # Delete removes the filesystem ENTRY itself (Path.unlink()),
+            # and a Move's source is renamed as the entry itself (`mv`
+            # does not follow a symlink source either) -- neither
+            # operation writes THROUGH a final-component symlink to
+            # wherever it points, unlike Update/Add (which open() and
+            # write bytes, following any symlink the normal way). Live
+            # symlink verification (tools.file_tools
+            # ._verify_realpath_within_any) must therefore resolve only
+            # this target's PARENT chain and leave its own (in-workspace)
+            # name as the answer for Delete/Move, not follow it to a
+            # target elsewhere that this operation never actually touches.
+            dereference_final.append(op.operation not in (OperationType.DELETE, OperationType.MOVE))
         if op.new_path:
             paths.append(op.new_path)
+            dereference_final.append(True)
     # Whether this is a single DELETE operation -- the sole V4A op kind whose
     # real executor (tools/patch_parser.py's _apply_delete) never derives new
     # content from old and already deletes binary/image targets just fine.
     is_delete_only = len(operations) == 1 and operations[0].operation is OperationType.DELETE
-    return paths, is_delete_only
+    return paths, dereference_final, is_delete_only
 
 
 def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default") -> EditProposal:
     patch_body = arguments.get("patch")
     if not isinstance(patch_body, str) or not patch_body:
         raise ValueError("patch content required")
-    paths, is_delete_only = _extract_v4a_patch_paths(patch_body)
+    paths, dereference_final, is_delete_only = _extract_v4a_patch_paths(patch_body)
     if not paths:
         raise ValueError("no file paths found in V4A patch")
     single = len(paths) == 1
@@ -524,6 +550,10 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
         # instead, for the policy check only -- the patch body handed to
         # the backend above is untouched either way.
         resolved_target_paths=resolved_target_paths,
+        # Delete targets and a Move's source must NOT have their final
+        # component dereferenced during live symlink verification -- see
+        # EditProposal's docstring and _extract_v4a_patch_paths.
+        target_dereference_final=tuple(dereference_final),
     )
 
 
@@ -556,7 +586,8 @@ def _is_sensitive_auto_approve_path(path: str) -> bool:
 
 def _is_single_path_auto_approvable(
     raw_path: str, policy: str, cwd_candidates: tuple[str | None, ...], resolved_path: str | None = None,
-    verify_backend: Callable[[str], bool] | None = None, temp_roots: tuple[str, ...] = (),
+    verify_backend: Callable[[str, bool], bool] | None = None, temp_roots: tuple[str, ...] = (),
+    dereference_final: bool = True,
 ) -> bool:
     """``raw_path`` is the ORIGINAL (pre-canonicalization) target, always a
     real string -- used for the sensitive-path guard and, under
@@ -594,6 +625,13 @@ def _is_single_path_auto_approvable(
     Skipped entirely for a host-paths (local) backend, where
     ``Path.resolve()`` above already followed any real symlink on the SAME
     filesystem the write happens on.
+
+    ``dereference_final`` is forwarded to ``verify_backend`` unchanged (see
+    ``tools.file_tools._verify_realpath_within_any``): False for a V4A
+    ``Delete`` target or a ``Move``'s source, where the live verification
+    must resolve only the target's parent chain and keep its own final
+    path component literal, since ``Path.unlink()``/``mv`` act on the
+    filesystem entry itself rather than whatever it points to.
     """
     if _is_sensitive_auto_approve_path(raw_path):
         return False
@@ -621,7 +659,7 @@ def _is_single_path_auto_approvable(
         )
         if not in_boundary:
             return False
-        if verify_backend is not None and not verify_backend(resolved_path):
+        if verify_backend is not None and not verify_backend(resolved_path, dereference_final):
             return False
         return True
     return False
@@ -800,12 +838,14 @@ def should_auto_approve_edit(
                 backend_temp_dir = getattr(getattr(file_ops, "env", None), "get_temp_dir", None)
                 temp_roots = (backend_temp_dir(),) if backend_temp_dir else (tempfile.gettempdir(),)
                 verify_boundaries = cwd_candidates + temp_roots
-                verify_backend = lambda resolved, _fo=file_ops, _b=verify_boundaries: _verify_realpath_within_any(
-                    resolved, _b, _fo)
+                verify_backend = (
+                    lambda resolved, dereference_final=True, _fo=file_ops, _b=verify_boundaries:
+                    _verify_realpath_within_any(resolved, _b, _fo, dereference_final=dereference_final)
+                )
         except Exception:
             # Could not even determine the backend type for this task --
             # fail closed rather than silently skipping the symlink check.
-            verify_backend = lambda _resolved: False
+            verify_backend = lambda _resolved, dereference_final=True: False
     raw_targets = proposal.target_paths or (proposal.path,)
     resolved_targets = proposal.resolved_target_paths
     if resolved_targets is None:
@@ -815,9 +855,17 @@ def should_auto_approve_edit(
         # same length) -- don't guess an alignment, fail every target's
         # workspace check closed instead of pairing the wrong entries.
         resolved_targets = (None,) * len(raw_targets)
+    dereference_flags = proposal.target_dereference_final
+    if dereference_flags is None or len(dereference_flags) != len(raw_targets):
+        # Only V4A patches populate this; a mismatched length (shouldn't
+        # happen for a real builder) falls back to the safe default of
+        # fully dereferencing every target, same as every non-V4A edit.
+        dereference_flags = (True,) * len(raw_targets)
     return all(
-        _is_single_path_auto_approvable(raw, policy, cwd_candidates, resolved, verify_backend, temp_roots)
-        for raw, resolved in zip(raw_targets, resolved_targets)
+        _is_single_path_auto_approvable(
+            raw, policy, cwd_candidates, resolved, verify_backend, temp_roots, deref,
+        )
+        for raw, resolved, deref in zip(raw_targets, resolved_targets, dereference_flags)
     )
 
 
