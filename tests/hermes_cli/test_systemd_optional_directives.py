@@ -10,15 +10,18 @@ comparison sees a difference.
 The fix: _strip_optional_systemd_directives() removes those directives
 from both the installed and expected text before comparison.
 
-Separately, generate_systemd_unit() bakes the invoking shell's PATH into
-the unit's Environment="PATH=..." directive. Two shells on the same host
-routinely carry different PATHs (WSL interop entries, per-tool installer
-dirs, etc.), so re-running `hermes gateway status`/`restart` from a
+Separately, generate_systemd_unit() bakes _build_wsl_interop_paths()'s
+/mnt/... entries -- scraped straight from the invoking shell's live PATH --
+into the unit's Environment="PATH=..." directive. Two shells on the same
+WSL host routinely carry different /mnt/... segments (per-Windows-session
+interop PATH), so re-running `hermes gateway status`/`restart` from a
 different shell than whichever last wrote the unit made a perfectly
 healthy install look outdated forever. _normalize_systemd_unit_for_comparison()
-masks that one payload before comparing, mirroring the launchd twin
-(_normalize_launchd_plist_for_comparison) which already does the same for
-its <key>PATH</key> entry.
+drops only those /mnt/... entries before comparing -- NOT the whole PATH
+payload, since the rest of it (managed Node, ~/.local/bin, etc.) reflects
+real deployment state a genuine change to which must still trigger a
+refresh (see #35240 review: masking everything let a moved/removed managed
+Node directory go unrepaired forever too).
 """
 
 from __future__ import annotations
@@ -197,7 +200,7 @@ WantedBy=default.target
         assert gw.systemd_unit_is_current(system=False) is True
 
     def test_unit_differing_by_more_than_path_is_still_stale(self, tmp_path, monkeypatch):
-        """PATH is masked, but a real difference elsewhere must still be caught."""
+        """/mnt/... noise is ignored, but a real difference elsewhere must still be caught."""
         from hermes_cli import gateway as gw
 
         installed = (
@@ -218,6 +221,30 @@ WantedBy=default.target
 
         assert gw.systemd_unit_is_current(system=False) is False
 
+    def test_unit_with_real_managed_node_path_change_is_stale(self, tmp_path, monkeypatch):
+        """#35240 review: a genuine, non-/mnt/... PATH change (managed Node moved/added) must
+        still be repaired -- only shell-ambient /mnt/... noise may be ignored."""
+        from hermes_cli import gateway as gw
+
+        installed = (
+            '[Service]\n'
+            'ExecStart=/usr/bin/python -m hermes_cli.main gateway run\n'
+            'Environment="PATH=/usr/bin:/bin"\n'
+        )
+        # A managed Node runtime just got provisioned -- a real, on-disk deployment change.
+        expected = (
+            '[Service]\n'
+            'ExecStart=/usr/bin/python -m hermes_cli.main gateway run\n'
+            'Environment="PATH=/home/user/.hermes/node/bin:/usr/bin:/bin"\n'
+        )
+        unit_file = tmp_path / "hermes-gateway.service"
+        unit_file.write_text(installed)
+
+        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
+        monkeypatch.setattr(gw, "generate_systemd_unit", lambda system=False, run_as_user=None: expected)
+
+        assert gw.systemd_unit_is_current(system=False) is False
+
 
 # ---------------------------------------------------------------------------
 # _normalize_systemd_unit_for_comparison
@@ -225,22 +252,29 @@ WantedBy=default.target
 
 
 class TestNormalizeSystemdUnitForComparison:
-    def test_masks_path_payload_only(self):
+    def test_drops_only_mnt_entries_from_path(self):
         from hermes_cli.gateway import _normalize_systemd_unit_for_comparison
 
         text = (
             '[Service]\n'
-            'Environment="PATH=/a:/b:/c"\n'
+            'Environment="PATH=/a:/mnt/c/windows/thing:/b:/c"\n'
             'Environment="VIRTUAL_ENV=/venv"\n'
         )
         result = _normalize_systemd_unit_for_comparison(text)
-        assert "/a:/b:/c" not in result
-        assert "__HERMES_PATH__" in result
+        assert "/mnt/c/windows/thing" not in result
+        assert 'Environment="PATH=/a:/b:/c"' in result
         assert 'Environment="VIRTUAL_ENV=/venv"' in result
 
-    def test_two_different_paths_normalize_identically(self):
+    def test_paths_differing_only_by_mnt_entries_normalize_identically(self):
+        from hermes_cli.gateway import _normalize_systemd_unit_for_comparison
+
+        a = '[Service]\nEnvironment="PATH=/a:/mnt/c/one:/b"\n'
+        b = '[Service]\nEnvironment="PATH=/a:/mnt/c/two:/mnt/d/three:/b"\n'
+        assert _normalize_systemd_unit_for_comparison(a) == _normalize_systemd_unit_for_comparison(b)
+
+    def test_paths_differing_by_non_mnt_entries_normalize_differently(self):
         from hermes_cli.gateway import _normalize_systemd_unit_for_comparison
 
         a = '[Service]\nEnvironment="PATH=/a:/b"\n'
-        b = '[Service]\nEnvironment="PATH=/x:/y:/z"\n'
-        assert _normalize_systemd_unit_for_comparison(a) == _normalize_systemd_unit_for_comparison(b)
+        b = '[Service]\nEnvironment="PATH=/a:/b:/home/user/.hermes/node/bin"\n'
+        assert _normalize_systemd_unit_for_comparison(a) != _normalize_systemd_unit_for_comparison(b)

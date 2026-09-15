@@ -2967,13 +2967,25 @@ def _normalize_launchd_plist_for_comparison(text: str) -> str:
 
 
 def _normalize_systemd_unit_for_comparison(text: str) -> str:
-    """Normalize unit text for staleness checks, ignoring the PATH payload: like the launchd plist
-    case above, the generated PATH is captured from the invoking shell and varies across shells (e.g.
-    WSL interop entries differ per Windows session), so comparing it verbatim flags a perfectly current
-    unit as outdated forever, once from any shell whose PATH doesn't match the one last used to install it."""
+    """Normalize unit text for staleness checks, dropping only the WSL-interop entries from the PATH
+    payload: ``_build_wsl_interop_paths()`` scrapes ``/mnt/...`` entries straight out of the invoking
+    shell's live ``PATH`` (plus ``shutil.which()`` hits for powershell.exe/cmd.exe/etc., which resolve
+    under the same ``/mnt/...`` prefix), so those entries genuinely differ across Windows sessions and
+    would flag a perfectly current unit as outdated forever. Every other PATH entry -- managed Node,
+    ``~/.local/bin`` and friends from ``_append_node_dir_for_service()``/``_build_user_local_paths()`` --
+    reflects real, on-disk deployment state and must still be compared verbatim, or a genuine change
+    there (Node install moved, a new tool dir appeared) would silently stop being repaired by
+    ``gateway start``/``restart``/``install``. (This assumes ``$HOME`` itself isn't under ``/mnt/...``,
+    true for a standard WSL distro install; that combination isn't supported here.)"""
     import re
+
+    def _drop_wsl_interop_entries(match: "re.Match[str]") -> str:
+        prefix, path_value, suffix = match.group(1), match.group(2), match.group(3)
+        kept = [entry for entry in path_value.split(":") if not entry.startswith("/mnt/")]
+        return f"{prefix}{':'.join(kept)}{suffix}"
+
     return re.sub(
-        r'(Environment="PATH=)(.*?)(")', r"\1__HERMES_PATH__\3",
+        r'(Environment="PATH=)(.*?)(")', _drop_wsl_interop_entries,
         _normalize_service_definition(text),
     )
 
