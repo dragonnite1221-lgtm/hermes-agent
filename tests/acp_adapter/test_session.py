@@ -340,6 +340,38 @@ class TestPersistence:
         }]
 
 
+    def test_restore_raises_on_history_query_failure_instead_of_faking_empty(
+        self, tmp_path, monkeypatch
+    ):
+        """A history-fetch exception must not be swallowed into a "the
+        conversation was just empty" success.
+
+        Before the fix, ``_restore`` caught any exception from
+        ``db.get_messages_as_conversation`` and continued on with
+        ``history = []`` as if that were a legitimately empty conversation,
+        so ``get_session`` returned an apparently-successful ``SessionState``
+        that had silently lost the persisted transcript. Callers like
+        ``resume_session``/``load_session`` then reported the resume/load as
+        successful even though the real history was never retrieved.
+        """
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+
+        state = manager.create_session(cwd=str(tmp_path))
+        state.history.append({"role": "user", "content": "do not lose me"})
+        manager.save_session(state.session_id)
+
+        with manager._lock:
+            del manager._sessions[state.session_id]
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("db timeout")
+
+        monkeypatch.setattr(db, "get_messages_as_conversation", _boom)
+
+        with pytest.raises(acp_session.SessionHistoryUnavailable):
+            manager.get_session(state.session_id)
+
     def test_acp_agents_route_human_output_to_stderr(self, tmp_path, monkeypatch):
         """ACP agents must keep stdout clean for JSON-RPC stdio transport."""
 

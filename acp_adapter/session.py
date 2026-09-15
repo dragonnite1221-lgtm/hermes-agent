@@ -24,6 +24,20 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+class SessionHistoryUnavailable(RuntimeError):
+    """Raised when a session row exists but its message history could not be
+    loaded (DB error, timeout, corruption, ...).
+
+    This is distinct from "no such session" (``None``): the session is real
+    and its metadata restored fine, but the transcript itself is currently
+    unreadable. Callers must not treat this the same as a genuinely empty
+    conversation — doing so silently discards context and reports a failed
+    restore as a success (see acp_adapter/server.py's ``load_session`` /
+    ``resume_session``, which turn this into an explicit protocol error
+    instead of resuming with amnesia).
+    """
+
+
 def _translate_acp_cwd(cwd: str) -> str:
     """Translate Windows ACP cwd values (``E:\\Projects``, ``\\\\wsl.localhost\\``) to POSIX form
     when Hermes runs in WSL so agents, tools, and persisted sessions agree; no-op elsewhere."""
@@ -353,9 +367,15 @@ class SessionManager:
         # ``user;user`` violation in state.db would otherwise re-fire the pre-request repair every request.
         try:
             history = db.get_messages_as_conversation(session_id, repair_alternation=True)
-        except Exception:
+        except Exception as exc:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
-            history = []
+            # Do NOT fall back to history=[] here: that would make a history
+            # query failure indistinguishable from a genuinely empty
+            # conversation, so the caller (load_session/resume_session)
+            # would report the restore as successful while having silently
+            # thrown away the real transcript. Raise instead so the failure
+            # is explicit all the way up.
+            raise SessionHistoryUnavailable(session_id) from exc
 
         try:
             agent = self._make_agent(
