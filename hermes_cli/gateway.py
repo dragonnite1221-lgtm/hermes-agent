@@ -2983,7 +2983,13 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     expected = generate_systemd_unit(system=system, run_as_user=expected_user)
     # Ignore directives older systemd drops (RestartMaxDelaySec, RestartSteps) to avoid a perpetual "outdated" flag.
     running_on_wsl = is_wsl()
-    home_under_mnt = str(Path.home()).startswith("/mnt/")
+    # A system-scope unit runs as expected_user, not the (often root, under sudo) caller checking it --
+    # the PATH masking guard must key off the account the service actually runs under.
+    if system:
+        _, _, target_home_dir, _ = _system_service_identity(expected_user)
+        home_under_mnt = target_home_dir.startswith("/mnt/")
+    else:
+        home_under_mnt = str(Path.home()).startswith("/mnt/")
     norm = lambda text: normalize_systemd_unit_for_comparison(  # noqa: E731
         _strip_optional_systemd_directives(text), is_wsl=running_on_wsl, home_under_mnt=home_under_mnt
     )
