@@ -69,6 +69,17 @@ _IMAGE_SUFFIX_MIME = {
 }
 
 
+def _infer_image_mime(mime_type: str | None, path: Path) -> str | None:
+    """Image MIME type for a local resource file, or ``None`` if it isn't one.
+
+    An explicit image/* ``mimeType`` wins; otherwise infer from the file suffix, since ACP
+    clients frequently omit ``mimeType`` on a ``resource_link``. Shared by the immediate-render
+    path (``_resource_link_to_parts``) and the queue-time snapshot (``snapshot_resource_link_now``)
+    so both recognize the same files as images instead of drifting apart."""
+    candidate = mime_type if _is_image_resource(mime_type) else _IMAGE_SUFFIX_MIME.get(path.suffix.lower())
+    return candidate if candidate and _is_image_resource(candidate) else None
+
+
 def _path_from_file_uri(uri: str) -> Path | None:
     """Local file URI/path from an ACP client -> readable Path (None for non-file URIs).
     Windows drive forms (Zed via wsl.exe) become ``/mnt/<drive>/...``."""
@@ -137,6 +148,51 @@ def _attr(obj: Any, name: str) -> str | None:
     return str(getattr(obj, name, "") or "").strip() or None
 
 
+def _image_too_large_note(size: int) -> str:
+    """Shared "too large to inline" wording for both the immediate-render and snapshot paths,
+    so an oversized image reads identically regardless of which path produced the notice."""
+    return f"[Image too large to inline: {size} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]"
+
+
+def _truncated_suffix(size: int) -> str:
+    """Notice appended to a resource body holding only the first ``_MAX_ACP_RESOURCE_BYTES``
+    bytes of a larger file, so a bounded read is never mistaken for the complete resource."""
+    return f"\n\n[Truncated to {_MAX_ACP_RESOURCE_BYTES} of {size} bytes]"
+
+
+def _resource_identity_meta(
+    name: str | None, title: str | None, *, original_size: int | None = None
+) -> dict[str, Any] | None:
+    """``_meta`` payload carrying a ``resource_link``'s ``name``/``title`` (and, for a truncated
+    binary snapshot, the pre-truncation file size) through a snapshotted
+    ``EmbeddedResourceContentBlock``. Neither ``TextResourceContents``/``BlobResourceContents``
+    nor ``EmbeddedResource`` itself has name/title/size fields of its own -- ``_meta`` is ACP's
+    sanctioned extensibility slot for exactly this, the same convention
+    ``acp_adapter.server``'s compaction-summary flags already use. ``None`` when there is
+    nothing worth carrying (an unnamed, untruncated resource)."""
+    hermes_meta: dict[str, Any] = {k: v for k, v in (("name", name), ("title", title)) if v}
+    if original_size is not None:
+        hermes_meta["originalSize"] = original_size
+    return {"hermes": hermes_meta} if hermes_meta else None
+
+
+def _resource_identity_from_meta(resource: Any) -> tuple[str | None, str | None, int | None]:
+    """Inverse of ``_resource_identity_meta``: recover the name/title/original-size stashed by
+    ``snapshot_resource_link_now``. Absent/malformed ``_meta`` (a resource embedded directly by
+    the ACP client, never snapshotted by us) yields ``(None, None, None)`` so callers fall back
+    to the URI-derived display name and raw blob length exactly as before this existed."""
+    meta = getattr(resource, "field_meta", None)
+    hermes_meta = meta.get("hermes") if isinstance(meta, dict) else None
+    if not isinstance(hermes_meta, dict):
+        return None, None, None
+    name, title, size = hermes_meta.get("name"), hermes_meta.get("title"), hermes_meta.get("originalSize")
+    return (
+        name if isinstance(name, str) else None,
+        title if isinstance(title, str) else None,
+        size if isinstance(size, int) else None,
+    )
+
+
 def _resource_link_to_parts(block: ResourceContentBlock) -> list[dict[str, Any]]:
     """ACP resource_link -> OpenAI content parts: images become a text header + image_url,
     everything else a single text part with the inlined body (or a binary-omit note)."""
@@ -153,14 +209,12 @@ def _resource_link_to_parts(block: ResourceContentBlock) -> list[dict[str, Any]]
             **ident, body="[Resource link only; Hermes cannot read non-file ACP resource URIs directly.]"
         )
 
-    image_mime = mime_type if _is_image_resource(mime_type) else _IMAGE_SUFFIX_MIME.get(path.suffix.lower())
-    if image_mime and _is_image_resource(image_mime):
+    image_mime = _infer_image_mime(mime_type, path)
+    if image_mime:
         try:
             size = path.stat().st_size
             if size > _MAX_ACP_RESOURCE_BYTES:
-                return _text_parts(
-                    **ident, body=f"[Image too large to inline: {size} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]"
-                )
+                return _text_parts(**ident, body=_image_too_large_note(size))
             with path.open("rb") as fh:
                 data = fh.read()
         except OSError as exc:
@@ -190,6 +244,16 @@ def snapshot_resource_link_now(block: PromptBlock) -> PromptBlock:
     possibly against a since-modified, moved, or deleted file, silently
     handing the model different content than the user actually attached.
 
+    Reuses ``_resource_link_to_parts``'s own building blocks (``_infer_image_mime``,
+    ``_image_too_large_note``, ``_truncated_suffix``) instead of reimplementing them, so the
+    two paths can't silently drift. The read is bounded to ``_MAX_ACP_RESOURCE_BYTES`` --
+    never the whole file -- because this runs synchronously on the asyncio event-loop thread
+    (inside ``_claim_turn_or_queue``, under ``state.runtime_lock``); an unbounded read of a
+    multi-GB attachment here would stall every ACP session, not just this one. Oversized
+    non-image files keep the same truncation notice ``_resource_link_to_parts`` gives, and the
+    original ``name``/``title`` survive via ``_meta`` (``_resource_identity_meta``) so replay
+    shows the real resource identity instead of a bare URI basename.
+
     A no-op for anything other than ``ResourceContentBlock``. Falls back to
     the original block unchanged if the file can't be read right now (e.g.
     already gone); ``_resource_link_to_parts``'s existing "resource link
@@ -202,45 +266,56 @@ def snapshot_resource_link_now(block: PromptBlock) -> PromptBlock:
     path = _path_from_file_uri(uri) if uri else None
     if path is None:
         return block
-    mime_type = _attr(block, "mime_type")
-    # Same inference _resource_link_to_parts uses: an explicit image
-    # mime_type wins, else fall back to the file suffix -- a resource_link
-    # with no mimeType set at all must still be recognized as an image
-    # (and therefore be size-gated and embedded as a blob, not read as
-    # text) exactly like the non-queued path does.
-    image_mime = mime_type if _is_image_resource(mime_type) else _IMAGE_SUFFIX_MIME.get(path.suffix.lower())
-    is_image = bool(image_mime and _is_image_resource(image_mime))
+
+    name, title, mime_type = _attr(block, "name"), _attr(block, "title"), _attr(block, "mime_type")
+    identity_meta = _resource_identity_meta(name, title)
+    image_mime = _infer_image_mime(mime_type, path)
     try:
         size = path.stat().st_size
     except OSError:
         return block
-    if is_image and size > _MAX_ACP_RESOURCE_BYTES:
-        # Mirror _resource_link_to_parts' oversized-image guard: never read
-        # (let alone truncate) an oversized image file. A truncated blob
-        # would replay as a corrupt, non-decodable image_url instead of the
-        # clear "too large" notice the non-queued path already gives.
+
+    if image_mime and size > _MAX_ACP_RESOURCE_BYTES:
+        # Mirror _resource_link_to_parts' oversized-image guard: never read (let alone
+        # truncate) an oversized image file. A truncated blob would replay as a corrupt,
+        # non-decodable image_url instead of the clear "too large" notice the non-queued path
+        # already gives.
         resource: TextResourceContents | BlobResourceContents = TextResourceContents(
-            uri=uri,
-            text=f"[Image too large to inline: {size} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]",
-            mimeType=mime_type,
+            uri=uri, text=_image_too_large_note(size), mimeType=mime_type, field_meta=identity_meta
         )
         return EmbeddedResourceContentBlock(type="resource", resource=resource)
+
     try:
-        # Bounded read: never pull more than the cap into memory, even for
-        # a huge non-image file (this call runs synchronously inside
-        # _claim_turn_or_queue, under state.runtime_lock, on the asyncio
-        # event loop thread -- reading an entire multi-GB file here would
-        # block every other session, not just this one).
+        # Bounded read: never pull more than the cap into memory, even for a huge non-image
+        # file -- see the docstring above for why this matters on the event-loop thread.
         with path.open("rb") as fh:
             sample = fh.read(_MAX_ACP_RESOURCE_BYTES)
     except OSError:
         return block
-    text = None if is_image else _decode_text_bytes(sample, mime_type)
-    if text is not None:
-        resource = TextResourceContents(uri=uri, text=text, mimeType=mime_type)
-    else:
+    truncated = size > _MAX_ACP_RESOURCE_BYTES
+
+    if image_mime:
         resource = BlobResourceContents(
-            uri=uri, blob=base64.b64encode(sample).decode("ascii"), mimeType=image_mime or mime_type
+            uri=uri, blob=base64.b64encode(sample).decode("ascii"), mimeType=image_mime, field_meta=identity_meta
+        )
+        return EmbeddedResourceContentBlock(type="resource", resource=resource)
+
+    text = _decode_text_bytes(sample, mime_type)
+    if text is not None:
+        # A TextResourceContents has no separate "note" channel the way
+        # _resource_link_to_parts' immediate _text_parts(..., note=...) does -- replay
+        # (_embedded_resource_to_parts) renders resource.text verbatim, so a truncated read
+        # must say so in-band or a queued turn silently treats a partial file as complete.
+        if truncated:
+            text += _truncated_suffix(size)
+        resource = TextResourceContents(uri=uri, text=text, mimeType=mime_type, field_meta=identity_meta)
+    else:
+        # Genuinely binary: stash the real file size in _meta too, since the base64 sample
+        # alone is exactly `_MAX_ACP_RESOURCE_BYTES` bytes once truncated and can no longer
+        # tell replay it was truncated at all.
+        resource = BlobResourceContents(
+            uri=uri, blob=base64.b64encode(sample).decode("ascii"), mimeType=mime_type,
+            field_meta=_resource_identity_meta(name, title, original_size=size),
         )
     return EmbeddedResourceContentBlock(type="resource", resource=resource)
 
@@ -252,9 +327,14 @@ def _embedded_resource_to_parts(block: EmbeddedResourceContentBlock) -> list[dic
 
     uri = _attr(resource, "uri") or ""
     mime_type = _attr(resource, "mime_type")
+    # Recover name/title (and, for a truncated binary snapshot, the pre-truncation file size)
+    # stashed by snapshot_resource_link_now via _meta; (None, None, None) for a resource
+    # embedded directly by the ACP client, which falls back to the URI-derived display name
+    # and raw blob length exactly as before this existed.
+    name, title, original_size = _resource_identity_from_meta(resource)
 
     if isinstance(resource, TextResourceContents):
-        return _text_parts(uri=uri, body=resource.text)
+        return _text_parts(uri=uri, body=resource.text, name=name, title=title)
 
     if isinstance(resource, BlobResourceContents):
         blob = resource.blob or ""
@@ -262,25 +342,28 @@ def _embedded_resource_to_parts(block: EmbeddedResourceContentBlock) -> list[dic
             data = base64.b64decode(blob, validate=True)
         except Exception:
             data = blob.encode("utf-8", errors="replace")
+        size = original_size if original_size is not None else len(data)
 
         if _is_image_resource(mime_type):
-            if len(data) > _MAX_ACP_RESOURCE_BYTES:
+            if size > _MAX_ACP_RESOURCE_BYTES:
                 return _text_parts(
-                    uri=uri,
-                    body=f"[Embedded image too large to inline: {len(data)} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]",
+                    uri=uri, name=name, title=title,
+                    body=f"[Embedded image too large to inline: {size} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]",
                 )
-            return _image_parts(uri, _resource_display_name(uri), data, mime_type or "image/png")
+            return _image_parts(
+                uri, _resource_display_name(uri, name=name, title=title), data, mime_type or "image/png"
+            )
 
         body = _decode_text_bytes(data[:_MAX_ACP_RESOURCE_BYTES], mime_type)
         if body is None:
-            body = f"[Binary embedded file omitted: {len(data)} bytes, mime={mime_type or 'unknown'}]"
-        elif len(data) > _MAX_ACP_RESOURCE_BYTES:
-            body += f"\n\n[Truncated to {_MAX_ACP_RESOURCE_BYTES} of {len(data)} bytes]"
-        return _text_parts(uri=uri, body=body)
+            body = f"[Binary embedded file omitted: {size} bytes, mime={mime_type or 'unknown'}]"
+        elif size > _MAX_ACP_RESOURCE_BYTES:
+            body += _truncated_suffix(size)
+        return _text_parts(uri=uri, body=body, name=name, title=title)
 
     text = getattr(resource, "text", None)
     if text:
-        return _text_parts(uri=uri, body=str(text))
+        return _text_parts(uri=uri, body=str(text), name=name, title=title)
     return []
 
 

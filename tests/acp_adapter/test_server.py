@@ -456,6 +456,41 @@ class TestPrompt:
         assert "audio/wav" in str(run_calls[0].get("user_message"))
 
     @pytest.mark.asyncio
+    async def test_whitespace_only_text_prompt_is_rejected_not_dispatched(self, agent, mock_manager):
+        """A prompt made of nothing but a whitespace-only TextContentBlock must not reach
+        run_conversation. _content_blocks_to_openai_user_content collapses an all-text prompt
+        to a joined string built straight from block.text, so a "   " block yields a
+        truthy-but-blank user_content -- the guard that lets a real non-text placeholder
+        (e.g. the audio-only one) through despite an empty user_text must not also let this
+        blank text-only turn through.
+        """
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+
+        run_calls = []
+
+        def _run(*args, **kwargs):
+            run_calls.append(kwargs)
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt_resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="   ")],
+            session_id=resp.session_id,
+        )
+
+        assert isinstance(prompt_resp, PromptResponse)
+        assert prompt_resp.stop_reason == "end_turn"
+        assert run_calls == []
+
+    @pytest.mark.asyncio
     async def test_queued_image_prompt_preserves_attachment_data(self, agent):
         """A prompt that arrives while a turn is already running gets
         queued for the next turn. If it carries an image, the queued item

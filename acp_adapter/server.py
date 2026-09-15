@@ -823,16 +823,20 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
-        # user_content is either a non-empty str or a non-empty list whenever
-        # there is anything at all to send (see
-        # _content_blocks_to_openai_user_content -- it falls back to
-        # _extract_text(prompt), which is "" for a genuinely empty/
-        # unconvertible prompt). Checking only "isinstance(..., list)"
-        # here missed a prompt that produces a meaningful non-empty STRING
-        # even though user_text (from _extract_text, real TextContentBlocks
-        # only) is empty -- e.g. an audio-only prompt, whose placeholder
-        # text lives in user_content but was never a real text block.
-        if not user_text and not user_content:
+        # A text-only prompt's user_content is never more than a join of the very same
+        # TextContentBlocks _extract_text reads (see
+        # _content_blocks_to_openai_user_content's "all parts are text -> join text_parts"
+        # branch), so gate it on user_text alone: a whitespace-only block ("   ") makes
+        # user_content a truthy-but-blank string ("not user_content" is False for
+        # whitespace), which would otherwise let a blank turn through to run_conversation and
+        # get persisted as "[Image attachment]".
+        # A prompt containing any non-text block (image/audio/resource) may legitimately
+        # produce meaningful user_content while user_text stays empty -- e.g. the audio-only
+        # placeholder, real content with no source TextContentBlock -- and must still pass.
+        if text_only_prompt:
+            if not user_text:
+                return PromptResponse(stop_reason="end_turn")
+        elif not user_text and not user_content:
             return PromptResponse(stop_reason="end_turn")
 
         user_text, user_content = self._rewrite_prompt_for_interrupt(state, user_text, user_content, text_only_prompt)

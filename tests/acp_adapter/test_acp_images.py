@@ -82,6 +82,59 @@ def test_snapshot_resource_link_now_handles_oversized_and_mimeless_images(tmp_pa
     assert base64.b64decode(snapshotted_mimeless.resource.blob) == small_png_bytes
 
 
+def test_snapshot_resource_link_now_preserves_name_and_title_through_replay(tmp_path):
+    """A resource_link's name/title must survive snapshot_resource_link_now and still show up
+    when the snapshot is later rendered to OpenAI content -- not fall back to the URI's bare
+    basename, which is often an opaque temp/cache path an editor uses on disk while the real
+    resource identity lives in ``name``/``title``.
+    """
+    from acp_adapter.content import _content_blocks_to_openai_user_content, snapshot_resource_link_now
+
+    attached = tmp_path / "tmp_cache_ab12.md"
+    attached.write_text("hello world", encoding="utf-8")
+    block = ResourceContentBlock(
+        type="resource_link", name="tmp_cache_ab12.md", title="design-notes.md", uri=attached.as_uri(),
+        mimeType="text/markdown",
+    )
+
+    snapshotted = snapshot_resource_link_now(block)
+    content = _content_blocks_to_openai_user_content([snapshotted])
+
+    assert isinstance(content, str)
+    assert "design-notes.md" in content
+    assert "tmp_cache_ab12.md" in content
+
+
+def test_snapshot_resource_link_now_bounds_and_flags_oversized_text(tmp_path):
+    """A queued non-image resource bigger than the cap must be bounded to
+    _MAX_ACP_RESOURCE_BYTES (never the whole file pulled into memory) AND the replayed
+    content must say the resource was truncated -- otherwise a queued turn silently treats a
+    partial file read as the complete attachment.
+    """
+    from acp_adapter.content import (
+        _MAX_ACP_RESOURCE_BYTES,
+        _content_blocks_to_openai_user_content,
+        snapshot_resource_link_now,
+    )
+
+    real_size = _MAX_ACP_RESOURCE_BYTES + 1000
+    oversized = tmp_path / "huge.txt"
+    oversized.write_text("A" * real_size, encoding="utf-8")
+    block = ResourceContentBlock(type="resource_link", name="huge.txt", uri=oversized.as_uri())
+
+    snapshotted = snapshot_resource_link_now(block)
+    assert isinstance(snapshotted, EmbeddedResourceContentBlock)
+    assert isinstance(snapshotted.resource, TextResourceContents)
+    # Bounded, not the whole file: the stored text must stay near the cap, nowhere close to
+    # the real file size.
+    assert len(snapshotted.resource.text) <= _MAX_ACP_RESOURCE_BYTES + 200
+
+    content = _content_blocks_to_openai_user_content([snapshotted])
+    assert isinstance(content, str)
+    assert "truncated" in content.lower()
+    assert str(real_size) in content
+
+
 def test_text_only_acp_blocks_stay_string_for_legacy_prompt_path():
     content = _content_blocks_to_openai_user_content([
         TextContentBlock(type="text", text="/help"),
