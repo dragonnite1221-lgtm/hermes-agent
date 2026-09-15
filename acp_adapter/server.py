@@ -34,7 +34,12 @@ from acp_adapter.events import (
 from acp_adapter.model_catalog import build_model_state, encode_model_choice
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
-from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
+from acp_adapter.session import (
+    SessionHistoryUnavailable,
+    SessionManager,
+    SessionState,
+    _expand_acp_enabled_toolsets,
+)
 from acp_adapter.tools import build_tool_complete, build_tool_start, coerce_tool_args
 from agent.context_compressor import (COMPRESSED_SUMMARY_METADATA_KEY, ContextCompressor)
 from agent.interrupt_compat import request_hard_interrupt
@@ -593,7 +598,18 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     async def load_session(
         self, cwd: str, session_id: str, mcp_servers: list | None = None, **kwargs: Any
     ) -> LoadSessionResponse | None:
-        state = self.session_manager.update_cwd(session_id, cwd)
+        try:
+            state = self.session_manager.update_cwd(session_id, cwd)
+        except SessionHistoryUnavailable:
+            # The session exists but its transcript could not be loaded
+            # (DB error/timeout) -- this is NOT "session not found" and must
+            # not be reported as a successful load with an empty history.
+            logger.warning(
+                "load_session: history unavailable for session %s", session_id, exc_info=True
+            )
+            raise acp.RequestError.internal_error(
+                {"session_id": session_id, "reason": "session history unavailable"}
+            )
         if state is None:
             logger.warning("load_session: session %s not found", session_id)
             return None
@@ -603,7 +619,19 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     async def resume_session(
         self, cwd: str, session_id: str, mcp_servers: list | None = None, **kwargs: Any
     ) -> ResumeSessionResponse:
-        state = self.session_manager.update_cwd(session_id, cwd)
+        try:
+            state = self.session_manager.update_cwd(session_id, cwd)
+        except SessionHistoryUnavailable:
+            # Do NOT silently fall through to "not found, creating new": that
+            # would discard a real, existing conversation and report the
+            # resume as successful with a fresh empty session instead of
+            # surfacing the actual history-load failure to the client.
+            logger.warning(
+                "resume_session: history unavailable for session %s", session_id, exc_info=True
+            )
+            raise acp.RequestError.internal_error(
+                {"session_id": session_id, "reason": "session history unavailable"}
+            )
         if state is None:
             logger.warning("resume_session: session %s not found, creating new", session_id)
             state = self.session_manager.create_session(cwd=cwd)

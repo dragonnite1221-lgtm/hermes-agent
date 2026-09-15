@@ -340,6 +340,54 @@ class TestPersistence:
         }]
 
 
+    @pytest.mark.parametrize(
+        "failing_db_method", ["get_session", "get_messages_as_conversation", "db_acquire"]
+    )
+    def test_restore_raises_on_db_failure_instead_of_faking_empty_or_missing(
+        self, tmp_path, monkeypatch, failing_db_method
+    ):
+        """A DB exception -- fetching the session row itself, fetching its
+        message history, or re-acquiring the SessionDB handle entirely --
+        must not be swallowed into "not found" or "the conversation was
+        just empty".
+
+        Before the fix, ``_restore`` caught any exception from
+        ``db.get_session``/``db.get_messages_as_conversation`` (or a
+        ``None`` from ``_get_db()`` after a failed ``acquire()``) and
+        treated it the same as "row not found" / "empty history", so
+        ``get_session`` returned either ``None`` or an apparently-
+        successful ``SessionState`` with the persisted transcript silently
+        lost. Callers like ``resume_session``/``load_session`` then
+        reported the resume/load as successful (or "not found, creating
+        new") even though the real DB call never actually resolved either
+        way.
+        """
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+
+        state = manager.create_session(cwd=str(tmp_path))
+        state.history.append({"role": "user", "content": "do not lose me"})
+        manager.save_session(state.session_id)
+
+        with manager._lock:
+            del manager._sessions[state.session_id]
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("db timeout")
+
+        if failing_db_method == "db_acquire":
+            # Force _get_db() to re-attempt acquisition on the next call
+            # (its guard is `if self._db_instance is None`) and make that
+            # attempt fail, as if state.db had become unreachable
+            # (corruption, permissions, a busy registry) between requests.
+            manager._db_instance = None
+            monkeypatch.setattr("hermes_state_registry.acquire", _boom)
+        else:
+            monkeypatch.setattr(db, failing_db_method, _boom)
+
+        with pytest.raises(acp_session.SessionHistoryUnavailable):
+            manager.get_session(state.session_id)
+
     def test_acp_agents_route_human_output_to_stderr(self, tmp_path, monkeypatch):
         """ACP agents must keep stdout clean for JSON-RPC stdio transport."""
 
