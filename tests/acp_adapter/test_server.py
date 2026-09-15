@@ -292,12 +292,16 @@ class TestSessionOps:
 
 
     @pytest.mark.asyncio
-    async def test_resume_session_fails_explicitly_when_history_unavailable(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize("method_name", ["resume_session", "load_session"])
+    async def test_session_op_fails_explicitly_when_history_unavailable(
+        self, tmp_path, monkeypatch, method_name
     ):
         """A DB error while loading a session's history must surface as an
-        explicit resume failure, not a silent "not found, creating new"
-        empty session reported as a successful resume.
+        explicit failure on BOTH resume_session and load_session, not a
+        silent success -- resume_session's pre-fix fallback was worse
+        ("not found, creating new" empty session reported as a successful
+        resume), but load_session likewise returned a successful,
+        empty-history load rather than the actual failure.
         """
         db = SessionDB(tmp_path / "state.db")
         manager = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"), db=db)
@@ -317,31 +321,9 @@ class TestSessionOps:
         monkeypatch.setattr(db, "get_messages_as_conversation", _boom)
 
         with pytest.raises(acp.RequestError):
-            await acp_agent.resume_session(cwd=str(tmp_path), session_id=new_resp.session_id)
-
-    @pytest.mark.asyncio
-    async def test_load_session_fails_explicitly_when_history_unavailable(
-        self, tmp_path, monkeypatch
-    ):
-        db = SessionDB(tmp_path / "state.db")
-        manager = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"), db=db)
-        acp_agent = HermesACPAgent(session_manager=manager)
-
-        new_resp = await acp_agent.new_session(cwd=str(tmp_path))
-        state = manager.get_session(new_resp.session_id)
-        state.history.append({"role": "user", "content": "do not lose me"})
-        manager.save_session(state.session_id)
-
-        with manager._lock:
-            del manager._sessions[state.session_id]
-
-        def _boom(*args, **kwargs):
-            raise RuntimeError("db timeout")
-
-        monkeypatch.setattr(db, "get_messages_as_conversation", _boom)
-
-        with pytest.raises(acp.RequestError):
-            await acp_agent.load_session(cwd=str(tmp_path), session_id=new_resp.session_id)
+            await getattr(acp_agent, method_name)(
+                cwd=str(tmp_path), session_id=new_resp.session_id
+            )
 
     @pytest.mark.asyncio
     async def test_resume_session_replays_persisted_history_to_client(self, agent):
