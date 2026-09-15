@@ -501,8 +501,57 @@ class TestPrompt:
 
         assert state.is_running is False
 
+    @pytest.mark.asyncio
+    async def test_queued_prompt_still_drains_when_final_response_delivery_raises(
+        self, agent, mock_manager
+    ):
+        """A prompt queued during a turn must still run even if THAT turn's
+        final-response delivery failed.
 
+        Nothing else drains ``state.queued_prompts`` -- it only happens at
+        the tail of ``prompt()``. Re-raising the delivery failure before
+        reaching the drain loop would strand any prompt queued during this
+        turn indefinitely (or let a later prompt run ahead of it, breaking
+        FIFO order), even though the session itself recovered.
+        """
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
 
+        run_calls = []
+
+        def _run(*args, **kwargs):
+            run_calls.append(1)
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        call_count = {"n": 0}
+
+        async def flaky_session_update(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("connection dropped")
+            return None
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(side_effect=flaky_session_update)
+        agent._conn = mock_conn
+
+        # Simulate a prompt that arrived (and got queued) while this turn
+        # was already running.
+        state.queued_prompts.append("follow-up while busy")
+
+        with pytest.raises(RuntimeError):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hi")],
+                session_id=resp.session_id,
+            )
+
+        assert state.is_running is False
+        assert state.queued_prompts == []
+        assert len(run_calls) == 2  # original turn + the drained follow-up
 
 
 

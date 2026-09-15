@@ -955,6 +955,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 await conn.session_update(session_id, acp.update_user_message_text(next_prompt))
             await self.prompt(prompt=[TextContentBlock(type="text", text=next_prompt)], session_id=session_id)
 
+        if delivery_error is not None:
+            # Now that the session is idle again and any queued follow-ups
+            # have actually run, surface the original delivery failure to
+            # the caller instead of silently reporting this turn as a
+            # normal end_turn.
+            raise delivery_error
+
         usage = None
         if any(result.get(k) is not None for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
             usage = Usage(
