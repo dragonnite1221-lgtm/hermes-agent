@@ -58,6 +58,13 @@ _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
 # ListSessionsRequest has no client-side limit; clients paginate via `cursor`/`next_cursor`.
 _LIST_SESSIONS_PAGE_SIZE = 50
 
+# Matches the fire-and-forget bound in acp_adapter/events.py's _send_update (future.result(timeout=5)).
+# Once acp.task.sender.MessageSender's write loop has died from one failed write, ANY further
+# session_update() on that same connection silently queues and never resolves instead of raising
+# (confirmed against a real broken pipe in tests/acp_adapter/test_server.py) -- bounding the wait
+# is the only way a caller downstream of a dead connection ever gets control back.
+_SESSION_UPDATE_TIMEOUT_SECONDS = 5.0
+
 
 def _flatten_history_text(value: Any) -> str:
     """Persisted content/reasoning (str, or list of ``{"text"}`` / ``{"type": "text", "content"}``
@@ -275,6 +282,18 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         except Exception:
             logger.log(level, fail_msg, session_id, exc_info=True)
             return False
+
+    @staticmethod
+    async def _session_update_or_raise(conn: Any, session_id: str, update: Any) -> None:
+        """``conn.session_update()`` bounded to ``_SESSION_UPDATE_TIMEOUT_SECONDS`` so a
+        connection already broken by an EARLIER failed write can never hang this call forever.
+
+        Used only where the caller (``_finish_turn``) needs delivery failure to actually
+        propagate as an exception -- ``_send`` above is for best-effort notifications where
+        that distinction doesn't matter, so it isn't bounded here too (out of scope for this
+        fix; a hang there would need the same treatment separately).
+        """
+        await asyncio.wait_for(conn.session_update(session_id, update), timeout=_SESSION_UPDATE_TIMEOUT_SECONDS)
 
     def _schedule_soon(self, make_coro: Callable[[], Any]) -> None:
         """Run a notification coroutine right after the current response is queued."""
@@ -1002,7 +1021,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     else:
                         update.message_id = state.message_ids.current()
                     state.message_ids.close()
-                await conn.session_update(session_id, update)
+                await self._session_update_or_raise(conn, session_id, update)
         except Exception as exc:
             # Remember the failure but do not let it skip the cleanup below:
             # is_running must still reset, and any prompt that was queued
@@ -1047,7 +1066,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 display_text = _extract_text(next_prompt).strip() or "[Image attachment]"
             try:
                 if conn:
-                    await conn.session_update(
+                    await self._session_update_or_raise(
+                        conn,
                         session_id,
                         acp.update_user_message_text(display_text),
                     )
