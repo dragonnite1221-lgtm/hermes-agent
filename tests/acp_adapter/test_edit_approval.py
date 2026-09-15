@@ -1017,3 +1017,118 @@ def test_v4a_session_policy_auto_approves_non_host_tilde_target(monkeypatch):
     assert proposal.resolved_target_paths == (None,)
 
     assert should_auto_approve_edit(proposal, "session") is True
+
+
+def test_workspace_auto_approval_maps_boundary_into_docker_workspace_mount(tmp_path, monkeypatch):
+    """The ``AUTO_APPROVE_WORKSPACE`` boundary must be translated into a
+    Docker backend's OWN mounted namespace when its
+    ``docker_mount_cwd_to_workspace`` feature bind-mounts EXACTLY the
+    client-reported workspace to a fixed in-container path (normally
+    ``/workspace``).
+
+    ``_resolve_workspace_boundary`` previously ran ONLY the client-reported,
+    host-style workspace (e.g. ``/Users/me/project``) through
+    ``tools.file_tools._resolve_path_for_task`` -- for an absolute input
+    that resolver just normalizes the string, it never maps a host path
+    onto the backend's own mount point. Meanwhile a V4A target on that same
+    backend resolves (via ``tools.file_tools._resolve_v4a_policy_target``)
+    to the backend-canonical ``/workspace/x`` -- an entirely different,
+    textually-unrelated namespace. Comparing the two directly made a
+    legitimate, in-workspace V4A edit fail the boundary check and prompt
+    (or, under a stricter policy, get denied) even though it targets the
+    exact directory the session was configured with.
+
+    ``tools.terminal_tool._resolve_task_host_cwd`` is the single source of
+    truth for which host directory (if any) got mounted for this task; this
+    test drives it (and ``_get_env_config``) through their real module
+    attributes -- not a bespoke boundary-mapping mock -- so the fix is
+    proven against the actual seam it reads from, and confirms the second
+    boundary candidate is added ONLY when that mount source provably IS the
+    registered workspace (an unconfigured/non-Docker task must still fail
+    closed on the unmapped host-style boundary alone, per the untouched
+    ``test_v4a_auto_approval_on_non_host_backend_uses_backend_cwd_not_host_resolve``
+    above).
+    """
+    import tools.terminal_tool as terminal_tool
+    from tools.file_operations import ReadResult
+
+    task_id = "docker-mount-workspace-boundary-task"
+    host_workspace = tmp_path / "host-workspace"
+    host_workspace.mkdir()
+
+    class FakeDockerEnv:
+        """Not a LocalEnvironment -- _file_ops_uses_host_paths() reads this."""
+
+        cwd = "/workspace"
+
+    class FakeDockerBackend:
+        env = FakeDockerEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+    monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeDockerBackend())
+    monkeypatch.setattr(
+        "tools.terminal_tool._get_env_config",
+        lambda: {"env_type": "docker", "cwd": "/workspace", "host_cwd": str(host_workspace)},
+    )
+    monkeypatch.setattr(
+        "tools.terminal_tool._resolve_task_host_cwd",
+        lambda config, task_id: config.get("host_cwd"),
+    )
+
+    terminal_tool.register_task_env_overrides(task_id, {"cwd": str(host_workspace)})
+    try:
+        proposal = build_edit_proposal(
+            "patch", {"mode": "patch", "patch": "*** Update File: x.txt\n@@\n-old\n+new\n"},
+            task_id=task_id,
+        )
+        # Backend-canonical: /workspace/x.txt, unrelated in string terms to
+        # host_workspace -- exactly the mismatch the fix must bridge.
+        assert proposal.resolved_target_paths == ("/workspace/x.txt",)
+
+        assert should_auto_approve_edit(
+            proposal, "workspace_session", cwd=str(host_workspace), task_id=task_id,
+        ) is True
+    finally:
+        terminal_tool.clear_task_env_overrides(task_id)
+
+
+def test_write_file_preview_line_ending_uses_the_same_byte_window_as_the_real_write(monkeypatch):
+    """The preview's line-ending detection must agree with the real write's
+    own probe even for a UTF-8 file whose first newline sits after byte
+    4096 but before character 4096 (e.g. ~3000 emoji ahead of a CRLF).
+
+    ``ShellFileOperations._probe_write_target()``'s production path (no
+    ``pre_content`` supplied -- how ``write_file_tool``/``patch_tool``
+    actually call it) detects the line ending from a live ``head -c 4096``
+    probe: a BYTE window over the on-disk file that, for this fixture,
+    contains only emoji and therefore no newline at all. Before the fix,
+    ``_normalize_new_text_for_preview`` fed the FULL ``old_text`` straight
+    to ``_detect_line_ending``, whose own ``sample[:4096]`` is a CHARACTER
+    slice -- since this fixture has well under 4096 characters total, that
+    slice covers the WHOLE string, including the CRLF the real byte-based
+    probe never sees, and wrongly normalized new_text to CRLF.
+    """
+    from tools.file_operations import ReadResult
+
+    # ~3000 emoji (4 bytes each in UTF-8 == ~12000 bytes, so byte offset
+    # 4096 falls well before them ending) then a CRLF -- character offset
+    # 4096 falls comfortably past the whole (~3010-character) string.
+    emoji_old_text = "\U0001F600" * 3000 + "\r\nafter\r\n"
+
+    class FakeEmojiBackend:
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content=emoji_old_text)
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeEmojiBackend()
+    )
+
+    proposal = build_edit_proposal(
+        "write_file", {"path": "emoji.txt", "content": "plain new content\n"}, task_id="some-task",
+    )
+
+    # Must NOT be normalized to CRLF: the real write's byte-capped probe
+    # never observes a line ending in the first 4096 bytes of this file.
+    assert proposal.new_text == "plain new content\n"

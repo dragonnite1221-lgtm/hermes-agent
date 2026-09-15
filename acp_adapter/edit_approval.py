@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import tempfile
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -269,12 +270,26 @@ def _normalize_new_text_for_preview(old_text: str | None, new_text: str) -> str:
     V4A's real apply path (``tools/patch_parser.py``) does no such
     normalization at all, so its preview (which also skips this) already
     matches.
+
+    ``old_text`` is run through ``_byte_capped_sample`` before
+    ``_detect_line_ending`` sees it, rather than handed to it directly:
+    ``_probe_write_target()``'s production path (no ``pre_content``
+    supplied, which is how ``write_file_tool``/``patch_tool`` actually call
+    it) detects the line ending from a live ``head -c 4096`` probe -- a
+    BYTE window over the on-disk file. ``_detect_line_ending``'s own
+    ``sample[:4096]`` is a CHARACTER slice of whatever string it is given;
+    for an existing file with enough multibyte characters ahead of its
+    first newline (e.g. ~3000 emoji before a CRLF) that the newline falls
+    after byte 4096 but before character 4096, feeding it the full
+    ``old_text`` directly would see that newline while the real byte-based
+    probe does not, disagreeing about the file's line ending. Byte-capping
+    first keeps this preview and the real write's decision in agreement.
     """
     if old_text is None:
         return new_text
-    from tools.file_operations_common import _detect_line_ending, _normalize_line_endings
+    from tools.file_operations_common import _byte_capped_sample, _detect_line_ending, _normalize_line_endings
 
-    file_ending = _detect_line_ending(old_text)
+    file_ending = _detect_line_ending(_byte_capped_sample(old_text))
     return _normalize_line_endings(new_text, file_ending) if file_ending else new_text
 
 
@@ -442,7 +457,7 @@ def _is_sensitive_auto_approve_path(path: str) -> bool:
 
 
 def _is_single_path_auto_approvable(
-    raw_path: str, policy: str, cwd: str | None, resolved_path: str | None = None,
+    raw_path: str, policy: str, cwd_candidates: tuple[str | None, ...], resolved_path: str | None = None,
 ) -> bool:
     """``raw_path`` is the ORIGINAL (pre-canonicalization) target, always a
     real string -- used for the sensitive-path guard and, under
@@ -457,6 +472,13 @@ def _is_single_path_auto_approvable(
     that check fails closed (denies auto-approval) rather than guessing --
     but this must NOT also deny ``AUTO_APPROVE_SESSION``, which never
     inspects the boundary in the first place.
+
+    ``cwd_candidates`` (from ``_resolve_workspace_boundary``) holds one or
+    more acceptable boundary namespaces: ``resolved_path`` need only fall
+    under ANY of them, since a non-host backend's own mounted root (e.g.
+    Docker's ``/workspace``) and the client-reported host workspace it maps
+    from are the SAME logical workspace even though they are textually
+    unrelated paths.
     """
     if _is_sensitive_auto_approve_path(raw_path):
         return False
@@ -468,15 +490,19 @@ def _is_single_path_auto_approvable(
         path = Path(resolved_path).expanduser().resolve(strict=False)
         # tempfile.gettempdir() is the real temp root on every platform
         # (``/private/tmp`` on macOS since resolve() follows the symlink).
-        return path.is_relative_to(Path(tempfile.gettempdir()).resolve(strict=False)) or (
-            bool(cwd) and path.is_relative_to(Path(cwd).expanduser().resolve(strict=False)))
+        if path.is_relative_to(Path(tempfile.gettempdir()).resolve(strict=False)):
+            return True
+        return any(
+            bool(cwd) and path.is_relative_to(Path(cwd).expanduser().resolve(strict=False))
+            for cwd in cwd_candidates
+        )
     return False
 
 
-def _resolve_workspace_boundary(cwd: str | None, task_id: str | None) -> str | None:
-    """Return the AUTO_APPROVE_WORKSPACE boundary in the SAME namespace as
-    ``proposal.resolved_target_paths`` -- WITHOUT letting it drift with the
-    task's *live* cwd.
+def _resolve_workspace_boundary(cwd: str | None, task_id: str | None) -> tuple[str | None, ...]:
+    """Return the AUTO_APPROVE_WORKSPACE boundary candidate(s), in the SAME
+    namespace(s) ``proposal.resolved_target_paths`` might land in -- WITHOUT
+    letting either candidate drift with the task's *live* cwd.
 
     ``cwd`` (``state.cwd`` at the call sites) is the ACP client's own report
     of the session's ORIGINAL workspace directory, set once at session
@@ -498,26 +524,57 @@ def _resolve_workspace_boundary(cwd: str | None, task_id: str | None) -> str | N
     boundary would always be resolved against the identical (now
     out-of-workspace) live directory.
 
-    Instead this reads ONLY the REGISTERED session cwd override
-    (``tools.file_tools_paths._registered_task_cwd_override`` -- what
-    ``acp_adapter/session.py``'s ``_register_task_cwd`` sets at session
-    create/load/resume, deliberately skipping the live-cwd tier) and runs
-    it through ``_resolve_path_for_task`` for the SAME namespace
-    normalization a resolved target gets. When ``task_id`` is unavailable
-    (e.g. an ``EditProposal`` built by hand in a test), no override is
-    registered, or the lookup fails, this falls back to the given ``cwd``
-    unchanged.
+    The FIRST (always present) candidate reads ONLY the REGISTERED session
+    cwd override (``tools.file_tools_paths._registered_task_cwd_override``
+    -- what ``acp_adapter/session.py``'s ``_register_task_cwd`` sets at
+    session create/load/resume, deliberately skipping the live-cwd tier)
+    and runs it through ``_resolve_path_for_task`` for the SAME namespace
+    normalization a host-paths-backend resolved target gets. When
+    ``task_id`` is unavailable (e.g. an ``EditProposal`` built by hand in a
+    test), no override is registered, or the lookup fails, this candidate
+    falls back to the given ``cwd`` unchanged.
+
+    A SECOND candidate is added only for a Docker task whose
+    ``docker_mount_cwd_to_workspace`` feature bind-mounts EXACTLY this
+    registered workspace to a fixed in-container path (``config["cwd"]``,
+    normally ``/workspace``) -- e.g. a V4A target on that backend resolves
+    (via ``tools.file_tools._resolve_v4a_policy_target``) to
+    ``/workspace/x``, which the first (host-style) candidate above can never
+    match, since a client-reported host directory like ``/Users/me/project``
+    shares no path relationship with the container's own mount point.
+    ``tools.terminal_tool._resolve_task_host_cwd`` is the single source of
+    truth for which host directory (if any) was actually mounted for this
+    task; re-deriving the mapped candidate from that STATIC config value
+    (rather than trusting the backend's LIVE ``env.cwd``, which an agent's
+    own ``cd`` can move away from the mount root) keeps the same
+    live-cwd-drift protection the first candidate already has, and only
+    adds this candidate when the mount source provably IS the registered
+    workspace -- anything else (SSH, an unconfigured Docker task, a
+    mismatched host dir) is left to fail closed on the first candidate
+    alone, exactly like every other "cannot verify" case in this module.
     """
     if not task_id:
-        return cwd
+        return (cwd,)
+    root: str | None = None
+    candidates: list[str | None] = []
     try:
         from tools.file_tools import _resolve_path_for_task
         from tools.file_tools_paths import _registered_task_cwd_override
 
         root = _registered_task_cwd_override(task_id)
-        return str(_resolve_path_for_task(root, task_id)) if root else cwd
+        candidates.append(str(_resolve_path_for_task(root, task_id)) if root else cwd)
     except Exception:
-        return cwd
+        candidates.append(cwd)
+    try:
+        from tools.terminal_tool import _get_env_config, _resolve_task_host_cwd
+
+        config = _get_env_config()
+        host_cwd = _resolve_task_host_cwd(config, task_id)
+        if root and host_cwd and os.path.normpath(os.path.expanduser(root)) == os.path.normpath(host_cwd):
+            candidates.append(str(config.get("cwd")))
+    except Exception:
+        pass
+    return tuple(candidates)
 
 
 def should_auto_approve_edit(
@@ -565,7 +622,7 @@ def should_auto_approve_edit(
     policy = str(policy or AUTO_APPROVE_ASK).strip()
     if policy == AUTO_APPROVE_ASK:
         return False
-    cwd = _resolve_workspace_boundary(cwd, task_id)
+    cwd_candidates = _resolve_workspace_boundary(cwd, task_id)
     raw_targets = proposal.target_paths or (proposal.path,)
     resolved_targets = proposal.resolved_target_paths
     if resolved_targets is None:
@@ -576,7 +633,7 @@ def should_auto_approve_edit(
         # workspace check closed instead of pairing the wrong entries.
         resolved_targets = (None,) * len(raw_targets)
     return all(
-        _is_single_path_auto_approvable(raw, policy, cwd, resolved)
+        _is_single_path_auto_approvable(raw, policy, cwd_candidates, resolved)
         for raw, resolved in zip(raw_targets, resolved_targets)
     )
 
