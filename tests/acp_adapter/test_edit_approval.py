@@ -1476,3 +1476,122 @@ def test_verify_backend_accepts_the_remote_temp_root_alongside_workspace_boundar
     assert should_auto_approve_edit(
         proposal, "workspace_session", cwd="/remote/base/some-other-workspace", task_id=task_id,
     ) is True
+
+
+def test_verify_backend_uses_the_selected_backends_own_temp_dir_not_the_controllers(monkeypatch):
+    """The temp-dir exemption (lexical AND backend verification) must use
+    the SELECTED non-host backend's OWN temp directory
+    (``BaseEnvironment.get_temp_dir()``), not the ACP controller's
+    ``tempfile.gettempdir()``.
+
+    The ACP server can run on macOS/Windows (``tempfile.gettempdir()``
+    returning e.g. ``/var/folders/...`` or ``C:\\Users\\...\\Temp``) while
+    a selected SSH/container backend is POSIX -- in that case the
+    controller's own temp root describes nothing on the backend at all, so
+    a genuinely-in-backend-/tmp edit must still be recognized via the
+    backend's OWN reported temp dir instead.
+    """
+    from tools.file_operations import ExecuteResult, ReadResult
+
+    # The controller's "global" temp dir looks nothing like the backend's
+    # own /tmp.
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: "/var/folders/xy/controller-temp")
+
+    task_id = "non-host-backend-temp-dir-task"
+
+    class FakeNonHostEnv:
+        cwd = "/remote/base"
+
+        def get_temp_dir(self):
+            return "/tmp"
+
+    class FakeNonHostBackend:
+        env = FakeNonHostEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+        def _escape_shell_arg(self, arg):
+            return f"'{arg}'"
+
+        def _exec(self, command, **kwargs):
+            return ExecuteResult(stdout="/tmp/x.txt\n", exit_code=0)
+
+    monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend())
+
+    patch_body = "*** Update File: /tmp/x.txt\n@@\n-old\n+new\n"
+    proposal = build_edit_proposal("patch", {"mode": "patch", "patch": patch_body}, task_id=task_id)
+    assert proposal.resolved_target_paths == ("/tmp/x.txt",)
+
+    assert should_auto_approve_edit(
+        proposal, "workspace_session", cwd="/remote/base/unrelated-workspace", task_id=task_id,
+    ) is True
+
+
+def test_workspace_auto_approval_drops_the_host_path_once_docker_mapping_is_confirmed(tmp_path, monkeypatch):
+    """Once a Docker mount is confirmed, the mapped in-container path
+    (``/workspace``) must REPLACE the host-style boundary candidate, not
+    join it: inside the container, the client-reported host path string
+    (e.g. ``/Users/me/project``) names no real location at all, so keeping
+    it as a second accepted boundary would let an absolute target that
+    happens to reuse that host string literally (e.g. a V4A header naming
+    it directly) pass containment despite being unrelated to the
+    container's actual mounted workspace.
+    """
+    import tools.terminal_tool as terminal_tool
+    from tools.file_operations import ExecuteResult, ReadResult
+
+    # Keep the global-tmp exemption out of the way: tmp_path itself lives
+    # under the real system temp dir, which would otherwise let the target
+    # qualify for the UNRELATED temp-dir boundary and mask what this test
+    # is actually checking.
+    fake_tmp_root = tmp_path / "unrelated-tmp-root"
+    fake_tmp_root.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp_root))
+
+    task_id = "docker-mount-host-path-foreign-task"
+    host_workspace = tmp_path / "host-workspace"
+    host_workspace.mkdir()
+
+    class FakeDockerEnv:
+        cwd = "/workspace"
+
+    class FakeDockerBackend:
+        env = FakeDockerEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+        def _escape_shell_arg(self, arg):
+            return f"'{arg}'"
+
+        def _exec(self, command, **kwargs):
+            # No symlink involved -- the backend reports the (foreign,
+            # un-mounted) literal path unchanged.
+            return ExecuteResult(stdout=f"{host_workspace}/out.txt\n", exit_code=0)
+
+    monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeDockerBackend())
+    monkeypatch.setattr(
+        "tools.terminal_tool._get_env_config",
+        lambda: {"env_type": "docker", "cwd": "/workspace", "host_cwd": str(host_workspace)},
+    )
+    monkeypatch.setattr(
+        "tools.terminal_tool._resolve_task_host_cwd",
+        lambda config, task_id: config.get("host_cwd"),
+    )
+
+    terminal_tool.register_task_env_overrides(task_id, {"cwd": str(host_workspace)})
+    try:
+        # An absolute V4A header naming the HOST workspace path literally:
+        # _resolve_v4a_policy_target returns it unchanged (already
+        # absolute), but that string is foreign inside the container --
+        # only /workspace is actually mounted there.
+        patch_body = f"*** Update File: {host_workspace}/out.txt\n@@\n-old\n+new\n"
+        proposal = build_edit_proposal("patch", {"mode": "patch", "patch": patch_body}, task_id=task_id)
+        assert proposal.resolved_target_paths == (f"{host_workspace}/out.txt",)
+
+        assert should_auto_approve_edit(
+            proposal, "workspace_session", cwd=str(host_workspace), task_id=task_id,
+        ) is False
+    finally:
+        terminal_tool.clear_task_env_overrides(task_id)

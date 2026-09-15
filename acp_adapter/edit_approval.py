@@ -525,7 +525,7 @@ def _is_sensitive_auto_approve_path(path: str) -> bool:
 
 def _is_single_path_auto_approvable(
     raw_path: str, policy: str, cwd_candidates: tuple[str | None, ...], resolved_path: str | None = None,
-    verify_backend: Callable[[str], bool] | None = None,
+    verify_backend: Callable[[str], bool] | None = None, temp_roots: tuple[str, ...] = (),
 ) -> bool:
     """``raw_path`` is the ORIGINAL (pre-canonicalization) target, always a
     real string -- used for the sensitive-path guard and, under
@@ -572,14 +572,19 @@ def _is_single_path_auto_approvable(
         if resolved_path is None:
             return False
         path = Path(resolved_path).expanduser().resolve(strict=False)
-        # tempfile.gettempdir() is the real temp root on every platform
-        # (``/private/tmp`` on macOS since resolve() follows the symlink).
-        # This is just ANOTHER acceptable boundary, not an early return: it
-        # must go through the SAME verify_backend gate below, or a
-        # non-host backend's own /tmp (reached through a backend-only
-        # parent symlink, e.g. /tmp/link -> /outside) could auto-approve
-        # unverified.
-        in_boundary = path.is_relative_to(Path(tempfile.gettempdir()).resolve(strict=False)) or any(
+        # temp_roots (from should_auto_approve_edit) is the CONTROLLER's own
+        # tempfile.gettempdir() for a host-paths backend, or the selected
+        # non-host backend's OWN temp dir (BaseEnvironment.get_temp_dir(),
+        # normally "/tmp") -- never the controller's, which can be a
+        # completely different path (e.g. macOS/Windows) than whatever a
+        # remote POSIX backend considers "/tmp". This is just ANOTHER
+        # acceptable boundary, not an early return: it must go through the
+        # SAME verify_backend gate below, or a non-host backend's own /tmp
+        # (reached through a backend-only parent symlink, e.g.
+        # /tmp/link -> /outside) could auto-approve unverified.
+        in_boundary = any(
+            path.is_relative_to(Path(root).resolve(strict=False)) for root in temp_roots
+        ) or any(
             bool(cwd) and path.is_relative_to(Path(cwd).expanduser().resolve(strict=False))
             for cwd in cwd_candidates
         )
@@ -639,34 +644,43 @@ def _resolve_workspace_boundary(cwd: str | None, task_id: str | None) -> tuple[s
     task; re-deriving the mapped candidate from that STATIC config value
     (rather than trusting the backend's LIVE ``env.cwd``, which an agent's
     own ``cd`` can move away from the mount root) keeps the same
-    live-cwd-drift protection the first candidate already has, and only
-    adds this candidate when the mount source provably IS the registered
-    workspace -- anything else (SSH, an unconfigured Docker task, a
-    mismatched host dir) is left to fail closed on the first candidate
+    live-cwd-drift protection the first candidate already has.
+
+    Once that mount is confirmed, the mapped candidate REPLACES the
+    host-style one rather than joining it: inside the container, the host
+    path string (``/Users/me/project``) names no real location at all --
+    keeping it as a second accepted boundary would let an absolute target
+    that happens to reuse that host string (e.g. a V4A header naming it
+    literally) pass containment despite being unrelated to anything the
+    container's own filesystem considers "the workspace" (and a write
+    against that literal, un-mounted path inside the container would fail
+    at the backend anyway, so dropping it here costs no working case).
+    Anything else (SSH, an unconfigured Docker task, a mismatched host
+    dir) is left to fail closed on the unmapped host-style candidate
     alone, exactly like every other "cannot verify" case in this module.
     """
     if not task_id:
         return (cwd,)
     root: str | None = None
-    candidates: list[str | None] = []
+    host_style_candidate: str | None = cwd
     try:
         from tools.file_tools import _resolve_path_for_task
         from tools.file_tools_paths import _registered_task_cwd_override
 
         root = _registered_task_cwd_override(task_id)
-        candidates.append(str(_resolve_path_for_task(root, task_id)) if root else cwd)
+        host_style_candidate = str(_resolve_path_for_task(root, task_id)) if root else cwd
     except Exception:
-        candidates.append(cwd)
+        pass
     try:
         from tools.terminal_tool import _get_env_config, _resolve_task_host_cwd
 
         config = _get_env_config()
         host_cwd = _resolve_task_host_cwd(config, task_id)
         if root and host_cwd and os.path.normpath(os.path.expanduser(root)) == os.path.normpath(host_cwd):
-            candidates.append(str(config.get("cwd")))
+            return (str(config.get("cwd")),)
     except Exception:
         pass
-    return tuple(candidates)
+    return (host_style_candidate,)
 
 
 def should_auto_approve_edit(
@@ -721,12 +735,23 @@ def should_auto_approve_edit(
     for real. This is skipped for a host-paths (local) backend, where
     ``Path.resolve()`` already followed any real symlink on the SAME
     filesystem the write happens on. The boundary set passed to that
-    verification includes ``tempfile.gettempdir()`` alongside
-    ``cwd_candidates`` -- the SAME two acceptable namespaces
-    ``_is_single_path_auto_approvable``'s own lexical check already grants,
-    so an ordinary remote ``/tmp`` edit that lexically qualifies for the
-    global-tmp exemption isn't then rejected by the verify step for landing
-    outside the (unrelated) workspace boundary alone.
+    verification includes ``temp_roots`` alongside ``cwd_candidates`` -- the
+    SAME two acceptable namespaces ``_is_single_path_auto_approvable``'s own
+    lexical check already grants, so an ordinary remote ``/tmp`` edit that
+    lexically qualifies for the temp exemption isn't then rejected by the
+    verify step for landing outside the (unrelated) workspace boundary
+    alone.
+
+    ``temp_roots`` is the CONTROLLER's own ``tempfile.gettempdir()`` for a
+    host-paths backend (matching this ACP process's own filesystem), or the
+    selected NON-HOST backend's OWN temp dir
+    (``BaseEnvironment.get_temp_dir()``, normally ``/tmp``) for a non-host
+    one -- never the controller's guess for a backend it doesn't share a
+    filesystem with: the ACP server can run on macOS/Windows
+    (``tempfile.gettempdir()`` returning e.g. ``/var/folders/...`` or a
+    Windows ``...\\Temp`` path) while a selected SSH/container backend is
+    POSIX, in which case the controller's own temp root is meaningless to
+    that backend's ``/tmp`` exemption.
     """
 
     policy = str(policy or AUTO_APPROVE_ASK).strip()
@@ -734,13 +759,16 @@ def should_auto_approve_edit(
         return False
     cwd_candidates = _resolve_workspace_boundary(cwd, task_id)
     verify_backend = None
+    temp_roots: tuple[str, ...] = (tempfile.gettempdir(),)
     if task_id:
         try:
             from tools.file_tools import _file_ops_uses_host_paths, _get_file_ops, _verify_realpath_within_any
 
             file_ops = _get_file_ops(task_id)
             if not _file_ops_uses_host_paths(file_ops):
-                verify_boundaries = cwd_candidates + (tempfile.gettempdir(),)
+                backend_temp_dir = getattr(getattr(file_ops, "env", None), "get_temp_dir", None)
+                temp_roots = (backend_temp_dir(),) if backend_temp_dir else (tempfile.gettempdir(),)
+                verify_boundaries = cwd_candidates + temp_roots
                 verify_backend = lambda resolved, _fo=file_ops, _b=verify_boundaries: _verify_realpath_within_any(
                     resolved, _b, _fo)
         except Exception:
@@ -757,7 +785,7 @@ def should_auto_approve_edit(
         # workspace check closed instead of pairing the wrong entries.
         resolved_targets = (None,) * len(raw_targets)
     return all(
-        _is_single_path_auto_approvable(raw, policy, cwd_candidates, resolved, verify_backend)
+        _is_single_path_auto_approvable(raw, policy, cwd_candidates, resolved, verify_backend, temp_roots)
         for raw, resolved in zip(raw_targets, resolved_targets)
     )
 
