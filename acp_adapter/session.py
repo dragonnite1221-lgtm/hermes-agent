@@ -175,13 +175,6 @@ class SessionManager:
         self._lock = threading.Lock()
         self._agent_factory = agent_factory
         self._db_instance = db  # None → lazy-init on first use
-        # Set by _get_db() whenever its lazy acquire() attempt raises;
-        # cleared on a successful acquire. _restore() uses this to tell a
-        # genuine acquisition failure (corruption, permissions, a busy
-        # registry) apart from "no db was ever configured" -- both leave
-        # _db_instance at None, but only the former means a session that
-        # actually exists might be unreachable rather than genuinely absent.
-        self._db_acquire_error: Exception | None = None
 
     # ---- public API ---------------------------------------------------------
 
@@ -295,15 +288,30 @@ class SessionManager:
         ``DEFAULT_DB_PATH``, so test fixtures that change the env var later are honoured. The
         registry handle is the one in-process tools (delegation, session_search, goals) also
         acquire, so the ACP server holds ONE writer on state.db instead of two (#100896)."""
-        if self._db_instance is None:
-            try:
-                from hermes_state_registry import acquire
-                self._db_instance = acquire(get_hermes_home() / "state.db")
-                self._db_acquire_error = None
-            except Exception as exc:
-                logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
-                self._db_acquire_error = exc
-        return self._db_instance
+        db, _ = self._acquire_db()
+        return db
+
+    def _acquire_db(self):
+        """Return ``(db_or_none, error_or_none)`` for THIS call's own attempt, atomically.
+
+        Unlike stashing the failure on ``self`` and reading it back separately after
+        ``_get_db()`` returns, the pair is a single local result: a concurrent call on
+        another thread can still race the underlying ``self._db_instance`` write, but it
+        cannot make THIS call observe a stale/foreign error or silently lose its own.
+        ``_restore()`` needs that guarantee to tell "acquisition just failed" apart from
+        "no DB was ever configured" without misattributing one thread's outcome to
+        another's concurrent attempt.
+        """
+        if self._db_instance is not None:
+            return self._db_instance, None
+        try:
+            from hermes_state_registry import acquire
+            db = acquire(get_hermes_home() / "state.db")
+        except Exception as exc:
+            logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
+            return None, exc
+        self._db_instance = db
+        return db, None
 
     def _persist(self, state: SessionState) -> None:
         """Create/update the session record, then sync the live message set."""
@@ -358,15 +366,15 @@ class SessionManager:
 
     def _restore(self, session_id: str) -> Optional[SessionState]:
         """Load an ACP session from the database into memory, recreating the AIAgent."""
-        db = self._get_db()
+        db, acquire_error = self._acquire_db()
         if db is None:
-            if self._db_acquire_error is not None:
-                # The DB is not simply "not configured" -- the just-now
+            if acquire_error is not None:
+                # The DB is not simply "not configured" -- THIS call's own
                 # acquire() attempt raised (corruption, permissions, a busy
                 # registry, ...). A session that genuinely exists could be
                 # unreachable right now; that must not look identical to
                 # "no such session" the way a bare None return would.
-                raise SessionHistoryUnavailable(session_id) from self._db_acquire_error
+                raise SessionHistoryUnavailable(session_id) from acquire_error
             return None
         try:
             row = db.get_session(session_id)
