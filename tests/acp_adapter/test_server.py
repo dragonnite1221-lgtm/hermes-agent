@@ -883,7 +883,21 @@ class TestPrompt:
             # side effect of THIS run, so pre_turn_hermes_id (snapshotted before the
             # executor call) differs from post_turn_hermes_id (read after it returns).
             state.agent.session_id = "hermes-2"
-            return {"final_response": "ok", "messages": []}
+            # Non-empty messages: SessionManager._persist() leaves a brand-new session
+            # ephemeral (no DB row at all) until it has real history, and
+            # _send_session_info_update() silently no-ops -- never touching the
+            # connection -- when it can't find a DB row for the session. Turn 1 never
+            # created one (it also returned empty messages), so without this, turn 2's
+            # provenance send would skip the real transport entirely, and this test
+            # would pass regardless of whether _send() is bounded (verified: it does,
+            # even with the fix reverted).
+            return {
+                "final_response": "ok",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "ok"},
+                ],
+            }
 
         state.agent.run_conversation = _run_no_rotation
 
