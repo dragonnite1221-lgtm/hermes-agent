@@ -17,6 +17,7 @@ from acp.schema import (
     AuthenticateResponse,
     AvailableCommandsUpdate,
     Implementation,
+    ImageContentBlock,
     InitializeResponse,
     LoadSessionResponse,
     NewSessionResponse,
@@ -408,6 +409,41 @@ class TestPrompt:
         resp = await agent.prompt(prompt=prompt, session_id="nonexistent")
         assert isinstance(resp, PromptResponse)
         assert resp.stop_reason == "refusal"
+
+    @pytest.mark.asyncio
+    async def test_queued_image_prompt_preserves_attachment_data(self, agent):
+        """A prompt that arrives while a turn is already running gets
+        queued for the next turn. If it carries an image, the queued item
+        must retain the actual image bytes -- not just a "[Image
+        attachment]" text placeholder -- or the attachment is silently
+        dropped once the queued turn finally runs (see the drain loop that
+        replays ``state.queued_prompts`` as a fresh ``self.prompt(...)``
+        call).
+        """
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.is_running = True  # simulate an in-flight turn
+
+        image_block = ImageContentBlock(type="image", data="aGVsbG8=", mimeType="image/png")
+        prompt = [
+            TextContentBlock(type="text", text="look at this"),
+            image_block,
+        ]
+
+        resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert isinstance(resp, PromptResponse)
+        assert len(state.queued_prompts) == 1
+        queued = state.queued_prompts[0]
+        assert queued != "[Image attachment]"
+        # The queued item must still carry the actual image data somewhere,
+        # not just a text summary that stands in for it.
+        blocks = queued if isinstance(queued, list) else [queued]
+        assert any(
+            getattr(block, "data", None) == "aGVsbG8="
+            or (isinstance(block, dict) and block.get("data") == "aGVsbG8=")
+            for block in blocks
+        )
 
     @pytest.mark.asyncio
     async def test_prompt_binds_session_id_into_subprocess_env(self, agent, mock_manager):

@@ -694,7 +694,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         return user_text, user_content
 
     def _claim_turn_or_queue(
-        self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool
+        self,
+        state: SessionState,
+        session_id: str,
+        user_text: str,
+        user_content: Any,
+        text_only: bool,
+        prompt: list[PromptBlock],
     ) -> str | None:
         """Mark the session running; if a turn is active, redirect it (text-only, supported
         runtime) or queue it. Returns the client message when absorbed, else None."""
@@ -711,7 +717,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         return "Redirected the active turn with your correction."
                 except Exception:
                     logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
-            state.queued_prompts.append(user_text or "[Image attachment]")
+            # Queue the full content-block list, not just its text. A
+            # text-only summary here would silently drop any
+            # image/audio/resource attachments before the queued turn is
+            # ever replayed (see the drain loop in prompt()).
+            state.queued_prompts.append(list(prompt))
             return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
 
     def _run_agent_turn(
@@ -804,7 +814,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     await self._send_usage_update(state)
                 return PromptResponse(stop_reason="end_turn")
 
-        absorbed = self._claim_turn_or_queue(state, session_id, user_text, user_content, text_only_prompt)
+        absorbed = self._claim_turn_or_queue(
+            state, session_id, user_text, user_content, text_only_prompt, prompt
+        )
         if absorbed is not None:
             if self._conn:
                 await self._conn.session_update(session_id, acp.update_agent_message_text(absorbed))
@@ -933,9 +945,25 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 if not state.queued_prompts:
                     break
                 next_prompt = state.queued_prompts.pop(0)
+            # A queued item is either plain text (/steer, /queue) or the
+            # full original content-block list (a rich prompt queued while
+            # a turn was running) -- rebuild the exact prompt to replay in
+            # either case so attachments queued alongside text survive.
+            if isinstance(next_prompt, str):
+                next_content_blocks = [TextContentBlock(type="text", text=next_prompt)]
+                display_text = next_prompt
+            else:
+                next_content_blocks = next_prompt
+                display_text = _extract_text(next_prompt).strip() or "[Image attachment]"
             if conn:
-                await conn.session_update(session_id, acp.update_user_message_text(next_prompt))
-            await self.prompt(prompt=[TextContentBlock(type="text", text=next_prompt)], session_id=session_id)
+                await conn.session_update(
+                    session_id,
+                    acp.update_user_message_text(display_text),
+                )
+            await self.prompt(
+                prompt=next_content_blocks,
+                session_id=session_id,
+            )
 
         usage = None
         if any(result.get(k) is not None for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
