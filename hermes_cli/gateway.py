@@ -2983,8 +2983,9 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     expected = generate_systemd_unit(system=system, run_as_user=expected_user)
     # Ignore directives older systemd drops (RestartMaxDelaySec, RestartSteps) to avoid a perpetual "outdated" flag.
     running_on_wsl = is_wsl()
+    home_under_mnt = str(Path.home()).startswith("/mnt/")
     norm = lambda text: normalize_systemd_unit_for_comparison(  # noqa: E731
-        _strip_optional_systemd_directives(text), is_wsl=running_on_wsl
+        _strip_optional_systemd_directives(text), is_wsl=running_on_wsl, home_under_mnt=home_under_mnt
     )
     return norm(installed) == norm(expected)
 

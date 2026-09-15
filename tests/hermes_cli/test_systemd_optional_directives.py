@@ -217,14 +217,24 @@ WantedBy=default.target
 
 
 class TestNormalizeSystemdUnitForComparison:
-    def test_masks_mnt_entries_only_when_is_wsl_true(self):
-        """The /mnt/... masking is WSL-interop-specific: on a non-WSL host, `_build_wsl_interop_paths()`
-        never contributes anything, so a /mnt/... entry there is a real mount (e.g. a managed Node
-        install or mounted toolchain) that must be compared verbatim, not masked away (#16 review).
-        `is_wsl` is passed in as plain data -- the platform is never faked (AGENTS.md)."""
+    def test_masks_mnt_entries_only_when_wsl_with_home_not_under_mnt(self):
+        """The /mnt/... masking only applies when it's unambiguously interop noise: on a non-WSL
+        host `_build_wsl_interop_paths()` never contributes anything, and on WSL with $HOME itself
+        under /mnt/... (e.g. a checkout at /mnt/c/project) every service-managed path -- venv,
+        managed Node, ~/.local/bin -- would ALSO sit under /mnt/..., indistinguishable from interop
+        noise by prefix alone (#16 review). In both cases a /mnt/... entry must be compared verbatim,
+        not masked away. `is_wsl`/`home_under_mnt` are passed in as plain data -- the platform is
+        never faked (AGENTS.md)."""
         from hermes_cli.gateway_service_staleness import normalize_systemd_unit_for_comparison
 
         text = '[Service]\nEnvironment="PATH=/a:/mnt/c/windows/thing:/b"\n'
 
-        assert "/mnt/c/windows/thing" not in normalize_systemd_unit_for_comparison(text, is_wsl=True)
-        assert "/mnt/c/windows/thing" in normalize_systemd_unit_for_comparison(text, is_wsl=False)
+        assert "/mnt/c/windows/thing" not in normalize_systemd_unit_for_comparison(
+            text, is_wsl=True, home_under_mnt=False
+        )
+        assert "/mnt/c/windows/thing" in normalize_systemd_unit_for_comparison(
+            text, is_wsl=False, home_under_mnt=False
+        )
+        assert "/mnt/c/windows/thing" in normalize_systemd_unit_for_comparison(
+            text, is_wsl=True, home_under_mnt=True
+        )
