@@ -66,6 +66,22 @@ _LIST_SESSIONS_PAGE_SIZE = 50
 _SESSION_UPDATE_TIMEOUT_SECONDS = 5.0
 
 
+async def _bounded_session_update(conn: Any, session_id: str, update: Any) -> None:
+    """``conn.session_update()`` bounded to ``_SESSION_UPDATE_TIMEOUT_SECONDS``.
+
+    The single choke point every session_update() call in this module goes through
+    (directly or via HermesACPAgent._send/_session_update_or_raise) so a connection
+    already broken by an earlier failed write can never hang a caller forever --
+    including ``_finish_turn``'s pre-drain provenance/usage sends, which run BEFORE
+    the try/finally that resets ``state.is_running`` and would otherwise strand a
+    session permanently "running" on a turn that rotates its session id (compression
+    split) after the connection has already died.
+    """
+    await asyncio.wait_for(
+        conn.session_update(session_id=session_id, update=update), timeout=_SESSION_UPDATE_TIMEOUT_SECONDS
+    )
+
+
 def _flatten_history_text(value: Any) -> str:
     """Persisted content/reasoning (str, or list of ``{"text"}`` / ``{"type": "text", "content"}``
     parts) -> one stripped string; whitespace-only collapses to ``""`` ("nothing to emit")."""
@@ -284,10 +300,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         guard downstream is actually reached instead of hanging forever.
         """
         try:
-            await asyncio.wait_for(
-                self._conn.session_update(session_id=session_id, update=update),
-                timeout=_SESSION_UPDATE_TIMEOUT_SECONDS,
-            )
+            await _bounded_session_update(self._conn, session_id, update)
             return True
         except Exception:
             logger.log(level, fail_msg, session_id, exc_info=True)
@@ -302,7 +315,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         propagate as an exception -- ``_send`` above is for best-effort notifications and
         swallows the (now also bounded) failure instead of raising it.
         """
-        await asyncio.wait_for(conn.session_update(session_id, update), timeout=_SESSION_UPDATE_TIMEOUT_SECONDS)
+        await _bounded_session_update(conn, session_id, update)
 
     def _schedule_soon(self, make_coro: Callable[[], Any]) -> None:
         """Run a notification coroutine right after the current response is queued."""
