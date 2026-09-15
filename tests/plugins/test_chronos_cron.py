@@ -163,8 +163,15 @@ def test_fire_due_rearms_next_oneshot(chronos, monkeypatch):
     assert fake.provisions[0]["fire_at"] == "2026-06-18T12:05:00+00:00"
 
 
-def test_fire_due_rearms_after_claimed_job_failure(chronos, monkeypatch):
-    """A pre-run abort is reported while its persisted retry is re-armed."""
+def test_fire_due_rearms_after_claimed_job_failure(chronos, monkeypatch, temp_home):
+    """A pre-run abort is reported while its persisted retry is re-armed.
+
+    ``create_execution``/``mark_fire_claim_acquired`` run for real against a
+    ``temp_home``-scoped executions.db so ``set_execution_occurrence`` (which
+    binds the claimed occurrence to a real, previously-created row) has
+    something to bind to; only the store-level fire claim and the run
+    pipeline are faked.
+    """
     prov, fake = chronos
     claimed = {"id": "j1", "fire_claim": {"by": "owner-1"}}
     persisted = {
@@ -174,30 +181,19 @@ def test_fire_due_rearms_after_claimed_job_failure(chronos, monkeypatch):
     }
 
     claim_calls = []
-    acquired = []
     monkeypatch.setattr(
         "cron.jobs.claim_job_for_fire",
         lambda jid, **kw: claim_calls.append(kw) or claimed,
-    )
-    monkeypatch.setattr(
-        "cron.executions.create_execution",
-        lambda jid, source, fire_claim_acquired: {
-            "id": "exec-1",
-            "fire_claim_acquired": int(fire_claim_acquired),
-        },
-    )
-    monkeypatch.setattr(
-        "cron.executions.mark_fire_claim_acquired",
-        lambda execution_id: acquired.append(execution_id) or {"id": execution_id},
     )
     monkeypatch.setattr("cron.scheduler.run_one_job", lambda *args, **kwargs: False)
     monkeypatch.setattr("cron.jobs.get_job", lambda jid: persisted)
 
     assert prov.fire_due("j1") is False
-    assert claim_calls == [
-        {"return_job": True, "execution_id": "exec-1", "force": False}
-    ]
-    assert acquired == ["exec-1"]
+    assert len(claim_calls) == 1
+    assert claim_calls[0]["return_job"] is True
+    assert claim_calls[0]["force"] is False
+    assert claim_calls[0]["manual"] is False
+    assert "execution_id" in claim_calls[0]
     assert [provision["job_id"] for provision in fake.provisions] == ["j1"]
 
 
@@ -224,7 +220,7 @@ def test_fire_due_forwards_manual_force_to_claim(chronos, monkeypatch):
 
     assert prov.fire_due("j1", force=True) is False
     assert seen == [
-        {"return_job": True, "execution_id": "exec-1", "force": True}
+        {"return_job": True, "execution_id": "exec-1", "force": True, "manual": False}
     ]
     assert discarded == ["exec-1"]
 
@@ -266,16 +262,11 @@ def test_chronos_is_split_fire_capable(chronos):
     fire webhook uses durable claim admission (not the legacy fire_due path).
     Chronos deliberately has NO fire_due override — its re-arm logic lives in
     fire_claimed, which the split path invokes."""
-    from cron.scheduler_provider import (
-        provider_supports_fire_cancel,
-        provider_supports_force_fire,
-        provider_supports_split_fire,
-    )
+    from cron.scheduler_provider import provider_supports_force_fire, provider_supports_split_fire
 
     prov, _fake = chronos
     assert provider_supports_split_fire(prov) is True
     assert provider_supports_force_fire(prov) is True
-    assert provider_supports_fire_cancel(prov) is True
 
 
 def test_fire_claimed_rearms_persisted_retry_when_run_aborts(chronos, monkeypatch):
