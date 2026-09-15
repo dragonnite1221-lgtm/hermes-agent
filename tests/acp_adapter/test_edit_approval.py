@@ -856,11 +856,20 @@ def test_v4a_preview_on_non_host_backend_does_not_resolve_via_host_resolver(monk
     resolve them against its own live cwd. The preview must do the same --
     resolving via ``_resolve_edit_path`` (host-anchored) would preview a
     path the real V4A apply never even looks at.
+
+    ``resolved_target_paths`` (used only by ``should_auto_approve_edit``'s
+    policy check, never for the patch body itself) must still land on a
+    BACKEND-canonical location -- ``tools.file_tools._resolve_v4a_policy_target``
+    joining the raw header onto the backend's own live ``env.cwd`` with a
+    plain ``posixpath`` join, no shell round-trip -- rather than the raw,
+    un-anchored header string a bare host resolve was leaving behind.
     """
     from tools.file_operations import ReadResult
 
     class FakeNonHostEnv:
         """Not a LocalEnvironment -- _file_ops_uses_host_paths() reads this."""
+
+        cwd = "/remote/base"
 
     class FakeNonHostBackend:
         env = FakeNonHostEnv()
@@ -884,4 +893,85 @@ def test_v4a_preview_on_non_host_backend_does_not_resolve_via_host_resolver(monk
     )
 
     assert proposal.old_text == "container content\n"
-    assert proposal.resolved_target_paths == ("relative.txt",)
+    # The policy-check target is backend-canonical ("/remote/base/relative.txt"),
+    # NOT the raw un-anchored header -- but the patch body handed to the
+    # backend (asserted inside read_file_raw above) stays untouched.
+    assert proposal.resolved_target_paths == ("/remote/base/relative.txt",)
+
+
+def test_v4a_auto_approval_on_non_host_backend_uses_backend_cwd_not_host_resolve(
+    tmp_path, monkeypatch,
+):
+    """A ``workspace_session`` on a non-host (SSH/container/sandbox) backend
+    must judge a V4A patch's auto-approval boundary against where the target
+    actually lands IN THE BACKEND'S OWN NAMESPACE, not against a host-side
+    ``pathlib.Path.resolve()`` of the raw header.
+
+    Before the fix, ``_proposal_for_patch_v4a`` stored the raw, un-anchored
+    V4A header as the policy-check target for a non-host backend, and
+    ``should_auto_approve_edit`` fed that raw string straight to
+    ``_is_single_path_auto_approvable``'s HOST ``Path(...).resolve()`` --
+    resolving it against wherever this ACP process itself happens to be
+    running (simulated below via ``monkeypatch.chdir`` into the registered
+    workspace, matching "the ACP process was launched inside the
+    workspace"), not against the backend's actual live cwd. A relative
+    header that the backend would apply somewhere ENTIRELY different (here,
+    a simulated container path with no relation to the host workspace at
+    all) was misclassified as workspace-local and silently auto-approved.
+
+    This reproduces exactly that setup: a `workspace_session` whose
+    registered/original cwd is the client's HOST workspace path, but whose
+    backend (`_get_file_ops`) is a non-host, SSH/container-style
+    environment with its OWN, entirely different live cwd (as if the agent
+    had `cd`-ed there, or the backend was never rooted at the host path to
+    begin with) -- then a relative V4A header that resolves, in the
+    backend's namespace, to a location with no relation to the registered
+    host workspace. The patch must NOT be auto-approved.
+    """
+    import tools.terminal_tool as terminal_tool
+    from tools.file_operations import ReadResult
+
+    task_id = "non-host-cd-outside-workspace-test"
+
+    # The ACP client's registered/original workspace -- a HOST path, and
+    # (critically for reproducing the pre-fix bug) also this test process's
+    # own cwd, simulating "the ACP process was launched inside the
+    # workspace" from the finding.
+    host_workspace = tmp_path / "host-workspace"
+    host_workspace.mkdir()
+    monkeypatch.chdir(host_workspace)
+
+    class FakeNonHostEnv:
+        """Not a LocalEnvironment -- _file_ops_uses_host_paths() reads this."""
+
+        # The backend's OWN live cwd: a different namespace entirely from
+        # `host_workspace` above, with no path relationship to it.
+        cwd = "/backend/elsewhere"
+
+    class FakeNonHostBackend:
+        env = FakeNonHostEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend()
+    )
+
+    terminal_tool.register_task_env_overrides(task_id, {"cwd": str(host_workspace)})
+    try:
+        patch_body = "*** Update File: secret.txt\n@@\n-old\n+new\n"
+        proposal = build_edit_proposal(
+            "patch", {"mode": "patch", "patch": patch_body}, task_id=task_id,
+        )
+
+        # Backend-canonical: the header resolves, in the backend's own
+        # namespace, to "/backend/elsewhere/secret.txt" -- unrelated to
+        # host_workspace under either namespace.
+        assert proposal.resolved_target_paths == ("/backend/elsewhere/secret.txt",)
+
+        assert should_auto_approve_edit(
+            proposal, "workspace_session", cwd=str(host_workspace), task_id=task_id,
+        ) is False
+    finally:
+        terminal_tool.clear_task_env_overrides(task_id)

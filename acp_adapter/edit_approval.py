@@ -34,6 +34,14 @@ class EditProposal:
     these over the raw ``target_paths``/``path`` so a relative target is
     judged against the same location the write actually lands on, not this
     ACP process's own cwd; see ``should_auto_approve_edit``.
+
+    For a V4A proposal on a non-host (SSH/container/sandbox) backend, an
+    entry can be ``None`` instead of a string: ``tools.file_tools
+    ._resolve_v4a_policy_target`` returns ``None`` when it cannot compute a
+    backend-canonical location for that target (a tilde-prefixed header, or
+    no backend cwd at all) -- ``should_auto_approve_edit`` must treat that as
+    "cannot verify workspace membership" and deny auto-approval, never fall
+    back to raw-string host resolution.
     """
 
     tool_name: str
@@ -42,7 +50,7 @@ class EditProposal:
     new_text: str
     arguments: dict[str, Any]
     target_paths: tuple[str, ...] | None = None
-    resolved_target_paths: tuple[str, ...] | None = None
+    resolved_target_paths: tuple[str | None, ...] | None = None
 
 
 EditApprovalRequester = Callable[[EditProposal], bool]
@@ -361,9 +369,10 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
     # _resolve_edit_path unconditionally here would preview (and report as
     # the auto-approval target) a path the real V4A apply never even looks
     # at -- see _read_text_if_exists's docstring on resolve=False.
-    from tools.file_tools import _file_ops_uses_host_paths, _get_file_ops
+    from tools.file_tools import _file_ops_uses_host_paths, _get_file_ops, _resolve_v4a_policy_target
 
-    uses_host_paths = _file_ops_uses_host_paths(_get_file_ops(task_id))
+    file_ops = _get_file_ops(task_id)
+    uses_host_paths = _file_ops_uses_host_paths(file_ops)
 
     # ACP only supports a single diff payload: surface the exact V4A patch as new_text so
     # patch-mode calls are permissioned and denied patches cannot mutate.
@@ -388,10 +397,19 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
         # Same targets resolved through the task-live-cwd-aware resolver --
         # ONLY on a host-paths backend, matching where the real (rewritten)
         # V4A headers will touch. On a non-host backend the real apply
-        # leaves headers untouched, so the raw paths ARE the real execution
-        # targets; resolving them here would diverge from reality.
+        # leaves headers untouched and lets THAT backend's shell resolve
+        # them against its own live env.cwd, so `_resolve_edit_path` (a HOST
+        # resolver) would diverge from reality here -- but the raw string
+        # can't be handed to `should_auto_approve_edit` either: comparing a
+        # backend-namespace path via host `Path.resolve()` can misclassify
+        # an out-of-workspace write as workspace-local (see
+        # `_resolve_v4a_policy_target`'s docstring). So a non-host target
+        # gets resolved via that SAME no-shell backend-canonical join
+        # instead, for the policy check only -- the patch body handed to
+        # the backend above is untouched either way.
         resolved_target_paths=(
-            tuple(_resolve_edit_path(p, task_id) for p in paths) if uses_host_paths else tuple(paths)
+            tuple(_resolve_edit_path(p, task_id) for p in paths) if uses_host_paths
+            else tuple(_resolve_v4a_policy_target(p, file_ops) for p in paths)
         ),
     )
 
@@ -512,6 +530,14 @@ def should_auto_approve_edit(
     ``_resolve_workspace_boundary`` before comparing — see that function's
     docstring for why a raw client-reported ``cwd`` is not always
     comparable to a task-resolved target.
+
+    A ``None`` entry in ``resolved_target_paths`` (only ``tools.file_tools
+    ._resolve_v4a_policy_target`` produces one, for a non-host V4A target it
+    could not canonicalize against the backend's own cwd) fails the whole
+    patch closed rather than falling back to the raw string — comparing an
+    un-canonicalized backend-namespace path via host ``Path.resolve()`` is
+    exactly the false-workspace-local misclassification this function exists
+    to prevent.
     """
 
     policy = str(policy or AUTO_APPROVE_ASK).strip()
@@ -519,7 +545,10 @@ def should_auto_approve_edit(
         return False
     cwd = _resolve_workspace_boundary(cwd, task_id)
     targets = proposal.resolved_target_paths or proposal.target_paths or (proposal.path,)
-    return all(_is_single_path_auto_approvable(target, policy, cwd) for target in targets)
+    return all(
+        target is not None and _is_single_path_auto_approvable(target, policy, cwd)
+        for target in targets
+    )
 
 
 def _denied(message: str) -> str:

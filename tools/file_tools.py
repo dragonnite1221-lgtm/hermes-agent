@@ -11,6 +11,7 @@ import errno
 import json
 import logging
 import os
+import posixpath
 import re
 import stat
 import threading
@@ -162,6 +163,55 @@ def _rewrite_v4a_patch_paths_for_host(patch: str, path_to_resolved: dict, file_o
 
     patch = _V4A_SINGLE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_res(m.group(3))}", patch)
     return _V4A_MOVE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_res(m.group(2))} -> {_res(m.group(3))}", patch)
+
+
+def _resolve_v4a_policy_target(path: str, file_ops) -> str | None:
+    """Backend-canonical form of a raw V4A header path, for the auto-approval
+    BOUNDARY CHECK only -- never for the patch body actually sent to the backend.
+
+    For a non-host (SSH/container/sandbox) backend, ``_rewrite_v4a_patch_paths_for_host``
+    deliberately leaves a relative header untouched: ``read_file_raw()`` and
+    ``patch_v4a()`` hand it straight to the backend's shell, which resolves it
+    against THAT backend's own live cwd (``ShellFileOperations._exec`` always
+    runs with ``cwd=effective_cwd`` from ``self.env.cwd``/``self.cwd``).
+    ``acp_adapter/edit_approval.py`` used to store that identical raw string as
+    the auto-approval policy target, which ``should_auto_approve_edit`` then fed
+    to a HOST-side ``pathlib.Path.resolve()`` -- resolving a path meant for the
+    backend's namespace against this ACP process's own cwd instead. If the ACP
+    process happened to be launched inside the workspace, a relative header that
+    actually lands OUTSIDE the workspace on the backend (because the agent
+    ``cd``-ed there) could still resolve, on the host, to something that looks
+    workspace-local -- misclassifying an out-of-workspace write as safe to
+    auto-approve.
+
+    This reproduces the backend's OWN resolution rule instead, with no shell
+    round-trip: the same no-exec join ``tools/file_operations_search.py``'s
+    ``_effective_macos_search_exclusions`` already uses for the identical
+    "where does this land on a non-host backend" question. An absolute header
+    is normalized as-is; a relative one is joined onto the backend's live
+    ``env.cwd`` (falling back to ``file_ops.cwd``) and normalized with
+    ``posixpath`` (every non-host backend -- SSH, Docker, Singularity, Modal,
+    Daytona, Vercel Sandbox -- is POSIX).
+
+    A leading ``~`` is intentionally NOT expanded here (that needs a live shell
+    round-trip against the backend's own ``$HOME``, see
+    ``ShellFileOperations._expand_path``) -- a tilde-prefixed header returns
+    ``None`` instead of guessing, so the caller fails CLOSED.
+
+    Returns ``None`` when no backend cwd is knowable at all (a malformed
+    environment or bare test double): callers must treat that as "cannot
+    verify workspace membership" and deny auto-approval rather than falling
+    back to a host-side guess -- the exact failure mode this function exists
+    to close.
+    """
+    if path.startswith("~"):
+        return None
+    if posixpath.isabs(path):
+        return posixpath.normpath(path)
+    cwd = getattr(getattr(file_ops, "env", None), "cwd", None) or getattr(file_ops, "cwd", None)
+    if not cwd:
+        return None
+    return posixpath.normpath(posixpath.join(str(cwd), path))
 
 
 def _is_blocked_device_path(path: str) -> bool:
