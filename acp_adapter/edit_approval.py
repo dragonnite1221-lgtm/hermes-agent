@@ -353,10 +353,21 @@ def _proposal_for_write_file(arguments: dict[str, Any], task_id: str = "default"
     # and detects the line ending from that (character-based), same as
     # patch_replace -- only an extension outside that coverage falls back
     # to the real write's byte-capped `head -c 4096` probe.
+    #
+    # The extension is taken from `resolved`, NOT the raw `path`: on a host
+    # backend, _resolve_path_for_task's Path.resolve() follows a symlink in
+    # the path to its REAL target (e.g. alias.txt -> script.py resolves to
+    # a path ending in script.py), and write_file_tool() hands write_file()
+    # that SAME resolved path -- write_file()'s own `ext =
+    # os.path.splitext(path)[1]` therefore sees the symlink TARGET's
+    # extension, not the symlink name's. Deriving ext from the raw `path`
+    # here would see ".txt" while the real write sees ".py", disagreeing
+    # about want_pre for exactly the multibyte-prefix-then-CRLF fixture
+    # this function's byte/character-window split exists to handle.
     from tools.file_operations import ShellFileOperations
     from tools.file_tools import _get_file_ops
 
-    ext = os.path.splitext(path)[1].lower()
+    ext = os.path.splitext(resolved)[1].lower()
     wants_pre = ShellFileOperations._write_wants_pre_content(ext, _get_file_ops(task_id))
     new_text = _normalize_new_text_for_preview(
         old_text, str(content), is_write_file=True, use_byte_window=not wants_pre, had_bom=had_bom)

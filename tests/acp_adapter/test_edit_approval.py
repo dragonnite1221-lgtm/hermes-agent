@@ -1706,3 +1706,48 @@ def test_maybe_require_edit_approval_freezes_non_host_v4a_headers_after_approval
     # header -- exactly what a subsequent file_ops.patch_v4a() dispatch
     # call would receive, regardless of what env.cwd becomes afterward.
     assert arguments["patch"] == "*** Update File: /workspace/relative.txt\n@@\n-old\n+new\n"
+
+
+def test_write_file_preview_derives_extension_from_the_resolved_symlink_target(tmp_path, monkeypatch):
+    """``write_file_tool()`` hands ``write_file()`` the RESOLVED path
+    (``_resolve_path_for_task``'s host ``Path.resolve()`` follows a
+    symlink to its real target), so ``write_file()``'s own ``ext =
+    os.path.splitext(path)[1]`` sees the symlink TARGET's extension, not
+    the symlink name's. The preview must derive its extension from the
+    SAME resolved path.
+
+    ``alias.txt -> script.py``: the real write treats this as a ``.py``
+    write (lint-covered -- full pre-content, character-based line-ending
+    detection); deriving the extension from the raw ``alias.txt`` name
+    would instead select the byte-capped probe, disagreeing for the same
+    multibyte-prefix-then-CRLF fixture the byte/character-window split
+    exists to handle. Exercised against a REAL ``ShellFileOperations``-
+    over-``LocalEnvironment`` backend so the real symlink-following
+    ``resolve()`` is genuinely exercised, not mocked.
+    """
+    from tools.environments.local import LocalEnvironment
+    from tools.file_operations import ShellFileOperations
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    real_target = workspace / "script.py"
+    # ~3000 emoji (4 bytes each) then CRLF -- byte offset 4096 falls well
+    # before the emoji run ends, but the full (character-window) text is
+    # scanned in its entirety, so the two windows must disagree here.
+    content = "\U0001F600" * 3000 + "\r\nafter\r\n"
+    real_target.write_text(content, encoding="utf-8")
+    alias = workspace / "alias.txt"
+    alias.symlink_to(real_target)
+
+    env = LocalEnvironment(cwd=str(workspace), timeout=15)
+    real_ops = ShellFileOperations(env, cwd=str(workspace))
+    monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": real_ops)
+
+    proposal = build_edit_proposal(
+        "write_file", {"path": str(alias), "content": "plain new content\n"}, task_id="some-task",
+    )
+
+    # .py is lint-covered -> character-window (full pre-content) detection,
+    # which DOES see the CRLF -- must normalize to CRLF, the opposite of
+    # what byte-window (from the alias's own ".txt" extension) would give.
+    assert proposal.new_text == "plain new content\r\n"
