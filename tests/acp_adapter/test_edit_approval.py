@@ -187,7 +187,7 @@ def test_preview_expands_tilde_using_the_writers_profile_home(tmp_path, monkeypa
     captured_paths = []
 
     class FakeBackend:
-        def read_file_raw(self, path):
+        def read_file_raw(self, path, **kwargs):
             captured_paths.append(path)
             return ReadResult(content="irrelevant\n")
 
@@ -306,7 +306,7 @@ def test_preview_reads_through_the_selected_file_backend_not_local_fs(tmp_path, 
     local_decoy.write_text("WRONG: local host file\n", encoding="utf-8")
 
     class FakeRemoteBackend:
-        def read_file_raw(self, path):
+        def read_file_raw(self, path, **kwargs):
             assert path == str(local_decoy)
             return ReadResult(content="correct remote content\n")
 
@@ -339,7 +339,7 @@ def test_preview_denies_instead_of_masking_unreadable_existing_file_as_new(monke
     from tools.file_operations import ReadResult
 
     class FakeBackendPermissionDenied:
-        def read_file_raw(self, path):
+        def read_file_raw(self, path, **kwargs):
             return ReadResult(error="Cannot read '/etc/shadow': Permission denied")
 
     monkeypatch.setattr(
@@ -365,7 +365,7 @@ def test_preview_treats_confirmed_not_found_as_new_file(monkeypatch):
     from tools.file_operations import ReadResult
 
     class FakeBackendMissing:
-        def read_file_raw(self, path):
+        def read_file_raw(self, path, **kwargs):
             return ReadResult(error=f"File not found: {path}", similar_files=[])
 
     monkeypatch.setattr(
@@ -393,7 +393,7 @@ def test_preview_denies_existing_image_instead_of_showing_it_as_empty(monkeypatc
     from tools.file_operations import ReadResult
 
     class FakeBackendImage:
-        def read_file_raw(self, path):
+        def read_file_raw(self, path, **kwargs):
             return ReadResult(is_image=True, is_binary=True, file_size=12345)
 
     monkeypatch.setattr(
@@ -689,3 +689,108 @@ def test_patch_replace_preview_normalizes_new_text_to_match_existing_crlf_ending
     )
 
     assert proposal.new_text == "alpha\r\nbeta\r\nextra\r\ngamma\r\n"
+
+
+def test_absolute_path_preview_also_routes_through_the_shared_resolver(monkeypatch):
+    """``_resolve_edit_path`` must route an ABSOLUTE path through
+    ``tools.file_tools._resolve_path_for_task`` too, not return it
+    unresolved. That resolver does more than anchor relative inputs -- it
+    also runs a host absolute path through ``Path.resolve()`` (following
+    symlinks, e.g. macOS's ``/tmp`` -> ``/private/tmp``) and a container
+    path through ``posixpath.normpath`` -- so short-circuiting on
+    ``Path(path).is_absolute()`` skipped that normalization entirely,
+    letting the preview and the real write resolve the identical-looking
+    absolute string to different underlying paths.
+    """
+    calls = []
+
+    def fake_resolve(path, task_id):
+        calls.append((path, task_id))
+        return f"/resolved{path}"
+
+    monkeypatch.setattr("tools.file_tools._resolve_path_for_task", fake_resolve)
+
+    from tools.file_operations import ReadResult
+
+    class FakeBackend:
+        def read_file_raw(self, path, **kwargs):
+            assert path == "/resolved/tmp/x.txt"
+            return ReadResult(content="old\n")
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeBackend()
+    )
+
+    proposal = build_edit_proposal(
+        "write_file", {"path": "/tmp/x.txt", "content": "new\n"}, task_id="abs-path-task",
+    )
+
+    # Called twice (once for resolved_target_paths, once inside
+    # _read_text_if_exists) -- both with the SAME absolute input, which is
+    # exactly what proves it is no longer short-circuited.
+    assert calls == [("/tmp/x.txt", "abs-path-task")] * 2
+    assert proposal.old_text == "old\n"
+    assert proposal.resolved_target_paths == ("/resolved/tmp/x.txt",)
+
+
+def test_write_file_preview_reads_unstripped_content_like_the_real_write(monkeypatch):
+    """``write_file()``'s real write never sanitizes the EXISTING file's
+    content -- it fully overwrites, with no dependency on old content at
+    all -- so ``old_text`` is pure display and must show the literal bytes
+    on disk, not a version with terminal-fence-leak patterns stripped out
+    (which would hide real existing content from the approval review).
+    """
+    from tools.file_operations import ReadResult
+
+    real_content = "before __HERMES_FENCE_deadbeef__ after\n"
+
+    class FakeBackend:
+        def read_file_raw(self, path, **kwargs):
+            assert kwargs.get("strip_fence_leaks") is False
+            return ReadResult(content=real_content)
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeBackend()
+    )
+
+    proposal = build_edit_proposal(
+        "write_file", {"path": "sample.txt", "content": "new content\n"}, task_id="some-task",
+    )
+
+    assert proposal.old_text == real_content
+
+
+def test_workspace_auto_approval_resolves_cwd_boundary_via_task_base_dir(tmp_path, monkeypatch):
+    """When ``task_id`` is given, ``should_auto_approve_edit`` must judge the
+    workspace boundary via ``tools.file_tools._resolve_base_dir(task_id)``
+    -- the SAME base a relative target is anchored onto -- not the raw
+    ``cwd`` argument alone, which (for a non-local backend, or simply a
+    stale client report) can be a different namespace/value than the
+    task-resolved target.
+    """
+    fake_tmp_root = tmp_path / "unrelated-tmp-root"
+    fake_tmp_root.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp_root))
+
+    real_workspace = tmp_path / "real-workspace"
+    real_workspace.mkdir()
+    (real_workspace / "x.txt").write_text("x", encoding="utf-8")
+
+    import tools.terminal_tool as terminal_tool
+
+    task_id = "boundary-namespace-test"
+    terminal_tool.register_task_env_overrides(task_id, {"cwd": str(real_workspace)})
+    try:
+        proposal = build_edit_proposal(
+            "write_file", {"path": "x.txt", "content": "y"}, task_id=task_id,
+        )
+        # A deliberately WRONG boundary (an unrelated directory) is passed as
+        # `cwd` -- if should_auto_approve_edit used it directly (as it did
+        # before this fix), the edit would be denied even though the target
+        # is genuinely inside the real, task-resolved workspace.
+        wrong_cwd = str(tmp_path / "an-unrelated-directory")
+        assert should_auto_approve_edit(
+            proposal, "workspace_session", cwd=wrong_cwd, task_id=task_id,
+        ) is True
+    finally:
+        terminal_tool.clear_task_env_overrides(task_id)

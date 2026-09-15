@@ -94,10 +94,22 @@ def _resolve_edit_path(path: str, task_id: str = "default") -> str:
     ourselves first would make every ``~/...`` path "look" absolute and
     skip ``_resolve_path_for_task`` entirely, previewing a file resolved
     against the wrong home while the real write resolves it correctly.
-    """
-    if Path(path).is_absolute():
-        return path
 
+    An ABSOLUTE ``path`` is also routed through ``_resolve_path_for_task``
+    rather than returned as-is: that resolver does more than anchor relative
+    inputs onto a base directory -- ``_anchor()`` also runs a host-backend
+    absolute path through ``Path.resolve()`` (following symlinks; e.g.
+    macOS's ``/tmp`` -> ``/private/tmp``, ``/var`` -> ``/private/var``) or a
+    container backend's path through ``posixpath.normpath`` with no host
+    symlink following, AND applies ``_host_text``'s Git-Bash/MSYS drive-path
+    translation on Windows -- all BEFORE deciding whether the input was
+    already absolute in that normalized form. Returning an absolute input
+    unresolved skipped every one of those, so the preview and the real write
+    could resolve the identical-looking string to different underlying
+    paths. ``_resolve_path_for_task`` itself already special-cases an
+    absolute input internally (no base-dir anchoring), so calling it
+    unconditionally here is correct for both absolute and relative paths.
+    """
     from tools.file_tools import _resolve_path_for_task
 
     return str(_resolve_path_for_task(path, task_id))
@@ -118,19 +130,23 @@ def _read_text_if_exists(
     an unrelated file that happens to exist at that same-looking path on
     the ACP server's own host.
 
-    ``strip_fence_leaks=False`` (used only by ``_proposal_for_patch_replace``)
-    opts out of ``ShellFileOperations``'s ``_strip_terminal_fence_leaks``
-    cleanup. That cleanup is applied by ``read_file_raw()`` (used here, and by
-    the real V4A apply path in ``tools/patch_parser.py``, so preview and
-    write already agree there) but NOT by ``patch_replace()``'s own internal
-    read (``tools/file_operations.py`` reads via a bare ``self._cat()`` for
-    the "replace" patch mode). If the file's real content happens to contain
-    text the stripper's regexes treat as leaked terminal wrapper noise (an
-    OSC sequence, or a ``__HERMES_FENCE_<id>__`` marker), the default
-    (stripped) preview would show -- and fuzzy-match old_string against -- a
-    laundered version of the file while the real ``patch_replace()`` matches
-    against the untouched bytes, computing a different result than what the
-    approval diff showed the user.
+    ``strip_fence_leaks=False`` (used by ``_proposal_for_write_file`` and
+    ``_proposal_for_patch_replace``; V4A keeps the default) opts out of
+    ``ShellFileOperations``'s ``_strip_terminal_fence_leaks`` cleanup. That
+    cleanup is applied by ``read_file_raw()`` (used here, and by the real
+    V4A apply path in ``tools/patch_parser.py``, so V4A's preview and write
+    already agree on stripped content) but NOT by ``write_file()`` (never
+    reads old content for the write at all -- old_text is pure display) or
+    ``patch_replace()``'s own internal read (``tools/file_operations.py``
+    reads via a bare ``self._cat()`` for the "replace" patch mode -- old_text
+    there also feeds the actual fuzzy-match). If the file's real content
+    happens to contain text the stripper's regexes treat as leaked terminal
+    wrapper noise (an OSC sequence, or a ``__HERMES_FENCE_<id>__`` marker),
+    the default (stripped) preview would hide real existing bytes from the
+    approval diff -- and, for patch-replace specifically, fuzzy-match
+    old_string against a laundered version of the file while the real
+    ``patch_replace()`` matches against the untouched bytes, computing a
+    different result than what the approval diff showed the user.
 
     ``deny_binary=False`` (used only by ``_proposal_for_patch_v4a`` for a
     delete-only operation) trades the binary/image raise below for a
@@ -244,7 +260,12 @@ def _proposal_for_write_file(arguments: dict[str, Any], task_id: str = "default"
     if content is None:
         raise ValueError("content required")
     resolved = _resolve_edit_path(path, task_id)
-    old_text = _read_text_if_exists(path, task_id)
+    # strip_fence_leaks=False: write_file()'s real write never sanitizes the
+    # EXISTING file's content -- it fully overwrites, with no dependency on
+    # old content at all -- so this old_text is pure display. Showing a
+    # "cleaned" version would hide real bytes the file actually holds from
+    # the user's approval review; see _read_text_if_exists's docstring.
+    old_text = _read_text_if_exists(path, task_id, strip_fence_leaks=False)
     new_text = _normalize_new_text_for_preview(old_text, str(content))
     return EditProposal(
         "write_file", path, old_text, new_text, dict(arguments),
@@ -381,7 +402,35 @@ def _is_single_path_auto_approvable(raw_path: str, policy: str, cwd: str | None)
     return False
 
 
-def should_auto_approve_edit(proposal: EditProposal, policy: str, cwd: str | None = None) -> bool:
+def _resolve_workspace_boundary(cwd: str | None, task_id: str | None) -> str | None:
+    """Return the AUTO_APPROVE_WORKSPACE boundary in the SAME namespace as
+    ``proposal.resolved_target_paths``.
+
+    ``cwd`` (``state.cwd`` at the call sites) is the ACP client's own report
+    of the session's workspace directory. For a local backend that IS the
+    filesystem namespace the write happens in, so comparing it directly
+    against a resolved target works. For an SSH/container/sandbox-backed
+    task it need not be: ``tools.file_tools._resolve_base_dir(task_id)`` is
+    the exact base directory ``_resolve_path_for_task`` anchors a relative
+    target onto (and, via ``_anchor``, the same normalization an absolute
+    target goes through) -- i.e. the boundary as the resolver itself sees
+    it, not as the client separately reported it. When ``task_id`` is
+    unavailable (e.g. an ``EditProposal`` built by hand in a test) or the
+    lookup fails, fall back to the given ``cwd`` unchanged.
+    """
+    if not task_id:
+        return cwd
+    try:
+        from tools.file_tools import _resolve_base_dir
+
+        return str(_resolve_base_dir(task_id))
+    except Exception:
+        return cwd
+
+
+def should_auto_approve_edit(
+    proposal: EditProposal, policy: str, cwd: str | None = None, task_id: str | None = None,
+) -> bool:
     """Return whether an ACP edit proposal may bypass the prompt for this session.
 
     This is intentionally session-scoped and conservative: sensitive paths still
@@ -401,11 +450,18 @@ def should_auto_approve_edit(proposal: EditProposal, policy: str, cwd: str | Non
     path against this ACP process's own ``os.getcwd()`` — wrong whenever the
     task's live/registered cwd differs, which could misjudge an
     out-of-workspace write as workspace-local and skip the approval prompt.
+
+    ``task_id`` (when given, the same id ``build_edit_proposal`` used) also
+    resolves ``cwd`` itself into the same namespace via
+    ``_resolve_workspace_boundary`` before comparing — see that function's
+    docstring for why a raw client-reported ``cwd`` is not always
+    comparable to a task-resolved target.
     """
 
     policy = str(policy or AUTO_APPROVE_ASK).strip()
     if policy == AUTO_APPROVE_ASK:
         return False
+    cwd = _resolve_workspace_boundary(cwd, task_id)
     targets = proposal.resolved_target_paths or proposal.target_paths or (proposal.path,)
     return all(_is_single_path_auto_approvable(target, policy, cwd) for target in targets)
 
@@ -470,7 +526,11 @@ def make_acp_edit_approval_requester(
         if auto_approve_getter is not None:
             try:
                 policy, cwd = auto_approve_getter()
-                if should_auto_approve_edit(proposal, policy, cwd):
+                # session_id doubles as the task id for the root call (see
+                # build_edit_proposal's own docstring) -- passing it lets
+                # should_auto_approve_edit resolve `cwd` into the same
+                # namespace as the proposal's resolved_target_paths.
+                if should_auto_approve_edit(proposal, policy, cwd, task_id=session_id):
                     logger.info("Auto-approved ACP edit under policy %s: %s", policy, proposal.path)
                     return True
             except Exception:

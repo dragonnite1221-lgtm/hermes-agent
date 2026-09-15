@@ -138,7 +138,7 @@ def make_tool_progress_cb(
                 proposal = build_edit_proposal(name, args, task_id=session_id)
                 if proposal is not None:
                     policy, cwd = edit_approval_policy_getter()
-                    if should_auto_approve_edit(proposal, policy, cwd):
+                    if should_auto_approve_edit(proposal, policy, cwd, task_id=session_id):
                         edit_diff = proposal
             except Exception:
                 logger.debug("Failed to prepare auto-approved ACP edit diff for %s", name, exc_info=True)
