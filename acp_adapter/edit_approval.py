@@ -60,13 +60,104 @@ def reset_edit_approval_requester(token: Token) -> None:
     _EDIT_APPROVAL_REQUESTER.reset(token)
 
 
-def _read_text_if_exists(path: str) -> str | None:
-    p = Path(path).expanduser()
-    if p.is_file():
-        return p.read_text(encoding="utf-8", errors="replace")
-    if p.exists():
-        raise OSError(f"Cannot edit non-file path: {path}")
-    return None
+def _resolve_edit_path(path: str, task_id: str = "default") -> str:
+    """Resolve ``path`` through the exact same resolver the tool backend
+    calls when it actually performs the write.
+
+    ``tools.file_tools._resolve_path_for_task`` is that resolver: it is the
+    literal function ``write_file_tool``/``patch`` call, and its resolution
+    order already covers everything the real write can be anchored to --
+    the task's *live* terminal cwd (updated by every ``cd`` the agent runs
+    mid-session, via ``tools.terminal_tool.record_session_cwd``), then a
+    registered task/session cwd override (what ACP registers at session
+    create/load/resume — see ``acp_adapter/session.py``'s
+    ``_register_task_cwd``), then ``$TERMINAL_CWD``, then the process cwd.
+
+    Returns a string rather than a local ``Path``: for a non-local backend
+    (SSH, container, sandbox) the resolved value lives in THAT backend's
+    namespace, not this process's filesystem, and must only ever be handed
+    to that same backend (see ``_read_text_if_exists``) -- never opened
+    directly here.
+
+    A leading ``~`` is deliberately NOT expanded here with
+    ``Path.expanduser()``/``os.path.expanduser`` (which use this ACP
+    process's own ``$HOME``): ``_resolve_path_for_task`` expands it itself
+    via ``tools.file_tools._expand_tilde``, which prefers Hermes'
+    profile-specific subprocess home over the raw process ``$HOME`` when
+    they differ (gateway/cron contexts in particular). Expanding it
+    ourselves first would make every ``~/...`` path "look" absolute and
+    skip ``_resolve_path_for_task`` entirely, previewing a file resolved
+    against the wrong home while the real write resolves it correctly.
+    """
+    if Path(path).is_absolute():
+        return path
+
+    from tools.file_tools import _resolve_path_for_task
+
+    return str(_resolve_path_for_task(path, task_id))
+
+
+def _read_text_if_exists(path: str, task_id: str = "default") -> str | None:
+    """Read ``path``'s current content for the approval diff.
+
+    Reads through ``tools.file_tools._get_file_ops(task_id)`` -- the same
+    ``ShellFileOperations`` backend ``write_file_tool``/``patch_tool`` use
+    for the actual mutation -- instead of a local ``pathlib.Path`` read.
+    For a local session that backend still shells out on this machine, so
+    behavior is unchanged; for an SSH/container/sandbox-backed task, a
+    direct local read would either wrongly report "file does not exist"
+    for a path that only exists in the remote/container namespace, or read
+    an unrelated file that happens to exist at that same-looking path on
+    the ACP server's own host.
+    """
+    resolved = _resolve_edit_path(path, task_id)
+
+    from tools.file_tools import _get_file_ops
+
+    result = _get_file_ops(task_id).read_file_raw(resolved)
+    if result.is_binary or result.is_image:
+        # An existing image sets NO .error at all -- just is_image=True,
+        # is_binary=True, and empty (default) .content -- so checking only
+        # .error below would fall through to `return result.content` and
+        # show old_text="" for it, as if the path were empty or brand new,
+        # when it actually holds existing binary/image content the user
+        # was never shown. Fail closed instead of masking it as "no old
+        # text".
+        raise OSError(f"Cannot preview binary/image content at {path!r} for edit approval")
+    if result.error:
+        # ShellFileOperations.read_file_raw() sets .error for several very
+        # different situations: a genuinely missing path (always and only
+        # "File not found: {path}", from _suggest_similar_files -- the sole
+        # producer of that exact prefix), but ALSO permission failures,
+        # non-regular files (directory/FIFO/socket/device), binary content,
+        # and transport/backend failures for a path that DOES exist.
+        # Collapsing all of those to "no old text" would make an existing
+        # (but unreadable-for-preview) file look like a brand-new one, and
+        # an approved write_file could then silently overwrite content the
+        # user was never shown. Only the confirmed-missing case is a real
+        # "new file" signal; anything else must fail the proposal instead
+        # of masquerading as one, so maybe_require_edit_approval's
+        # fail-closed default kicks in.
+        if result.error.startswith("File not found: "):
+            # NOTE: this prefix is not a perfectly reliable "confirmed
+            # absent" signal by itself. It comes from
+            # ShellFileOperations._suggest_similar_files(), reached
+            # whenever read_file_raw()'s existence probe command exits
+            # non-zero -- which is also what happens if the probe itself
+            # fails to run at all (a dropped SSH connection, a container
+            # that died, ...), not only when the shell's own `[ -e ... ]`
+            # check says the path is missing. That ambiguity is inherent
+            # to read_file_raw()'s exit-code contract and pre-dates this
+            # module: write_file_tool/patch_tool read through the exact
+            # same function and have the same blind spot before writing.
+            # Fixing it for real means giving read_file_raw() a way to
+            # report "could not determine existence" distinctly from
+            # "confirmed absent", which is a change to the shared
+            # tools.file_operations backend, not something to smuggle into
+            # this preview-only module.
+            return None
+        raise OSError(f"Cannot read current content of {path!r}: {result.error}")
+    return result.content
 
 
 def _required_path(arguments: dict[str, Any]) -> str:
@@ -76,20 +167,20 @@ def _required_path(arguments: dict[str, Any]) -> str:
     return path
 
 
-def _proposal_for_write_file(arguments: dict[str, Any]) -> EditProposal:
+def _proposal_for_write_file(arguments: dict[str, Any], task_id: str = "default") -> EditProposal:
     path = _required_path(arguments)
     content = arguments.get("content")
     if content is None:
         raise ValueError("content required")
-    return EditProposal("write_file", path, _read_text_if_exists(path), str(content), dict(arguments))
+    return EditProposal("write_file", path, _read_text_if_exists(path, task_id), str(content), dict(arguments))
 
 
-def _proposal_for_patch_replace(arguments: dict[str, Any]) -> EditProposal:
+def _proposal_for_patch_replace(arguments: dict[str, Any], task_id: str = "default") -> EditProposal:
     path = _required_path(arguments)
     old_string, new_string = arguments.get("old_string"), arguments.get("new_string")
     if old_string is None or new_string is None:
         raise ValueError("old_string and new_string required")
-    old_text = _read_text_if_exists(path)
+    old_text = _read_text_if_exists(path, task_id)
     if old_text is None:
         raise ValueError(f"Failed to read file: {path}")
 
@@ -123,7 +214,7 @@ def _extract_v4a_patch_paths(patch_body: str) -> list[str]:
     return paths
 
 
-def _proposal_for_patch_v4a(arguments: dict[str, Any]) -> EditProposal:
+def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default") -> EditProposal:
     patch_body = arguments.get("patch")
     if not isinstance(patch_body, str) or not patch_body:
         raise ValueError("patch content required")
@@ -136,7 +227,7 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any]) -> EditProposal:
     return EditProposal(
         tool_name="patch",
         path=paths[0] if single else ", ".join(paths),
-        old_text=_read_text_if_exists(paths[0]) if single else None,
+        old_text=_read_text_if_exists(paths[0], task_id) if single else None,
         # ACP only supports a single diff payload here.  Surface the exact V4A
         # patch content before execution so patch-mode calls are permissioned
         # and denied patches cannot mutate.
@@ -155,11 +246,19 @@ _PROPOSAL_BUILDERS = {
 }
 
 
-def build_edit_proposal(tool_name: str, arguments: dict[str, Any]) -> EditProposal | None:
-    """Return an edit proposal for supported file mutation calls."""
+def build_edit_proposal(
+    tool_name: str, arguments: dict[str, Any], task_id: str = "default"
+) -> EditProposal | None:
+    """Return an edit proposal for supported file mutation calls.
+
+    ``task_id`` must match the id the tool call will actually execute under
+    (the ACP session id) so the preview resolves relative paths through the
+    exact same live-cwd-aware resolver as the real write -- see
+    ``_resolve_edit_path``.
+    """
     mode = arguments.get("mode", "replace") if tool_name == "patch" else None
     builder = _PROPOSAL_BUILDERS.get((tool_name, mode))
-    return builder(arguments) if builder else None
+    return builder(arguments, task_id) if builder else None
 
 
 def _is_sensitive_auto_approve_path(path: str) -> bool:
@@ -203,16 +302,24 @@ def _denied(message: str) -> str:
     return json.dumps({"error": message}, ensure_ascii=False)
 
 
-def maybe_require_edit_approval(tool_name: str, arguments: dict[str, Any]) -> str | None:
+def maybe_require_edit_approval(
+    tool_name: str, arguments: dict[str, Any], task_id: str | None = None
+) -> str | None:
     """Run ACP edit approval if bound.
 
     Returns a JSON tool-error string when the edit must be blocked, otherwise
-    ``None`` so dispatch can continue.  Requester exceptions deny by default."""
+    ``None`` so dispatch can continue.  Requester exceptions deny by default.
+
+    ``task_id`` should be the same id the tool call is about to execute
+    under (model_tools.py's dispatch already has it) so the preview reads
+    relative paths through the identical live-cwd-aware resolver the real
+    write uses -- see ``build_edit_proposal``/``_resolve_edit_path``.
+    """
     requester = _EDIT_APPROVAL_REQUESTER.get()
     if requester is None:
         return None
     try:
-        proposal = build_edit_proposal(tool_name, arguments)
+        proposal = build_edit_proposal(tool_name, arguments, task_id or "default")
     except Exception as exc:
         logger.warning("Could not build ACP edit approval proposal for %s: %s", tool_name, exc)
         return _denied(f"Edit approval denied: could not prepare diff ({exc})")
