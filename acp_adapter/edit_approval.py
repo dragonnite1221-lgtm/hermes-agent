@@ -903,13 +903,24 @@ def maybe_require_edit_approval(
         approved = False
     if not approved:
         return _denied("Edit approval denied by ACP client; file was not modified.")
-    _freeze_non_host_v4a_targets(tool_name, arguments, proposal, task_id or "default")
+    if not _freeze_non_host_v4a_targets(tool_name, arguments, proposal, task_id or "default"):
+        # _freeze_non_host_v4a_targets returned False: there IS a resolvable
+        # non-host V4A target this call needed to freeze but could not (see
+        # its own docstring). Executing `arguments["patch"]` as-is now would
+        # dispatch the STILL-relative, still-live-cwd-dependent patch --
+        # exactly the shared-backend race freezing exists to close. Fail
+        # the approval closed instead of silently falling back to the
+        # unfrozen header.
+        return _denied(
+            "Edit approval could not be finalized (failed to lock the approved file "
+            "path against a concurrent change); the file was not modified. Please retry."
+        )
     return None
 
 
 def _freeze_non_host_v4a_targets(
     tool_name: str, arguments: dict[str, Any], proposal: EditProposal, task_id: str,
-) -> None:
+) -> bool:
     """Rewrite an approved non-host V4A patch's headers, IN PLACE on
     ``arguments`` (the same dict object model_tools.py's dispatch goes on to
     execute), to the exact backend-canonical paths approval was granted for.
@@ -949,32 +960,65 @@ def _freeze_non_host_v4a_targets(
     absolute form here would silently launder it past that check, letting
     ACP execute an input every other dispatch path refuses. Leaving the
     raw ``..`` header untouched preserves that rejection.
+
+    Returns ``False`` when there was at least one target this call NEEDED
+    to freeze (a resolvable -- non-``None``, non-traversal -- entry in
+    ``resolved_target_paths``) but COULD NOT, because ``_get_file_ops``/
+    ``_file_ops_uses_host_paths`` raised (e.g. a shared persistent backend
+    is mid-recreation) or ``_apply_v4a_header_rewrite`` itself failed.
+    ``maybe_require_edit_approval`` denies the approval in that case rather
+    than dispatching ``arguments["patch"]`` still relative and still
+    dependent on the backend's *live* cwd -- exactly the shared-backend
+    race this function exists to close; silently falling back to the
+    unfrozen header would leave the target open to it. ``True`` covers
+    every other case, including nothing-to-freeze-at-all (not a V4A patch,
+    a host-paths backend, or no resolvable target) and a successful
+    rewrite -- whether a target NEEDED freezing is decided purely from
+    ``proposal``/``arguments`` BEFORE ``_get_file_ops`` is even called, so
+    a transient failure there can never wrongly deny an edit that had
+    nothing to freeze in the first place.
     """
     if tool_name != "patch" or arguments.get("mode") != "patch":
-        return
+        return True
     target_paths = proposal.target_paths
     resolved_paths = proposal.resolved_target_paths
     if not target_paths or not resolved_paths or len(target_paths) != len(resolved_paths):
-        return
+        return True
     patch_body = arguments.get("patch")
     if not isinstance(patch_body, str):
-        return
+        return True
+
+    from tools.path_security import has_traversal_component
+
+    if not any(
+        resolved is not None and not has_traversal_component(raw)
+        for raw, resolved in zip(target_paths, resolved_paths)
+    ):
+        # Every target is either unresolvable or traversal-flagged -- this
+        # call could freeze nothing even in the best case, so a file_ops
+        # failure below (never reached) could not have cost us anything.
+        return True
     try:
         from tools.file_tools import _apply_v4a_header_rewrite, _file_ops_uses_host_paths, _get_file_ops
-        from tools.path_security import has_traversal_component
 
         file_ops = _get_file_ops(task_id)
         if _file_ops_uses_host_paths(file_ops):
-            return
+            # Already frozen at dispatch time in tools/file_tools.py for a
+            # host-paths backend.
+            return True
         path_to_resolved = {
             raw: resolved for raw, resolved in zip(target_paths, resolved_paths)
             if resolved is not None and not has_traversal_component(raw)
         }
-        if not path_to_resolved:
-            return
         arguments["patch"] = _apply_v4a_header_rewrite(patch_body, path_to_resolved)
+        return True
     except Exception:
-        logger.debug("Failed to freeze non-host V4A patch headers after approval", exc_info=True)
+        logger.warning(
+            "Failed to freeze an approved non-host V4A patch's headers for task %s -- "
+            "denying rather than dispatching the unfrozen (live-cwd-dependent) patch",
+            task_id, exc_info=True,
+        )
+        return False
 
 
 def build_acp_edit_tool_call(proposal: EditProposal):

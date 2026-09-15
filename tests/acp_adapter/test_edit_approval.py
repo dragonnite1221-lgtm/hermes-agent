@@ -1857,6 +1857,58 @@ def test_maybe_require_edit_approval_freezes_non_host_v4a_headers_after_approval
     assert arguments["patch"] == "*** Update File: /workspace/relative.txt\n@@\n-old\n+new\n"
 
 
+def test_maybe_require_edit_approval_denies_when_freezing_a_resolvable_target_fails(monkeypatch):
+    """If freezing a RESOLVABLE non-host V4A target raises (e.g. the shared
+    backend is mid-recreation when ``_get_file_ops`` is called again after
+    approval), ``maybe_require_edit_approval`` must deny the edit rather
+    than silently falling through to dispatch on the unfrozen, still
+    relative, still live-cwd-dependent patch -- exactly the shared-backend
+    race freezing exists to close. The approved-but-unfrozen header must
+    also be left untouched in ``arguments``, since it is never dispatched.
+    """
+    from acp_adapter.edit_approval import maybe_require_edit_approval
+    from tools.file_operations import ReadResult
+
+    task_id = "freeze-failure-task"
+
+    class FakeNonHostEnv:
+        cwd = "/workspace"
+
+    class FakeNonHostBackend:
+        env = FakeNonHostEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+    # Succeeds when building the proposal (BEFORE approval) so
+    # resolved_target_paths gets a real, resolvable entry; raises the
+    # SECOND time -- simulating the backend becoming unavailable in the
+    # gap between approval and this post-approval freeze attempt.
+    calls = {"n": 0}
+
+    def flaky_get_file_ops(task_id="default"):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return FakeNonHostBackend()
+        raise RuntimeError("backend is being recreated")
+
+    monkeypatch.setattr("tools.file_tools._get_file_ops", flaky_get_file_ops)
+
+    original_patch = "*** Update File: relative.txt\n@@\n-old\n+new\n"
+    arguments = {"mode": "patch", "patch": original_patch}
+    set_edit_approval_requester(lambda _proposal: True)
+    try:
+        result = maybe_require_edit_approval("patch", arguments, task_id=task_id)
+    finally:
+        set_edit_approval_requester(None)
+
+    assert result is not None
+    assert "error" in json.loads(result)
+    # The unfrozen header must never be dispatched -- it is left exactly
+    # as approved, not silently executed against whatever the live cwd is.
+    assert arguments["patch"] == original_patch
+
+
 def test_write_file_preview_derives_extension_from_the_resolved_symlink_target(tmp_path, monkeypatch):
     """``write_file_tool()`` hands ``write_file()`` the RESOLVED path
     (``_resolve_path_for_task``'s host ``Path.resolve()`` follows a
