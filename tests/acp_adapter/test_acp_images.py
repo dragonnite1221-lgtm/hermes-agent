@@ -28,6 +28,25 @@ def test_acp_image_blocks_convert_to_openai_multimodal_content():
     ]
 
 
+def test_audio_only_prompt_becomes_a_text_placeholder_not_empty():
+    """An AudioContentBlock has no real conversion path (no canonical
+    "build an input_audio part" helper in this codebase, and provider
+    audio-input support/format varies), but dropping it silently would
+    turn an audio-only prompt into a completely empty one that never
+    reaches the agent at all. It must at least surface as a text
+    placeholder instead of vanishing without a trace.
+    """
+    from acp.schema import AudioContentBlock
+
+    content = _content_blocks_to_openai_user_content([
+        AudioContentBlock(type="audio", data="aGVsbG8=", mimeType="audio/wav"),
+    ])
+
+    assert isinstance(content, str)
+    assert "audio/wav" in content
+    assert content.strip()
+
+
 def test_text_only_acp_blocks_stay_string_for_legacy_prompt_path():
     content = _content_blocks_to_openai_user_content([
         TextContentBlock(type="text", text="/help"),

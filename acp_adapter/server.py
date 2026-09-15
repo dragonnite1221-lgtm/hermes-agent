@@ -26,7 +26,12 @@ from acp.schema import (
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
 from acp_adapter.commands import HERMES_VERSION, SlashCommandsMixin, _estimate_tokens
-from acp_adapter.content import PromptBlock, _content_blocks_to_openai_user_content, _extract_text
+from acp_adapter.content import (
+    PromptBlock,
+    _content_blocks_to_openai_user_content,
+    _extract_text,
+    snapshot_resource_link_now,
+)
 from acp_adapter.events import (
     AssistantMessageIdAllocator, _build_plan_update_from_todo_result, make_message_cb, make_step_cb,
     make_thinking_cb, make_tool_progress_cb,
@@ -717,11 +722,31 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         return "Redirected the active turn with your correction."
                 except Exception:
                     logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
-            # Queue the full content-block list, not just its text. A
-            # text-only summary here would silently drop any
-            # image/audio/resource attachments before the queued turn is
-            # ever replayed (see the drain loop in prompt()).
-            state.queued_prompts.append(list(prompt))
+            if text_only and isinstance(user_content, str):
+                # Text-only: queue user_text/user_content, NOT the raw
+                # prompt blocks. _rewrite_prompt_for_interrupt() may have
+                # already replaced them with a combined "cancelled
+                # request + new correction" string before this call --
+                # queuing the untouched raw prompt instead would silently
+                # drop that attached correction, reverting to just the
+                # bare new text once the queued turn replays.
+                state.queued_prompts.append(user_text or "[Image attachment]")
+            else:
+                # Rich media: _rewrite_prompt_for_interrupt() never
+                # rewrites these (it only handles text_only + str
+                # user_content), so the raw prompt list is exactly
+                # equivalent here and preserving it in full is safe. Queue
+                # the full content-block list, not just its text -- a
+                # text-only summary here would silently drop any
+                # image/audio/resource attachments before the queued turn
+                # is ever replayed (see the drain loop in prompt()). A
+                # resource_link block only carries a URI, so it's
+                # snapshotted into a self-contained embedded resource NOW
+                # -- otherwise the replay would re-read the file whenever
+                # the queued turn actually runs, possibly against a
+                # since-modified, moved, or deleted file instead of what
+                # the user actually attached.
+                state.queued_prompts.append([snapshot_resource_link_now(block) for block in prompt])
             return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
 
     def _run_agent_turn(
@@ -949,15 +974,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             # full original content-block list (a rich prompt queued while
             # a turn was running) -- rebuild the exact prompt to replay in
             # either case so attachments queued alongside text survive.
-            # NOTE: an AudioContentBlock queued this way still won't reach
-            # the model -- that's not specific to queuing, though.
-            # acp_adapter.content._content_blocks_to_openai_user_content()
-            # (called unconditionally at the top of prompt(), for every
-            # prompt whether queued or not) has no audio branch at all, so
-            # an immediate (non-queued) audio-only prompt is silently
-            # dropped the exact same way. Fixing that means adding real
-            # audio-to-model conversion in a shared, always-on code path --
-            # out of scope for the queuing fix here.
             # Explicitly typed as list[PromptBlock] (not left to inference):
             # the two branches would otherwise infer list[TextContentBlock]
             # and list[PromptBlock] respectively, and a bare `list[X] |

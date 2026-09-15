@@ -24,6 +24,7 @@ from acp.schema import (
     LoadSessionResponse,
     NewSessionResponse,
     PromptResponse,
+    ResourceContentBlock,
     ResumeSessionResponse,
     SessionModelState,
     SessionModeState,
@@ -446,6 +447,89 @@ class TestPrompt:
             or (isinstance(block, dict) and block.get("data") == "aGVsbG8=")
             for block in blocks
         )
+
+    @pytest.mark.asyncio
+    async def test_queued_resource_link_is_snapshotted_not_reread_later(self, agent, tmp_path):
+        """A resource_link block only carries a URI. If it's queued as-is,
+        the drain loop's replay re-reads that URI whenever the queued turn
+        actually runs -- possibly long after the file was modified. The
+        queued item must instead be a self-contained snapshot of the
+        file's content AT THE TIME IT WAS QUEUED.
+        """
+        attached = tmp_path / "notes.md"
+        attached.write_text("original content", encoding="utf-8")
+
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.is_running = True  # simulate an in-flight turn
+
+        prompt = [
+            TextContentBlock(type="text", text="read this"),
+            ResourceContentBlock(
+                type="resource_link",
+                name="notes.md",
+                uri=attached.as_uri(),
+                mimeType="text/markdown",
+            ),
+        ]
+
+        resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+        assert isinstance(resp, PromptResponse)
+        assert len(state.queued_prompts) == 1
+
+        # The file changes AFTER queuing but BEFORE the queued turn runs.
+        attached.write_text("MUTATED AFTER QUEUING", encoding="utf-8")
+
+        queued = state.queued_prompts[0]
+        blocks = queued if isinstance(queued, list) else [queued]
+        resource_blocks = [b for b in blocks if hasattr(b, "resource")]
+        assert resource_blocks, "queued resource_link was not snapshotted into an embedded resource"
+        snapshotted_text = resource_blocks[0].resource.text
+        assert snapshotted_text == "original content"
+        assert "MUTATED" not in snapshotted_text
+
+    @pytest.mark.asyncio
+    async def test_queued_post_interrupt_correction_keeps_the_rewritten_text(
+        self, agent, monkeypatch
+    ):
+        """A post-cancel correction ("stop and send") gets its text rewritten
+        to include the cancelled request BEFORE the turn-claim lock is
+        taken. If another prompt starts running in that gap, this one is
+        queued instead of run immediately -- and the queued item must still
+        carry the REWRITTEN text (cancelled request + correction), not just
+        the bare new text, or the attached context from the salvage path is
+        silently dropped once the queued turn replays.
+        """
+        import acp_adapter.server as server_module
+
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        original_take = server_module._take_interrupted_prompt
+
+        def _take_and_race(state_arg):
+            # Simulate another request claiming the turn in the gap
+            # between this consuming the interrupted prompt (while still
+            # idle) and _claim_turn_or_queue's later lock acquisition.
+            idle, interrupted = original_take(state_arg)
+            state_arg.is_running = True
+            return idle, interrupted
+
+        monkeypatch.setattr(server_module, "_take_interrupted_prompt", _take_and_race)
+
+        state.interrupted_prompt_text = "please refactor the auth module"
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="actually use the new schema")],
+            session_id=new_resp.session_id,
+        )
+
+        assert isinstance(resp, PromptResponse)
+        assert len(state.queued_prompts) == 1
+        queued = state.queued_prompts[0]
+        assert isinstance(queued, str)
+        assert "please refactor the auth module" in queued
+        assert "actually use the new schema" in queued
 
     @pytest.mark.asyncio
     async def test_queued_image_prompt_replay_actually_delivers_attachment(self, agent):

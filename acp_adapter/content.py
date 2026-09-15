@@ -182,6 +182,44 @@ def _resource_link_to_parts(block: ResourceContentBlock) -> list[dict[str, Any]]
         return _text_parts(**ident, body=f"[Could not read attached file: {exc}]")
 
 
+def snapshot_resource_link_now(block: PromptBlock) -> PromptBlock:
+    """Read a ``resource_link``'s file NOW and return a self-contained
+    ``EmbeddedResourceContentBlock``, instead of a bare URI a caller that
+    defers processing (e.g. queuing a prompt for a later turn) would
+    otherwise re-read whenever that later processing actually happens --
+    possibly against a since-modified, moved, or deleted file, silently
+    handing the model different content than the user actually attached.
+
+    A no-op for anything other than ``ResourceContentBlock``. Falls back to
+    the original block unchanged if the file can't be read right now (e.g.
+    already gone); ``_resource_link_to_parts``'s existing "resource link
+    only" / "could not read" fallbacks then apply at replay time, exactly
+    as they would have without this snapshot.
+    """
+    if not isinstance(block, ResourceContentBlock):
+        return block
+    uri = _attr(block, "uri")
+    path = _path_from_file_uri(uri) if uri else None
+    if path is None:
+        return block
+    mime_type = _attr(block, "mime_type")
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return block
+    sample = data[:_MAX_ACP_RESOURCE_BYTES]
+    text = _decode_text_bytes(sample, mime_type)
+    if text is not None and not _is_image_resource(mime_type):
+        resource: TextResourceContents | BlobResourceContents = TextResourceContents(
+            uri=uri, text=text, mimeType=mime_type
+        )
+    else:
+        resource = BlobResourceContents(
+            uri=uri, blob=base64.b64encode(sample).decode("ascii"), mimeType=mime_type
+        )
+    return EmbeddedResourceContentBlock(type="resource", resource=resource)
+
+
 def _embedded_resource_to_parts(block: EmbeddedResourceContentBlock) -> list[dict[str, Any]]:
     resource = getattr(block, "resource", None)
     if resource is None:
@@ -264,6 +302,20 @@ def _content_blocks_to_openai_user_content(prompt: list[PromptBlock]) -> str | l
             _append_parts(parts, text_parts, _resource_link_to_parts(block))
         elif isinstance(block, EmbeddedResourceContentBlock):
             _append_parts(parts, text_parts, _embedded_resource_to_parts(block))
+        elif isinstance(block, AudioContentBlock):
+            # No provider-agnostic audio-input conversion exists in this
+            # codebase yet (no canonical "build an input_audio part"
+            # helper, and provider audio-input support/format varies) --
+            # dropping the block with zero trace would silently discard an
+            # attachment the user explicitly sent, including turning an
+            # audio-only prompt into a fully empty one that never reaches
+            # the agent at all. Surface a plain-text placeholder instead so
+            # the model (and any transcript/log) at least records that an
+            # audio attachment was present, rather than pretending it
+            # never arrived.
+            placeholder = f"[Audio attachment ({block.mime_type}) -- content not transcribed]"
+            parts.append({"type": "text", "text": placeholder})
+            text_parts.append(placeholder)
 
     if not parts:
         return _extract_text(prompt)
