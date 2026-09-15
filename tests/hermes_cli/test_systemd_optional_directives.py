@@ -1,4 +1,5 @@
-"""Tests for systemd optional-directive normalization (issue #41119).
+"""Tests for systemd optional-directive normalization (issue #41119) and PATH
+normalization (issue #35240 follow-up).
 
 On older systemd versions that don't support RestartMaxDelaySec /
 RestartSteps, the installed unit file has those directives silently
@@ -8,6 +9,20 @@ comparison sees a difference.
 
 The fix: _strip_optional_systemd_directives() removes those directives
 from both the installed and expected text before comparison.
+
+Separately, generate_systemd_unit() bakes _build_wsl_interop_paths()'s
+/mnt/... entries -- scraped straight from the invoking shell's live PATH,
+only when is_wsl() -- into the unit's Environment="PATH=..." directive. Two
+shells on the same WSL host routinely carry different /mnt/... segments
+(per-Windows-session interop PATH), so re-running `hermes gateway
+status`/`restart` from a different shell than whichever last wrote the unit
+made a perfectly healthy install look outdated forever.
+hermes_cli.gateway_service_staleness.normalize_systemd_unit_for_comparison()
+drops only those /mnt/... entries, and only under is_wsl() -- never the whole
+PATH payload (a moved/removed managed Node directory must still trigger a
+refresh, #35240 review), and never on a non-WSL host (there /mnt/... entries
+are never interop noise -- they're real mounts a managed Node install or a
+mounted toolchain can legitimately live under, #16 review).
 """
 
 from __future__ import annotations
@@ -156,3 +171,70 @@ WantedBy=default.target
         unit_file = tmp_path / "nonexistent.service"
         monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
         assert gw.systemd_unit_is_current(system=False) is False
+
+    def test_unit_is_current_still_catches_real_path_and_non_path_changes(
+        self, tmp_path, monkeypatch,
+    ):
+        """#16 review: systemd_unit_is_current() must keep catching every real change --
+        PATH or not -- end to end, with the real (host-native) is_wsl() wired through
+        normalize_systemd_unit_for_comparison() rather than faked. The complementary
+        "WSL interop drift is ignored" contract is proven host-independently, as plain
+        data, in TestNormalizeSystemdUnitForComparison below."""
+        from hermes_cli import gateway as gw
+
+        unit_file = tmp_path / "hermes-gateway.service"
+        monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
+
+        installed = (
+            '[Service]\n'
+            'ExecStart=/usr/bin/python -m hermes_cli.main gateway run\n'
+            'Environment="PATH=/home/user/.hermes/node/bin:/usr/bin:/bin"\n'
+        )
+        unit_file.write_text(installed)
+
+        # The managed Node directory itself changed -- a real deployment change.
+        monkeypatch.setattr(
+            gw, "generate_systemd_unit",
+            lambda system=False, run_as_user=None: installed.replace(
+                "/home/user/.hermes/node/bin", "/home/user/.hermes/node/v2/bin"
+            ),
+        )
+        assert gw.systemd_unit_is_current(system=False) is False
+
+        # ExecStart itself changed -- unrelated to PATH, must still be caught.
+        monkeypatch.setattr(
+            gw, "generate_systemd_unit",
+            lambda system=False, run_as_user=None: installed.replace(
+                "gateway run", "gateway run --profile jarvis"
+            ),
+        )
+        assert gw.systemd_unit_is_current(system=False) is False
+
+
+# ---------------------------------------------------------------------------
+# hermes_cli.gateway_service_staleness.normalize_systemd_unit_for_comparison
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeSystemdUnitForComparison:
+    def test_masks_mnt_entries_only_when_wsl_with_home_not_under_mnt(self):
+        """The /mnt/... masking only applies when it's unambiguously interop noise: on a non-WSL
+        host `_build_wsl_interop_paths()` never contributes anything, and on WSL with $HOME itself
+        under /mnt/... (e.g. a checkout at /mnt/c/project) every service-managed path -- venv,
+        managed Node, ~/.local/bin -- would ALSO sit under /mnt/..., indistinguishable from interop
+        noise by prefix alone (#16 review). In both cases a /mnt/... entry must be compared verbatim,
+        not masked away. `is_wsl`/`home_under_mnt` are passed in as plain data -- the platform is
+        never faked (AGENTS.md)."""
+        from hermes_cli.gateway_service_staleness import normalize_systemd_unit_for_comparison
+
+        text = '[Service]\nEnvironment="PATH=/a:/mnt/c/windows/thing:/b"\n'
+
+        assert "/mnt/c/windows/thing" not in normalize_systemd_unit_for_comparison(
+            text, is_wsl=True, home_under_mnt=False
+        )
+        assert "/mnt/c/windows/thing" in normalize_systemd_unit_for_comparison(
+            text, is_wsl=False, home_under_mnt=False
+        )
+        assert "/mnt/c/windows/thing" in normalize_systemd_unit_for_comparison(
+            text, is_wsl=True, home_under_mnt=True
+        )

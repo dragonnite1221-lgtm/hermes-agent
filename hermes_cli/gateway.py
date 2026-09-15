@@ -2976,11 +2976,23 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     if not unit_path.exists():
         return False
 
+    from hermes_cli.gateway_service_staleness import normalize_systemd_unit_for_comparison
+
     installed = unit_path.read_text(encoding="utf-8")
     expected_user = _read_systemd_user_from_unit(unit_path) if system else None
     expected = generate_systemd_unit(system=system, run_as_user=expected_user)
     # Ignore directives older systemd drops (RestartMaxDelaySec, RestartSteps) to avoid a perpetual "outdated" flag.
-    norm = lambda text: _normalize_service_definition(_strip_optional_systemd_directives(text))  # noqa: E731
+    running_on_wsl = is_wsl()
+    # A system-scope unit runs as expected_user, not the (often root, under sudo) caller checking it --
+    # the PATH masking guard must key off the account the service actually runs under.
+    if system:
+        _, _, target_home_dir, _ = _system_service_identity(expected_user)
+        home_under_mnt = target_home_dir.startswith("/mnt/")
+    else:
+        home_under_mnt = str(Path.home()).startswith("/mnt/")
+    norm = lambda text: normalize_systemd_unit_for_comparison(  # noqa: E731
+        _strip_optional_systemd_directives(text), is_wsl=running_on_wsl, home_under_mnt=home_under_mnt
+    )
     return norm(installed) == norm(expected)
 
 
