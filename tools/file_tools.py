@@ -147,6 +147,25 @@ _V4A_SINGLE_HEADER_RE = re.compile(r'^(\*\*\*\s*(Update|Add|Delete)\s+File:\s*)(
 _V4A_MOVE_HEADER_RE = re.compile(r'^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$', re.MULTILINE)
 
 
+def _apply_v4a_header_rewrite(patch: str, path_to_resolved: dict) -> str:
+    """Substitute each V4A header path present in ``path_to_resolved`` with
+    its resolved value; a header path absent from the mapping is left
+    untouched.
+
+    Shared substitution core for ``_rewrite_v4a_patch_paths_for_host``
+    (host-paths backends, rewriting to host-resolved paths) and
+    ``acp_adapter.edit_approval``'s non-host approval-freeze step
+    (rewriting to the backend-canonical paths approval was granted for) --
+    one regex-substitution implementation for both callers.
+    """
+    def _res(raw: str) -> str:
+        raw = raw.strip()
+        return path_to_resolved.get(raw) or raw
+
+    patch = _V4A_SINGLE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_res(m.group(3))}", patch)
+    return _V4A_MOVE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_res(m.group(2))} -> {_res(m.group(3))}", patch)
+
+
 def _rewrite_v4a_patch_paths_for_host(patch: str, path_to_resolved: dict, file_ops) -> str:
     """Rewrite V4A file headers to the resolved host paths (host backends only).
 
@@ -156,13 +175,7 @@ def _rewrite_v4a_patch_paths_for_host(patch: str, path_to_resolved: dict, file_o
     """
     if not _file_ops_uses_host_paths(file_ops):
         return patch
-
-    def _res(raw: str) -> str:
-        raw = raw.strip()
-        return path_to_resolved.get(raw) or raw
-
-    patch = _V4A_SINGLE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_res(m.group(3))}", patch)
-    return _V4A_MOVE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_res(m.group(2))} -> {_res(m.group(3))}", patch)
+    return _apply_v4a_header_rewrite(patch, path_to_resolved)
 
 
 def _resolve_v4a_policy_target(path: str, file_ops) -> str | None:

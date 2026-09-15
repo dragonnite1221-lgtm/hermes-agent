@@ -1595,3 +1595,114 @@ def test_workspace_auto_approval_drops_the_host_path_once_docker_mapping_is_conf
         ) is False
     finally:
         terminal_tool.clear_task_env_overrides(task_id)
+
+
+def test_write_file_preview_only_normalizes_the_crlf_case(monkeypatch):
+    """``write_file()``'s real write ONLY normalizes incoming content when
+    the EXISTING file is CRLF-terminated (``if original_ending == "\\r\\n":
+    content = _normalize_line_endings(content, "\\r\\n")``) -- for an
+    LF-terminated (or single-line) existing file, incoming content that
+    happens to contain CRLF or lone-CR characters is written UNCHANGED, not
+    force-normalized to bare LF. The preview must match: only the CRLF case
+    triggers normalization.
+    """
+    from tools.file_operations import ReadResult
+
+    class FakeLfBackend:
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="line one\nline two\n")
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeLfBackend()
+    )
+
+    mixed_new_content = "line one\r\nline two changed\r\n"
+    proposal = build_edit_proposal(
+        "write_file", {"path": "lf_file.txt", "content": mixed_new_content}, task_id="some-task",
+    )
+
+    # Must stay exactly as the model proposed -- write_file() would write
+    # these mixed endings unchanged against an LF-terminated file.
+    assert proposal.new_text == mixed_new_content
+
+
+def test_write_file_preview_character_window_accounts_for_a_stripped_bom(monkeypatch):
+    """For a linted/LSP-covered extension (e.g. ``.py``), ``write_file()``'s
+    real probe reads FULL pre-content via a bare ``cat`` that does NOT
+    strip a leading BOM (unlike ``read_file_raw()``, which always does).
+    Its character window therefore covers ONE FEWER actual-content
+    character than a same-length slice of our (BOM-less) ``old_text``
+    would, for a file where the first CRLF straddles the 4096-character
+    boundary.
+    """
+    from tools.file_operations import ReadResult
+
+    # Exactly 4095 ASCII chars then CRLF then more text. Real probe (BOM +
+    # this content): char 4096 of the RAW text is the 4095th ASCII char;
+    # its 4096-char window ends there, one character BEFORE the CRLF --
+    # sees no line ending. Our old_text (BOM-stripped) capped to the SAME
+    # 4095 real characters (4096 - 1 for the missing BOM slot) must match.
+    old_text = "A" * 4095 + "\r\nrest\r\n"
+
+    class FakeBomPyBackend:
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content=old_text, _had_bom=True)
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeBomPyBackend()
+    )
+
+    proposal = build_edit_proposal(
+        "write_file", {"path": "bom.py", "content": "plain new content\n"}, task_id="some-task",
+    )
+
+    # Must NOT be normalized to CRLF: accounting for the BOM the real cat
+    # output has (and old_text doesn't), the real probe's window ends one
+    # character before the CRLF.
+    assert proposal.new_text == "plain new content\n"
+
+
+def test_maybe_require_edit_approval_freezes_non_host_v4a_headers_after_approval(monkeypatch):
+    """After a non-host (SSH/container/sandbox) V4A patch is approved,
+    ``maybe_require_edit_approval`` must rewrite its headers, IN PLACE on
+    the SAME ``arguments`` dict the real dispatch goes on to execute, to
+    the exact backend-canonical paths approval was granted for.
+
+    Without this, the relative header stays unresolved and
+    ``ShellFileOperations._exec()`` interprets it against the backend's
+    *live* ``env.cwd`` only at execution time -- when two ACP sessions
+    share a persistent Docker environment, the other session's ``cd``
+    between this approval and the actual dispatch could redirect an
+    approved write to a completely different path. Freezing the header
+    here removes that live-cwd dependency entirely.
+    """
+    from acp_adapter.edit_approval import maybe_require_edit_approval
+    from tools.file_operations import ReadResult
+
+    task_id = "freeze-non-host-v4a-task"
+
+    class FakeNonHostEnv:
+        cwd = "/workspace"
+
+    class FakeNonHostBackend:
+        env = FakeNonHostEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend()
+    )
+
+    arguments = {"mode": "patch", "patch": "*** Update File: relative.txt\n@@\n-old\n+new\n"}
+    set_edit_approval_requester(lambda _proposal: True)
+    try:
+        result = maybe_require_edit_approval("patch", arguments, task_id=task_id)
+    finally:
+        set_edit_approval_requester(None)
+
+    assert result is None  # approved, not blocked
+    # The SAME arguments dict now carries the frozen, backend-canonical
+    # header -- exactly what a subsequent file_ops.patch_v4a() dispatch
+    # call would receive, regardless of what env.cwd becomes afterward.
+    assert arguments["patch"] == "*** Update File: /workspace/relative.txt\n@@\n-old\n+new\n"

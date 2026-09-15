@@ -256,82 +256,82 @@ def _required_path(arguments: dict[str, Any]) -> str:
 
 
 def _normalize_new_text_for_preview(
-    old_text: str | None, new_text: str, *, use_byte_window: bool, had_bom: bool = False,
+    old_text: str | None, new_text: str, *, is_write_file: bool, use_byte_window: bool = False,
+    had_bom: bool = False,
 ) -> str:
     """Match ``write_file()``/``patch_replace()``'s own line-ending
     normalization, so the preview's ``new_text`` uses the SAME ending the
-    real write will produce.
+    real write will produce. ``write_file`` and ``patch_replace`` are NOT
+    interchangeable here -- three separate divergences, selected by
+    ``is_write_file``:
 
-    ``ShellFileOperations.write_file()`` (and ``patch_replace()``, which
-    calls it) preserve an existing file's dominant line ending: when the
-    on-disk content is CRLF, the incoming (usually bare-LF, since models
-    send bare-LF) content/replacement is normalized to CRLF before writing
-    -- see ``tools/file_operations.py``'s ``write_file()`` (``original_ending``
-    from ``_probe_write_target()``) and ``patch_replace()`` (``file_ending
-    = _detect_line_ending(content)``). Without this, the preview's diff
-    compares the model's bare-LF ``new_text`` against CRLF ``old_text`` and
-    shows every unchanged line as modified (or a mixed-ending result),
-    misrepresenting a write that will not actually touch those bytes.
+    1. WHICH bytes decide the ending. ``write_file`` (``use_byte_window =
+       not ShellFileOperations._write_wants_pre_content(ext, file_ops)``):
+       ``write_file_tool`` calls ``write_file()`` with NO ``pre_content``,
+       so whether ``_probe_write_target()`` detects the ending from a live
+       ``head -c 4096`` probe (a BYTE window over the ON-DISK file,
+       ``use_byte_window=True``) or from FULL pre-content
+       (``use_byte_window=False``) depends on the target's extension --
+       true (full, character-based) for any extension covered by
+       in-process linting or a registered LSP server (pre-content also
+       feeds diagnostics/the line-shift map for those), false
+       (byte-capped) otherwise. ``patch_replace`` (``is_write_file=False``)
+       ALWAYS uses the full, character-based text regardless of extension:
+       it already has the FULL file content in hand (its own ``_cat()``,
+       for the fuzzy match) and passes that SAME content to ``write_file()``
+       as ``pre_content``, so ``_probe_write_target()`` unconditionally
+       takes its ``pre_content`` branch. Byte-capping a patch_replace
+       preview would disagree with its real, always-character-based
+       decision.
 
-    ``_detect_line_ending`` is the exact same pure helper
-    ``_probe_write_target()`` uses on its own pre-content/sample, so this
-    reproduces the real write's decision without a second shell round-trip
-    (the preview already has ``old_text`` from ``_read_text_if_exists``).
+    2. The BOM offset. Only meaningful for ``write_file``'s two branches,
+       and DIFFERENTLY for each:
+       - byte window: the real ``head -c 4096`` probe reads the RAW
+         on-disk bytes, BOM included; ``old_text`` (from ``read_file_raw()``,
+         which always BOM-strips) lacks those 3 bytes, so the cap shrinks
+         to 4093 bytes to cover the identical on-disk byte range.
+       - character window (``want_pre=True``): the real probe's ``cat``
+         body is ALSO not BOM-stripped (unlike ``read_file_raw()``), so its
+         character window covers one FEWER actual-content character than
+         a same-length slice of our (BOM-less) ``old_text`` would; the cap
+         shrinks to 4095 characters to compensate.
+       ``patch_replace`` needs NEITHER adjustment: its own real line-ending
+       source (``content = _strip_bom(raw_content)`` before ``_detect_line_
+       ending(content)``) is ALREADY BOM-stripped, exactly matching
+       ``old_text`` as-is.
+
+    3. WHICH detected endings trigger normalization. ``write_file()``'s
+       real write (``if original_ending == "\\r\\n": content =
+       _normalize_line_endings(content, "\\r\\n")``) normalizes ONLY the
+       CRLF case -- an LF-terminated (or single-line) file leaves the
+       model's incoming content untouched even if it contains CRLF/lone-CR
+       characters, which a blanket ``_normalize_line_endings(new_text,
+       "\\n")`` would incorrectly force to bare LF in the preview.
+       ``patch_replace()`` (``file_ending = _detect_line_ending(content);
+       if file_ending: new_content = _normalize_line_endings(new_content,
+       file_ending)``) normalizes for BOTH detected endings unconditionally.
+
     V4A's real apply path (``tools/patch_parser.py``) does no such
-    normalization at all, so its preview (which also skips this) already
-    matches.
-
-    ``use_byte_window`` selects WHICH of the two different real-write code
-    paths this proposal kind must match -- they are NOT the same:
-
-    * ``write_file`` (``use_byte_window = not ShellFileOperations.
-      _write_wants_pre_content(ext, file_ops)``): ``write_file_tool`` calls
-      ``ShellFileOperations.write_file()`` with NO ``pre_content``, so
-      whether ``_probe_write_target()`` detects the line ending from a
-      live ``head -c 4096`` probe (a BYTE window over the ON-DISK file) or
-      from FULL pre-content depends on the target's extension --
-      ``want_pre`` is true (full, character-based) for any extension
-      covered by in-process linting or a registered LSP server (pre-content
-      also feeds diagnostics/the line-shift map for those), false
-      (byte-capped) otherwise. Only in that false case is ``old_text`` run
-      through ``_byte_capped_sample`` before ``_detect_line_ending`` sees
-      it: that helper's own ``sample[:4096]`` is a CHARACTER slice, and for
-      an existing file with enough multibyte characters ahead of its first
-      newline (e.g. ~3000 emoji before a CRLF) that the newline falls after
-      byte 4096 but before character 4096, feeding it the full ``old_text``
-      directly would see a newline the real byte-based probe does not.
-
-    * ``patch_replace`` (``use_byte_window=False``, unconditionally):
-      ``patch_replace()`` already has the FULL file content in hand (its
-      own ``_cat()``, for the fuzzy match) and calls ``write_file()`` WITH
-      that content as ``pre_content`` -- so ``_probe_write_target()`` takes
-      its ``pre_content`` branch regardless of extension, detecting the
-      line ending via ``_detect_line_ending(pre_content)`` on the FULL
-      (CHARACTER-sliced) text, never the byte-based probe. Byte-capping
-      here would instead make the preview disagree with patch_replace's
-      real (character-based, full-text) decision for the exact same
-      multibyte-heavy fixture a non-lint/LSP write_file case is byte-capped
-      to match.
-
-    ``had_bom`` (only meaningful when ``use_byte_window`` is true): whether
-    ``read_file_raw()`` stripped a leading UTF-8 BOM from ``old_text``. The
-    real ``head -c 4096`` probe reads the RAW on-disk bytes, BOM included;
-    ``old_text`` no longer has those 3 bytes, so byte-capping it to the
-    full 4096 would cover 3 bytes MORE of actual content than the real
-    probe's window does. For a file where the first newline sits close
-    enough to the boundary that those 3 bytes matter, this shrinks the cap
-    to 4093 bytes so both windows cover the identical on-disk range.
+    normalization at all, so its preview (which never calls this function)
+    already matches.
     """
     if old_text is None:
         return new_text
     from tools.file_operations_common import _byte_capped_sample, _detect_line_ending, _normalize_line_endings
 
-    if use_byte_window:
-        limit = 4096 - (3 if had_bom else 0)
-        sample = _byte_capped_sample(old_text, limit)
-    else:
-        sample = old_text
-    file_ending = _detect_line_ending(sample)
+    if is_write_file:
+        if use_byte_window:
+            limit = 4096 - (3 if had_bom else 0)
+            sample = _byte_capped_sample(old_text, limit)
+        else:
+            sample = old_text[: 4096 - 1] if had_bom else old_text
+        file_ending = _detect_line_ending(sample)
+        # write_file()'s real write ONLY normalizes the CRLF case.
+        return _normalize_line_endings(new_text, file_ending) if file_ending == "\r\n" else new_text
+
+    # patch_replace: always the full, already-BOM-stripped old_text, no
+    # window/BOM nuance -- and normalizes for EITHER detected ending.
+    file_ending = _detect_line_ending(old_text)
     return _normalize_line_endings(new_text, file_ending) if file_ending else new_text
 
 
@@ -359,7 +359,7 @@ def _proposal_for_write_file(arguments: dict[str, Any], task_id: str = "default"
     ext = os.path.splitext(path)[1].lower()
     wants_pre = ShellFileOperations._write_wants_pre_content(ext, _get_file_ops(task_id))
     new_text = _normalize_new_text_for_preview(
-        old_text, str(content), use_byte_window=not wants_pre, had_bom=had_bom)
+        old_text, str(content), is_write_file=True, use_byte_window=not wants_pre, had_bom=had_bom)
     return EditProposal(
         "write_file", path, old_text, new_text, dict(arguments),
         resolved_target_paths=(resolved,),
@@ -393,11 +393,10 @@ def _proposal_for_patch_replace(arguments: dict[str, Any], task_id: str = "defau
     # replace (file_ending = _detect_line_ending(content); new_content =
     # _normalize_line_endings(new_content, file_ending)) -- old_text here IS
     # that same content (BOM-stripped, fence-leak-unstripped cat output).
-    # use_byte_window=False: patch_replace()'s real write passes this SAME
-    # full content through to write_file() as pre_content, so its probe
-    # takes the character-based (not byte-capped) branch -- see
-    # _normalize_new_text_for_preview's docstring.
-    new_text = _normalize_new_text_for_preview(old_text, new_text, use_byte_window=False)
+    # is_write_file=False: patch_replace() has its own real normalization
+    # rule (always full-text, BOM-agnostic, both endings trigger it) --
+    # see _normalize_new_text_for_preview's docstring.
+    new_text = _normalize_new_text_for_preview(old_text, new_text, is_write_file=False)
     resolved = _resolve_edit_path(path, task_id)
     return EditProposal("patch", path, old_text, new_text, dict(arguments), resolved_target_paths=(resolved,))
 
@@ -822,7 +821,61 @@ def maybe_require_edit_approval(
     except Exception as exc:
         logger.warning("ACP edit approval requester failed: %s", exc)
         approved = False
-    return None if approved else _denied("Edit approval denied by ACP client; file was not modified.")
+    if not approved:
+        return _denied("Edit approval denied by ACP client; file was not modified.")
+    _freeze_non_host_v4a_targets(tool_name, arguments, proposal, task_id or "default")
+    return None
+
+
+def _freeze_non_host_v4a_targets(
+    tool_name: str, arguments: dict[str, Any], proposal: EditProposal, task_id: str,
+) -> None:
+    """Rewrite an approved non-host V4A patch's headers, IN PLACE on
+    ``arguments`` (the same dict object model_tools.py's dispatch goes on to
+    execute), to the exact backend-canonical paths approval was granted for.
+
+    Without this, a non-host (SSH/container/sandbox) V4A header stays
+    relative: ``tools.file_tools._rewrite_v4a_patch_paths_for_host`` only
+    rewrites headers for a HOST-paths backend, so a non-host one reaches
+    ``ShellFileOperations._exec()`` unresolved and gets interpreted against
+    the backend's *live* ``env.cwd`` only at execution time -- normally a
+    negligible gap, but when two ACP sessions share a persistent Docker
+    environment, the OTHER session can run ``cd`` in the moments between
+    this approval and this call's actual dispatch, so a patch approved for
+    ``/workspace/x`` could silently modify a completely different path once
+    the (now-changed) shared cwd is applied. Freezing the header to the
+    SAME absolute, backend-canonical path ``tools.file_tools
+    ._resolve_v4a_policy_target`` already computed for the approval check
+    (via ``proposal.resolved_target_paths``) removes that live-cwd
+    dependency entirely: whatever was approved is now the literal target,
+    regardless of what any other session does afterward.
+
+    A no-op for anything other than a V4A patch, a host-paths backend
+    (already frozen at dispatch time in ``tools/file_tools.py``), or a
+    proposal with an unresolvable (``None``) target -- there is nothing
+    safe to freeze it to, so the header is left for the backend's own live
+    resolution, matching this module's existing "cannot verify" handling.
+    """
+    if tool_name != "patch" or arguments.get("mode") != "patch":
+        return
+    target_paths = proposal.target_paths
+    resolved_paths = proposal.resolved_target_paths
+    if not target_paths or not resolved_paths or len(target_paths) != len(resolved_paths):
+        return
+    if any(r is None for r in resolved_paths):
+        return
+    patch_body = arguments.get("patch")
+    if not isinstance(patch_body, str):
+        return
+    try:
+        from tools.file_tools import _apply_v4a_header_rewrite, _file_ops_uses_host_paths, _get_file_ops
+
+        file_ops = _get_file_ops(task_id)
+        if _file_ops_uses_host_paths(file_ops):
+            return
+        arguments["patch"] = _apply_v4a_header_rewrite(patch_body, dict(zip(target_paths, resolved_paths)))
+    except Exception:
+        logger.debug("Failed to freeze non-host V4A patch headers after approval", exc_info=True)
 
 
 def build_acp_edit_tool_call(proposal: EditProposal):
