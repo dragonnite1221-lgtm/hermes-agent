@@ -19,9 +19,34 @@ import time
 import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    # Only for the queued_prompts type below -- keep this module importable
+    # without the optional `agent-client-protocol` extra installed.
+    from acp.schema import (
+        AudioContentBlock,
+        EmbeddedResourceContentBlock,
+        ImageContentBlock,
+        ResourceContentBlock,
+        TextContentBlock,
+    )
 
 logger = logging.getLogger(__name__)
+
+
+class SessionHistoryUnavailable(RuntimeError):
+    """Raised when a session row exists but its message history could not be
+    loaded (DB error, timeout, corruption, ...).
+
+    This is distinct from "no such session" (``None``): the session is real
+    and its metadata restored fine, but the transcript itself is currently
+    unreadable. Callers must not treat this the same as a genuinely empty
+    conversation — doing so silently discards context and reports a failed
+    restore as a success (see acp_adapter/server.py's ``load_session`` /
+    ``resume_session``, which turn this into an explicit protocol error
+    instead of resuming with amnesia).
+    """
 
 
 def _translate_acp_cwd(cwd: str) -> str:
@@ -139,7 +164,24 @@ class SessionState:
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
-    queued_prompts: List[str] = field(default_factory=list)
+    # Each entry is either a plain ``str`` (queued via /steer or /queue,
+    # which are always text-only) or the full list of ACP content blocks
+    # from a rich prompt that arrived while a turn was already running.
+    # The list form must be preserved as-is -- collapsing it down to a text
+    # summary at queue time would silently drop any image/audio/resource
+    # attachments before the queued turn ever runs. Kept as an explicit
+    # union (rather than widened to ``Any``) so a static type checker can
+    # still catch a producer/consumer drifting from this contract.
+    queued_prompts: List[
+        str
+        | list[
+            TextContentBlock
+            | ImageContentBlock
+            | AudioContentBlock
+            | ResourceContentBlock
+            | EmbeddedResourceContentBlock
+        ]
+    ] = field(default_factory=list)
     runtime_lock: Any = field(default_factory=threading.Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
@@ -274,13 +316,30 @@ class SessionManager:
         ``DEFAULT_DB_PATH``, so test fixtures that change the env var later are honoured. The
         registry handle is the one in-process tools (delegation, session_search, goals) also
         acquire, so the ACP server holds ONE writer on state.db instead of two (#100896)."""
-        if self._db_instance is None:
-            try:
-                from hermes_state_registry import acquire
-                self._db_instance = acquire(get_hermes_home() / "state.db")
-            except Exception:
-                logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
-        return self._db_instance
+        db, _ = self._acquire_db()
+        return db
+
+    def _acquire_db(self):
+        """Return ``(db_or_none, error_or_none)`` for THIS call's own attempt, atomically.
+
+        Unlike stashing the failure on ``self`` and reading it back separately after
+        ``_get_db()`` returns, the pair is a single local result: a concurrent call on
+        another thread can still race the underlying ``self._db_instance`` write, but it
+        cannot make THIS call observe a stale/foreign error or silently lose its own.
+        ``_restore()`` needs that guarantee to tell "acquisition just failed" apart from
+        "no DB was ever configured" without misattributing one thread's outcome to
+        another's concurrent attempt.
+        """
+        if self._db_instance is not None:
+            return self._db_instance, None
+        try:
+            from hermes_state_registry import acquire
+            db = acquire(get_hermes_home() / "state.db")
+        except Exception as exc:
+            logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
+            return None, exc
+        self._db_instance = db
+        return db, None
 
     def _persist(self, state: SessionState) -> None:
         """Create/update the session record, then sync the live message set."""
@@ -335,14 +394,28 @@ class SessionManager:
 
     def _restore(self, session_id: str) -> Optional[SessionState]:
         """Load an ACP session from the database into memory, recreating the AIAgent."""
-        db = self._get_db()
+        db, acquire_error = self._acquire_db()
         if db is None:
+            if acquire_error is not None:
+                # The DB is not simply "not configured" -- THIS call's own
+                # acquire() attempt raised (corruption, permissions, a busy
+                # registry, ...). A session that genuinely exists could be
+                # unreachable right now; that must not look identical to
+                # "no such session" the way a bare None return would.
+                raise SessionHistoryUnavailable(session_id) from acquire_error
             return None
         try:
             row = db.get_session(session_id)
-        except Exception:
-            logger.debug("Failed to query DB for ACP session %s", session_id, exc_info=True)
-            return None
+        except Exception as exc:
+            # Same failure class as the history-fetch below: a DB
+            # error/timeout here is NOT "session not found" and must not be
+            # treated as one -- that would let resume_session() silently
+            # create a fresh empty session (masking the outage) and
+            # load_session() report a plain "not found" for a session that
+            # actually exists. Only a row that genuinely comes back None
+            # below means "not found".
+            logger.warning("Failed to query DB for ACP session %s", session_id, exc_info=True)
+            raise SessionHistoryUnavailable(session_id) from exc
         if row is None or row.get("source") != "acp":
             return None
 
@@ -353,9 +426,15 @@ class SessionManager:
         # ``user;user`` violation in state.db would otherwise re-fire the pre-request repair every request.
         try:
             history = db.get_messages_as_conversation(session_id, repair_alternation=True)
-        except Exception:
+        except Exception as exc:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
-            history = []
+            # Do NOT fall back to history=[] here: that would make a history
+            # query failure indistinguishable from a genuinely empty
+            # conversation, so the caller (load_session/resume_session)
+            # would report the restore as successful while having silently
+            # thrown away the real transcript. Raise instead so the failure
+            # is explicit all the way up.
+            raise SessionHistoryUnavailable(session_id) from exc
 
         try:
             agent = self._make_agent(

@@ -26,7 +26,12 @@ from acp.schema import (
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
 from acp_adapter.commands import HERMES_VERSION, SlashCommandsMixin, _estimate_tokens
-from acp_adapter.content import PromptBlock, _content_blocks_to_openai_user_content, _extract_text
+from acp_adapter.content import (
+    PromptBlock,
+    _content_blocks_to_openai_user_content,
+    _extract_text,
+    snapshot_resource_link_now,
+)
 from acp_adapter.events import (
     AssistantMessageIdAllocator, _build_plan_update_from_todo_result, make_message_cb, make_step_cb,
     make_thinking_cb, make_tool_progress_cb,
@@ -34,7 +39,12 @@ from acp_adapter.events import (
 from acp_adapter.model_catalog import build_model_state, encode_model_choice
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
-from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
+from acp_adapter.session import (
+    SessionHistoryUnavailable,
+    SessionManager,
+    SessionState,
+    _expand_acp_enabled_toolsets,
+)
 from acp_adapter.tools import build_tool_complete, build_tool_start, coerce_tool_args
 from agent.context_compressor import (COMPRESSED_SUMMARY_METADATA_KEY, ContextCompressor)
 from agent.interrupt_compat import request_hard_interrupt
@@ -593,7 +603,18 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     async def load_session(
         self, cwd: str, session_id: str, mcp_servers: list | None = None, **kwargs: Any
     ) -> LoadSessionResponse | None:
-        state = self.session_manager.update_cwd(session_id, cwd)
+        try:
+            state = self.session_manager.update_cwd(session_id, cwd)
+        except SessionHistoryUnavailable:
+            # The session exists but its transcript could not be loaded
+            # (DB error/timeout) -- this is NOT "session not found" and must
+            # not be reported as a successful load with an empty history.
+            logger.warning(
+                "load_session: history unavailable for session %s", session_id, exc_info=True
+            )
+            raise acp.RequestError.internal_error(
+                {"session_id": session_id, "reason": "session history unavailable"}
+            )
         if state is None:
             logger.warning("load_session: session %s not found", session_id)
             return None
@@ -603,7 +624,19 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     async def resume_session(
         self, cwd: str, session_id: str, mcp_servers: list | None = None, **kwargs: Any
     ) -> ResumeSessionResponse:
-        state = self.session_manager.update_cwd(session_id, cwd)
+        try:
+            state = self.session_manager.update_cwd(session_id, cwd)
+        except SessionHistoryUnavailable:
+            # Do NOT silently fall through to "not found, creating new": that
+            # would discard a real, existing conversation and report the
+            # resume as successful with a fresh empty session instead of
+            # surfacing the actual history-load failure to the client.
+            logger.warning(
+                "resume_session: history unavailable for session %s", session_id, exc_info=True
+            )
+            raise acp.RequestError.internal_error(
+                {"session_id": session_id, "reason": "session history unavailable"}
+            )
         if state is None:
             logger.warning("resume_session: session %s not found, creating new", session_id)
             state = self.session_manager.create_session(cwd=cwd)
@@ -694,7 +727,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         return user_text, user_content
 
     def _claim_turn_or_queue(
-        self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool
+        self,
+        state: SessionState,
+        session_id: str,
+        user_text: str,
+        user_content: Any,
+        text_only: bool,
+        prompt: list[PromptBlock],
     ) -> str | None:
         """Mark the session running; if a turn is active, redirect it (text-only, supported
         runtime) or queue it. Returns the client message when absorbed, else None."""
@@ -711,7 +750,31 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         return "Redirected the active turn with your correction."
                 except Exception:
                     logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
-            state.queued_prompts.append(user_text or "[Image attachment]")
+            if text_only and isinstance(user_content, str):
+                # Text-only: queue user_text/user_content, NOT the raw
+                # prompt blocks. _rewrite_prompt_for_interrupt() may have
+                # already replaced them with a combined "cancelled
+                # request + new correction" string before this call --
+                # queuing the untouched raw prompt instead would silently
+                # drop that attached correction, reverting to just the
+                # bare new text once the queued turn replays.
+                state.queued_prompts.append(user_text or "[Image attachment]")
+            else:
+                # Rich media: _rewrite_prompt_for_interrupt() never
+                # rewrites these (it only handles text_only + str
+                # user_content), so the raw prompt list is exactly
+                # equivalent here and preserving it in full is safe. Queue
+                # the full content-block list, not just its text -- a
+                # text-only summary here would silently drop any
+                # image/audio/resource attachments before the queued turn
+                # is ever replayed (see the drain loop in prompt()). A
+                # resource_link block only carries a URI, so it's
+                # snapshotted into a self-contained embedded resource NOW
+                # -- otherwise the replay would re-read the file whenever
+                # the queued turn actually runs, possibly against a
+                # since-modified, moved, or deleted file instead of what
+                # the user actually attached.
+                state.queued_prompts.append([snapshot_resource_link_now(block) for block in prompt])
             return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
 
     def _run_agent_turn(
@@ -788,7 +851,20 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
-        if not user_text and not (isinstance(user_content, list) and user_content):
+        # A text-only prompt's user_content is never more than a join of the very same
+        # TextContentBlocks _extract_text reads (see
+        # _content_blocks_to_openai_user_content's "all parts are text -> join text_parts"
+        # branch), so gate it on user_text alone: a whitespace-only block ("   ") makes
+        # user_content a truthy-but-blank string ("not user_content" is False for
+        # whitespace), which would otherwise let a blank turn through to run_conversation and
+        # get persisted as "[Image attachment]".
+        # A prompt containing any non-text block (image/audio/resource) may legitimately
+        # produce meaningful user_content while user_text stays empty -- e.g. the audio-only
+        # placeholder, real content with no source TextContentBlock -- and must still pass.
+        if text_only_prompt:
+            if not user_text:
+                return PromptResponse(stop_reason="end_turn")
+        elif not user_text and not user_content:
             return PromptResponse(stop_reason="end_turn")
 
         user_text, user_content = self._rewrite_prompt_for_interrupt(state, user_text, user_content, text_only_prompt)
@@ -804,7 +880,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     await self._send_usage_update(state)
                 return PromptResponse(stop_reason="end_turn")
 
-        absorbed = self._claim_turn_or_queue(state, session_id, user_text, user_content, text_only_prompt)
+        absorbed = self._claim_turn_or_queue(
+            state, session_id, user_text, user_content, text_only_prompt, prompt
+        )
         if absorbed is not None:
             if self._conn:
                 await self._conn.session_update(session_id, acp.update_agent_message_text(absorbed))
@@ -951,11 +1029,27 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 if not state.queued_prompts:
                     break
                 next_prompt = state.queued_prompts.pop(0)
+            # A queued item is either plain text (/steer, /queue) or the
+            # full original content-block list (a rich prompt queued while
+            # a turn was running) -- rebuild the exact prompt to replay in
+            # either case so attachments queued alongside text survive.
+            # Explicitly typed as list[PromptBlock] (not left to inference):
+            # the two branches would otherwise infer list[TextContentBlock]
+            # and list[PromptBlock] respectively, and a bare `list[X] |
+            # list[PromptBlock]` union is not assignable to prompt()'s
+            # list[PromptBlock] parameter -- mutable lists are invariant.
+            next_content_blocks: list[PromptBlock]
+            if isinstance(next_prompt, str):
+                next_content_blocks = [TextContentBlock(type="text", text=next_prompt)]
+                display_text = next_prompt
+            else:
+                next_content_blocks = next_prompt
+                display_text = _extract_text(next_prompt).strip() or "[Image attachment]"
             try:
                 if conn:
                     await conn.session_update(
                         session_id,
-                        acp.update_user_message_text(next_prompt),
+                        acp.update_user_message_text(display_text),
                     )
             except Exception:
                 # Only the "now running" notification is guarded here.
@@ -996,7 +1090,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             # here would replay an already-executed turn -- including any
             # side-effecting tool calls -- a second time.
             await self.prompt(
-                prompt=[TextContentBlock(type="text", text=next_prompt)],
+                prompt=next_content_blocks,
                 session_id=session_id,
             )
 
