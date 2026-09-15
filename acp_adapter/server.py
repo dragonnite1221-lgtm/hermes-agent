@@ -968,15 +968,24 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 # continuing to drain against a connection that keeps
                 # failing.
                 #
-                # NOTE: once reinserted, nothing proactively retries this
-                # item -- the queue only drains at the tail of some future
-                # prompt() call. If no further prompt ever arrives on this
-                # session, it stays queued indefinitely. That's an accepted
-                # limitation of this reactive-only drain design (the same
-                # is true of any item sitting in queued_prompts generally);
-                # a newer prompt claiming a fresh turn ahead of it would
-                # still flush it via that turn's own drain loop, just out
-                # of strict FIFO order.
+                # NOTE (known, deliberately-not-fixed gap): once reinserted,
+                # nothing proactively retries this item -- the queue only
+                # drains via the recursive self.prompt() calls already in
+                # this loop, which only happen from WITHIN an active turn.
+                # If no further prompt ever arrives on this session, it
+                # stays queued indefinitely; if one does, _claim_turn_or_
+                # queue() has no way to tell "a genuinely new external
+                # prompt" apart from "the internal recursive call this very
+                # loop would make to run the next backlog item", so it
+                # can't safely special-case "is_running is False but there
+                # is a backlog" without either re-queuing the recursive
+                # call that's supposed to be running right now (breaking
+                # draining entirely) or needing a new signal threaded
+                # through self.prompt() to distinguish the two callers.
+                # That's a real architecture change (or a background
+                # scheduler), not a contained fix -- left as a known
+                # limitation rather than risking a half-verified rework of
+                # the queue/turn-claim contract under this PR's scope.
                 with state.runtime_lock:
                     state.queued_prompts.insert(0, next_prompt)
                 raise
