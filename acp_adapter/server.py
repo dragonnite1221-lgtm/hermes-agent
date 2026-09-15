@@ -957,22 +957,39 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         session_id,
                         acp.update_user_message_text(next_prompt),
                     )
-                await self.prompt(
-                    prompt=[TextContentBlock(type="text", text=next_prompt)],
-                    session_id=session_id,
-                )
             except Exception:
-                # The connection that failed to deliver the ORIGINAL final
-                # response above may still be down, or self.prompt() itself
-                # may have failed before it could take ownership of this
-                # item. Either way, the item was already popped -- put it
-                # back at the front of the queue so a persistent failure
-                # here can't silently drop a user's queued prompt, then
-                # surface the failure instead of continuing to drain
-                # against a connection that keeps failing.
+                # Only the "now running" notification is guarded here.
+                # self.prompt() has not been called yet, so this item has
+                # done no work and no side effects -- it's safe to put back
+                # at the front of the queue (the connection that failed to
+                # deliver the ORIGINAL final response above may still be
+                # down) so a persistent failure here can't silently drop a
+                # user's queued prompt, then surface the failure instead of
+                # continuing to drain against a connection that keeps
+                # failing.
+                #
+                # NOTE: once reinserted, nothing proactively retries this
+                # item -- the queue only drains at the tail of some future
+                # prompt() call. If no further prompt ever arrives on this
+                # session, it stays queued indefinitely. That's an accepted
+                # limitation of this reactive-only drain design (the same
+                # is true of any item sitting in queued_prompts generally);
+                # a newer prompt claiming a fresh turn ahead of it would
+                # still flush it via that turn's own drain loop, just out
+                # of strict FIFO order.
                 with state.runtime_lock:
                     state.queued_prompts.insert(0, next_prompt)
                 raise
+            # self.prompt() takes full ownership of this item from here:
+            # whatever happens inside it (including its OWN internal
+            # final-response delivery failing after it already ran the
+            # turn and persisted history) must propagate as-is. Requeuing
+            # here would replay an already-executed turn -- including any
+            # side-effecting tool calls -- a second time.
+            await self.prompt(
+                prompt=[TextContentBlock(type="text", text=next_prompt)],
+                session_id=session_id,
+            )
 
         if delivery_error is not None:
             # Now that the session is idle again and any queued follow-ups

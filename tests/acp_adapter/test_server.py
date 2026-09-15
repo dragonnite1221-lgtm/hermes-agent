@@ -593,6 +593,61 @@ class TestPrompt:
         # The queued item must still be there for a later retry, not lost.
         assert state.queued_prompts == ["follow-up while busy"]
 
+    @pytest.mark.asyncio
+    async def test_queued_prompt_is_not_replayed_after_it_already_ran(
+        self, agent, mock_manager
+    ):
+        """A queued item must NOT be requeued once self.prompt() has taken
+        ownership of it, even if that nested call later fails.
+
+        The drain loop's "now running" notification and the nested
+        self.prompt() call used to share one except clause, so a failure
+        inside the NESTED turn's own final-response delivery -- which
+        happens only after that turn already ran (tools included) and
+        persisted its history -- would put the same item back on the
+        queue. Draining it again would re-execute an already-completed
+        turn, including any side-effecting tool calls, a second time.
+        """
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+
+        run_calls = []
+
+        def _run(*args, **kwargs):
+            run_calls.append(1)
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        # Sequence: [1] original turn's final response (ok), [2] "now
+        # running" notification for the queued item (ok), [3] the NESTED
+        # turn's own final-response delivery (fails).
+        call_count = {"n": 0}
+
+        async def flaky_session_update(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 3:
+                raise RuntimeError("nested delivery failed")
+            return None
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(side_effect=flaky_session_update)
+        agent._conn = mock_conn
+
+        state.queued_prompts.append("follow-up while busy")
+
+        with pytest.raises(RuntimeError):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hi")],
+                session_id=resp.session_id,
+            )
+
+        # The nested turn actually ran -- must not be replayed.
+        assert state.queued_prompts == []
+        assert len(run_calls) == 2
+
 
 
 
