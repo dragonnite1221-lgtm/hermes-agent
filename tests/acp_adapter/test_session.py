@@ -340,19 +340,23 @@ class TestPersistence:
         }]
 
 
-    def test_restore_raises_on_history_query_failure_instead_of_faking_empty(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize("failing_db_method", ["get_session", "get_messages_as_conversation"])
+    def test_restore_raises_on_db_failure_instead_of_faking_empty_or_missing(
+        self, tmp_path, monkeypatch, failing_db_method
     ):
-        """A history-fetch exception must not be swallowed into a "the
-        conversation was just empty" success.
+        """A DB exception -- whether fetching the session row itself or its
+        message history -- must not be swallowed into "not found" or "the
+        conversation was just empty".
 
-        Before the fix, ``_restore`` caught any exception from
-        ``db.get_messages_as_conversation`` and continued on with
-        ``history = []`` as if that were a legitimately empty conversation,
-        so ``get_session`` returned an apparently-successful ``SessionState``
-        that had silently lost the persisted transcript. Callers like
-        ``resume_session``/``load_session`` then reported the resume/load as
-        successful even though the real history was never retrieved.
+        Before the fix, ``_restore`` caught any exception from either
+        ``db.get_session`` or ``db.get_messages_as_conversation`` and
+        treated it the same as "row not found" / "empty history", so
+        ``get_session`` returned either ``None`` or an apparently-
+        successful ``SessionState`` with the persisted transcript silently
+        lost. Callers like ``resume_session``/``load_session`` then
+        reported the resume/load as successful (or "not found, creating
+        new") even though the real DB call never actually resolved either
+        way.
         """
         db = SessionDB(tmp_path / "state.db")
         manager = SessionManager(agent_factory=_mock_agent, db=db)
@@ -367,7 +371,7 @@ class TestPersistence:
         def _boom(*args, **kwargs):
             raise RuntimeError("db timeout")
 
-        monkeypatch.setattr(db, "get_messages_as_conversation", _boom)
+        monkeypatch.setattr(db, failing_db_method, _boom)
 
         with pytest.raises(acp_session.SessionHistoryUnavailable):
             manager.get_session(state.session_id)

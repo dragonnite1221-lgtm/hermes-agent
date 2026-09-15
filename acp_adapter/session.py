@@ -354,9 +354,16 @@ class SessionManager:
             return None
         try:
             row = db.get_session(session_id)
-        except Exception:
-            logger.debug("Failed to query DB for ACP session %s", session_id, exc_info=True)
-            return None
+        except Exception as exc:
+            # Same failure class as the history-fetch below: a DB
+            # error/timeout here is NOT "session not found" and must not be
+            # treated as one -- that would let resume_session() silently
+            # create a fresh empty session (masking the outage) and
+            # load_session() report a plain "not found" for a session that
+            # actually exists. Only a row that genuinely comes back None
+            # below means "not found".
+            logger.warning("Failed to query DB for ACP session %s", session_id, exc_info=True)
+            raise SessionHistoryUnavailable(session_id) from exc
         if row is None or row.get("source") != "acp":
             return None
 
