@@ -1,7 +1,9 @@
 """Tests for acp_adapter.server — HermesACPAgent ACP server."""
 
 import asyncio
+import json
 import os
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -444,6 +446,73 @@ class TestPrompt:
             or (isinstance(block, dict) and block.get("data") == "aGVsbG8=")
             for block in blocks
         )
+
+    @pytest.mark.asyncio
+    async def test_queued_image_prompt_replay_actually_delivers_attachment(self, agent):
+        """End-to-end: the queued image prompt must reach ``run_conversation``
+        with its attachment intact when the drain loop replays it, not just
+        sit unmodified in ``state.queued_prompts``.
+
+        A test that only inspects the queue would stay green even if the
+        drain loop's replay path silently converted the content back to
+        text before calling ``run_conversation`` again. Drive a real first
+        turn, queue the image prompt while it is genuinely in flight, let
+        the first turn finish, and assert the SECOND ``run_conversation``
+        call actually received the image data.
+        """
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        calls: list[dict] = []
+        first_call_started = threading.Event()
+        release_first_call = threading.Event()
+
+        def _run(*args, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                first_call_started.set()
+                assert release_first_call.wait(timeout=5), "test deadlocked"
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        first_task = asyncio.create_task(
+            agent.prompt(
+                prompt=[TextContentBlock(type="text", text="first turn")],
+                session_id=new_resp.session_id,
+            )
+        )
+        await asyncio.get_event_loop().run_in_executor(None, first_call_started.wait, 5)
+        assert state.is_running is True  # the first turn is genuinely in flight
+
+        image_block = ImageContentBlock(type="image", data="aGVsbG8=", mimeType="image/png")
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="look at this"), image_block],
+            session_id=new_resp.session_id,
+        )
+        assert isinstance(resp, PromptResponse)
+        assert len(state.queued_prompts) == 1
+
+        release_first_call.set()
+        await first_task
+        # The drain loop's recursive self.prompt(...) call runs on the same
+        # event loop but still dispatches through run_in_executor; give it a
+        # turn to complete.
+        for _ in range(50):
+            if len(calls) >= 2:
+                break
+            await asyncio.sleep(0.05)
+
+        assert len(calls) == 2
+        # Whatever shape run_conversation's user_message takes (OpenAI-style
+        # multimodal content), the base64 image payload must survive into it.
+        assert "aGVsbG8=" in json.dumps(calls[1].get("user_message"), default=str)
 
     @pytest.mark.asyncio
     async def test_prompt_binds_session_id_into_subprocess_env(self, agent, mock_manager):
