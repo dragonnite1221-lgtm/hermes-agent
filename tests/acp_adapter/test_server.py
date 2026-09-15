@@ -922,11 +922,19 @@ class TestPrompt:
 
             # Turn 2: the run itself rotates the internal head, so _finish_turn's first
             # action is the provenance send, hitting the now-dead connection's
-            # hang-not-raise behavior.
+            # hang-not-raise behavior. Bounded by an outer timeout independent of
+            # _SESSION_UPDATE_TIMEOUT_SECONDS: if _send()'s own bound regresses, this
+            # call would otherwise hang for real, stalling the whole test file until
+            # the runner's file-level timeout (and its automatic retry) instead of
+            # failing promptly -- the outer wait_for turns that into a fast, clear
+            # failure while still letting the is_running assertion run right after.
             state.agent.run_conversation = _run_with_rotation
             with pytest.raises(Exception):
-                await agent.prompt(
-                    prompt=[TextContentBlock(type="text", text="again")], session_id=resp.session_id
+                await asyncio.wait_for(
+                    agent.prompt(
+                        prompt=[TextContentBlock(type="text", text="again")], session_id=resp.session_id
+                    ),
+                    timeout=5,
                 )
             assert state.is_running is False
         finally:
