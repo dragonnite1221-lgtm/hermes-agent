@@ -1218,3 +1218,46 @@ def test_write_file_preview_line_ending_uses_the_same_byte_window_as_the_real_wr
     # Must NOT be normalized to CRLF: the real write's byte-capped probe
     # never observes a line ending in the first 4096 bytes of this file.
     assert proposal.new_text == "plain new content\n"
+
+
+def test_patch_replace_preview_line_ending_uses_the_full_character_window_not_the_byte_one(monkeypatch):
+    """Unlike ``write_file``, ``patch_replace()``'s real write must NOT be
+    matched by a byte-capped line-ending sample -- it already has the FULL
+    file content in hand (its own ``_cat()``, for the fuzzy match) and
+    passes that same content through to ``write_file()`` as ``pre_content``,
+    so ``_probe_write_target()`` takes its ``pre_content`` branch and
+    detects the line ending via ``_detect_line_ending(pre_content)`` on the
+    FULL (character-sliced) text -- the live byte-based ``head -c 4096``
+    probe never runs at all in that case.
+
+    Using the SAME ~3000-emoji-then-CRLF fixture as the write_file byte-
+    window test above (deliberately chosen so the two proposal kinds must
+    disagree): for patch_replace, the character-based full-text detection
+    DOES see the CRLF (unlike write_file's byte-capped one), so the
+    preview's normalized replacement must be CRLF, not the model's bare LF.
+    """
+    from tools.file_operations import ReadResult
+
+    # Same divergence fixture as the write_file byte-window test: byte
+    # offset 4096 falls well before the emoji run ends, but character
+    # offset 4096 falls past the whole (~3010-character) string.
+    emoji_old_text = "\U0001F600" * 3000 + "\r\nafter\r\n"
+
+    class FakeEmojiBackend:
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content=emoji_old_text)
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeEmojiBackend()
+    )
+
+    proposal = build_edit_proposal(
+        "patch",
+        {"mode": "replace", "path": "emoji.txt", "old_string": "after", "new_string": "AFTER"},
+        task_id="some-task",
+    )
+
+    # patch_replace's real write DOES see the CRLF (full-text, character-
+    # based detection) -- the preview must normalize to match it, the
+    # opposite of the write_file case above.
+    assert proposal.new_text == "\U0001F600" * 3000 + "\r\nAFTER\r\n"

@@ -247,7 +247,7 @@ def _required_path(arguments: dict[str, Any]) -> str:
     return path
 
 
-def _normalize_new_text_for_preview(old_text: str | None, new_text: str) -> str:
+def _normalize_new_text_for_preview(old_text: str | None, new_text: str, *, use_byte_window: bool) -> str:
     """Match ``write_file()``/``patch_replace()``'s own line-ending
     normalization, so the preview's ``new_text`` uses the SAME ending the
     real write will produce.
@@ -271,25 +271,38 @@ def _normalize_new_text_for_preview(old_text: str | None, new_text: str) -> str:
     normalization at all, so its preview (which also skips this) already
     matches.
 
-    ``old_text`` is run through ``_byte_capped_sample`` before
-    ``_detect_line_ending`` sees it, rather than handed to it directly:
-    ``_probe_write_target()``'s production path (no ``pre_content``
-    supplied, which is how ``write_file_tool``/``patch_tool`` actually call
-    it) detects the line ending from a live ``head -c 4096`` probe -- a
-    BYTE window over the on-disk file. ``_detect_line_ending``'s own
-    ``sample[:4096]`` is a CHARACTER slice of whatever string it is given;
-    for an existing file with enough multibyte characters ahead of its
-    first newline (e.g. ~3000 emoji before a CRLF) that the newline falls
-    after byte 4096 but before character 4096, feeding it the full
-    ``old_text`` directly would see that newline while the real byte-based
-    probe does not, disagreeing about the file's line ending. Byte-capping
-    first keeps this preview and the real write's decision in agreement.
+    ``use_byte_window`` selects WHICH of the two different real-write code
+    paths this proposal kind must match -- they are NOT the same:
+
+    * ``write_file`` (``use_byte_window=True``): ``write_file_tool`` calls
+      ``ShellFileOperations.write_file()`` with NO ``pre_content``, so
+      ``_probe_write_target()`` detects the line ending from a live
+      ``head -c 4096`` probe -- a BYTE window over the ON-DISK file.
+      ``old_text`` is therefore run through ``_byte_capped_sample`` before
+      ``_detect_line_ending`` sees it: that helper's own ``sample[:4096]``
+      is a CHARACTER slice, and for an existing file with enough multibyte
+      characters ahead of its first newline (e.g. ~3000 emoji before a
+      CRLF) that the newline falls after byte 4096 but before character
+      4096, feeding it the full ``old_text`` directly would see a newline
+      the real byte-based probe does not.
+
+    * ``patch_replace`` (``use_byte_window=False``): ``patch_replace()``
+      already has the FULL file content in hand (its own ``_cat()``, for
+      the fuzzy match) and calls ``write_file()`` WITH that content as
+      ``pre_content`` -- so ``_probe_write_target()`` takes its
+      ``pre_content`` branch instead, detecting the line ending via
+      ``_detect_line_ending(pre_content)`` on the FULL (CHARACTER-sliced)
+      text, never the byte-based probe. Byte-capping here would instead
+      make the preview disagree with patch_replace's real (character-
+      based, full-text) decision for the exact same multibyte-heavy fixture
+      the write_file case above is byte-capped to match.
     """
     if old_text is None:
         return new_text
     from tools.file_operations_common import _byte_capped_sample, _detect_line_ending, _normalize_line_endings
 
-    file_ending = _detect_line_ending(_byte_capped_sample(old_text))
+    sample = _byte_capped_sample(old_text) if use_byte_window else old_text
+    file_ending = _detect_line_ending(sample)
     return _normalize_line_endings(new_text, file_ending) if file_ending else new_text
 
 
@@ -305,7 +318,7 @@ def _proposal_for_write_file(arguments: dict[str, Any], task_id: str = "default"
     # "cleaned" version would hide real bytes the file actually holds from
     # the user's approval review; see _read_text_if_exists's docstring.
     old_text = _read_text_if_exists(path, task_id, strip_fence_leaks=False)
-    new_text = _normalize_new_text_for_preview(old_text, str(content))
+    new_text = _normalize_new_text_for_preview(old_text, str(content), use_byte_window=True)
     return EditProposal(
         "write_file", path, old_text, new_text, dict(arguments),
         resolved_target_paths=(resolved,),
@@ -337,7 +350,11 @@ def _proposal_for_patch_replace(arguments: dict[str, Any], task_id: str = "defau
     # replace (file_ending = _detect_line_ending(content); new_content =
     # _normalize_line_endings(new_content, file_ending)) -- old_text here IS
     # that same content (BOM-stripped, fence-leak-unstripped cat output).
-    new_text = _normalize_new_text_for_preview(old_text, new_text)
+    # use_byte_window=False: patch_replace()'s real write passes this SAME
+    # full content through to write_file() as pre_content, so its probe
+    # takes the character-based (not byte-capped) branch -- see
+    # _normalize_new_text_for_preview's docstring.
+    new_text = _normalize_new_text_for_preview(old_text, new_text, use_byte_window=False)
     resolved = _resolve_edit_path(path, task_id)
     return EditProposal("patch", path, old_text, new_text, dict(arguments), resolved_target_paths=(resolved,))
 
