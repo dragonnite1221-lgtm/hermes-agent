@@ -458,6 +458,7 @@ def _is_sensitive_auto_approve_path(path: str) -> bool:
 
 def _is_single_path_auto_approvable(
     raw_path: str, policy: str, cwd_candidates: tuple[str | None, ...], resolved_path: str | None = None,
+    verify_backend: Callable[[str], bool] | None = None,
 ) -> bool:
     """``raw_path`` is the ORIGINAL (pre-canonicalization) target, always a
     real string -- used for the sensitive-path guard and, under
@@ -479,6 +480,22 @@ def _is_single_path_auto_approvable(
     Docker's ``/workspace``) and the client-reported host workspace it maps
     from are the SAME logical workspace even though they are textually
     unrelated paths.
+
+    ``verify_backend`` (only set for a non-host backend -- see
+    ``should_auto_approve_edit``) is an ADDITIONAL confirmation gate run
+    AFTER the lexical containment check above already passed: every
+    resolver that can populate ``resolved_path`` for a non-host backend
+    (``tools.file_tools._resolve_v4a_policy_target`` for V4A,
+    ``_resolve_path_for_task``'s container-path branch for write_file/
+    patch_replace) is a plain string join/normalize with NO knowledge of
+    the backend's actual filesystem, so a workspace-internal symlink the
+    host cannot see (e.g. ``/workspace/link -> /outside``) can make an
+    apparently in-workspace target resolve, once the backend's own shell
+    actually applies the write, to a location entirely outside every
+    boundary -- silently escaping the workspace without ever prompting.
+    Skipped entirely for a host-paths (local) backend, where
+    ``Path.resolve()`` above already followed any real symlink on the SAME
+    filesystem the write happens on.
     """
     if _is_sensitive_auto_approve_path(raw_path):
         return False
@@ -492,10 +509,15 @@ def _is_single_path_auto_approvable(
         # (``/private/tmp`` on macOS since resolve() follows the symlink).
         if path.is_relative_to(Path(tempfile.gettempdir()).resolve(strict=False)):
             return True
-        return any(
+        in_boundary = any(
             bool(cwd) and path.is_relative_to(Path(cwd).expanduser().resolve(strict=False))
             for cwd in cwd_candidates
         )
+        if not in_boundary:
+            return False
+        if verify_backend is not None and not verify_backend(resolved_path):
+            return False
+        return True
     return False
 
 
@@ -617,12 +639,37 @@ def should_auto_approve_edit(
     inspects the workspace boundary — a session-wide accept still
     auto-allows a non-sensitive edit whose canonical location is unknown;
     see ``_is_single_path_auto_approvable``.
+
+    For a NON-HOST (SSH/container/sandbox) backend, a target that lexically
+    looks workspace-local is additionally verified via a live backend-side
+    ``readlink -f`` round-trip (``tools.file_tools._verify_realpath_within_any``)
+    before ``AUTO_APPROVE_WORKSPACE`` skips the prompt: every resolver that
+    can produce a ``resolved_target_paths`` entry for such a backend is a
+    plain string join with no knowledge of the backend's actual filesystem,
+    so a workspace-internal symlink the host cannot see could otherwise
+    escape the workspace unprompted once the backend's own shell follows it
+    for real. This is skipped for a host-paths (local) backend, where
+    ``Path.resolve()`` already followed any real symlink on the SAME
+    filesystem the write happens on.
     """
 
     policy = str(policy or AUTO_APPROVE_ASK).strip()
     if policy == AUTO_APPROVE_ASK:
         return False
     cwd_candidates = _resolve_workspace_boundary(cwd, task_id)
+    verify_backend = None
+    if task_id:
+        try:
+            from tools.file_tools import _file_ops_uses_host_paths, _get_file_ops, _verify_realpath_within_any
+
+            file_ops = _get_file_ops(task_id)
+            if not _file_ops_uses_host_paths(file_ops):
+                verify_backend = lambda resolved, _fo=file_ops: _verify_realpath_within_any(
+                    resolved, cwd_candidates, _fo)
+        except Exception:
+            # Could not even determine the backend type for this task --
+            # fail closed rather than silently skipping the symlink check.
+            verify_backend = lambda _resolved: False
     raw_targets = proposal.target_paths or (proposal.path,)
     resolved_targets = proposal.resolved_target_paths
     if resolved_targets is None:
@@ -633,7 +680,7 @@ def should_auto_approve_edit(
         # workspace check closed instead of pairing the wrong entries.
         resolved_targets = (None,) * len(raw_targets)
     return all(
-        _is_single_path_auto_approvable(raw, policy, cwd_candidates, resolved)
+        _is_single_path_auto_approvable(raw, policy, cwd_candidates, resolved, verify_backend)
         for raw, resolved in zip(raw_targets, resolved_targets)
     )
 

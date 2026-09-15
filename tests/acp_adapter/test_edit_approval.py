@@ -1067,6 +1067,19 @@ def test_workspace_auto_approval_maps_boundary_into_docker_workspace_mount(tmp_p
         def read_file_raw(self, path, **kwargs):
             return ReadResult(content="old\n")
 
+        # The live symlink-safety probe (tools.file_tools
+        # ._verify_realpath_within_any) needs a backend that can run
+        # commands -- this one reports the target as its OWN real path
+        # (no symlink in the way), confirming the mapped boundary above is
+        # genuinely safe to auto-approve.
+        def _escape_shell_arg(self, arg):
+            return f"'{arg}'"
+
+        def _exec(self, command, **kwargs):
+            from tools.file_operations import ExecuteResult
+
+            return ExecuteResult(stdout="/workspace/x.txt\n", exit_code=0)
+
     monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeDockerBackend())
     monkeypatch.setattr(
         "tools.terminal_tool._get_env_config",
@@ -1090,6 +1103,79 @@ def test_workspace_auto_approval_maps_boundary_into_docker_workspace_mount(tmp_p
         assert should_auto_approve_edit(
             proposal, "workspace_session", cwd=str(host_workspace), task_id=task_id,
         ) is True
+    finally:
+        terminal_tool.clear_task_env_overrides(task_id)
+
+
+def test_v4a_auto_approval_denies_a_non_host_symlink_escape(tmp_path, monkeypatch):
+    """A V4A target that LOOKS workspace-local under the lexical
+    ``tools.file_tools._resolve_v4a_policy_target`` join must still be
+    denied ``AUTO_APPROVE_WORKSPACE`` auto-approval when the non-host
+    backend's OWN filesystem resolves it, via a real symlink, to a location
+    outside every workspace boundary.
+
+    ``/workspace/link`` is a symlink to ``/outside`` that only exists on
+    the backend -- invisible to both the purely lexical
+    ``posixpath.normpath`` join that computes ``resolved_target_paths`` and
+    to a host-side ``pathlib.Path.resolve()`` (which cannot see a backend-
+    only symlink either). Before this fix, a V4A header like
+    ``/workspace/link/file`` would pass the lexical containment check and
+    auto-approve, even though the backend's own shell -- which is what
+    actually applies the patch -- follows the real symlink and writes
+    ``/outside/file`` instead. The live ``readlink -f`` verification this
+    fix adds is the only vantage point that can see that symlink at all,
+    and must deny auto-approval (falling through to the normal approval
+    prompt, never silently allowing OR silently writing) whenever it
+    reports a real location outside every boundary.
+    """
+    import tools.terminal_tool as terminal_tool
+    from tools.file_operations import ExecuteResult, ReadResult
+
+    task_id = "non-host-symlink-escape-task"
+    host_workspace = tmp_path / "host-workspace"
+    host_workspace.mkdir()
+
+    class FakeDockerEnv:
+        cwd = "/workspace"
+
+    class FakeDockerBackend:
+        env = FakeDockerEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+        def _escape_shell_arg(self, arg):
+            return f"'{arg}'"
+
+        def _exec(self, command, **kwargs):
+            # Simulates the backend's real filesystem: /workspace/link is a
+            # symlink to /outside, so the target's REAL path lands entirely
+            # outside both /workspace and the host-mapped boundary.
+            return ExecuteResult(stdout="/outside/file.txt\n", exit_code=0)
+
+    monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeDockerBackend())
+    monkeypatch.setattr(
+        "tools.terminal_tool._get_env_config",
+        lambda: {"env_type": "docker", "cwd": "/workspace", "host_cwd": str(host_workspace)},
+    )
+    monkeypatch.setattr(
+        "tools.terminal_tool._resolve_task_host_cwd",
+        lambda config, task_id: config.get("host_cwd"),
+    )
+
+    terminal_tool.register_task_env_overrides(task_id, {"cwd": str(host_workspace)})
+    try:
+        proposal = build_edit_proposal(
+            "patch", {"mode": "patch", "patch": "*** Update File: link/file.txt\n@@\n-old\n+new\n"},
+            task_id=task_id,
+        )
+        # Lexically looks workspace-local -- this is exactly what makes the
+        # escape dangerous: a naive containment check would approve it.
+        assert proposal.resolved_target_paths == ("/workspace/link/file.txt",)
+
+        assert should_auto_approve_edit(
+            proposal, "workspace_session", cwd=str(host_workspace), task_id=task_id,
+        ) is False
     finally:
         terminal_tool.clear_task_env_overrides(task_id)
 

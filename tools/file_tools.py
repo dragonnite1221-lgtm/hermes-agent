@@ -214,6 +214,54 @@ def _resolve_v4a_policy_target(path: str, file_ops) -> str | None:
     return posixpath.normpath(posixpath.join(str(cwd), path))
 
 
+def _verify_realpath_within_any(resolved_path: str, boundaries: tuple, file_ops) -> bool:
+    """Confirm ``resolved_path`` -- a LEXICALLY workspace-local V4A policy
+    target on a non-host (SSH/container/sandbox) backend, from
+    ``_resolve_v4a_policy_target`` -- ALSO stays within one of
+    ``boundaries`` once the backend follows any REAL symlink along the way.
+
+    ``_resolve_v4a_policy_target``'s plain ``posixpath.normpath`` join never
+    inspects the backend's actual filesystem: a workspace-internal symlink
+    the host cannot see (e.g. ``/workspace/link -> /outside``) makes an
+    apparently in-workspace target (``/workspace/link/file``) resolve, once
+    the backend's own shell actually applies the patch, to a location
+    entirely outside every boundary -- silently escaping the workspace
+    without ever prompting for approval, since a purely lexical containment
+    check (host-side ``Path.resolve()`` cannot see a symlink that only
+    exists on the backend either) would still call it workspace-local.
+
+    This runs ONE bounded, read-only ``readlink -f`` round-trip against the
+    backend's own shell (the only vantage point that can see that symlink
+    at all) before letting ``should_auto_approve_edit`` skip the prompt,
+    and fails CLOSED (returns ``False``) on any probe failure, missing
+    ``_exec``/``_escape_shell_arg`` (a bare test double, or a backend that
+    cannot run commands), empty result, or non-zero exit -- "cannot
+    verify" must never be treated as "verified safe".
+    """
+    exec_fn = getattr(file_ops, "_exec", None)
+    quote = getattr(file_ops, "_escape_shell_arg", None)
+    if exec_fn is None or quote is None:
+        return False
+    try:
+        arg = quote(resolved_path)
+        result = exec_fn(f"readlink -f {arg} 2>/dev/null || realpath {arg} 2>/dev/null")
+    except Exception:
+        return False
+    if getattr(result, "exit_code", 1) != 0:
+        return False
+    real = (getattr(result, "stdout", "") or "").strip()
+    if not real:
+        return False
+    normalized = posixpath.normpath(real)
+    return any(
+        bool(boundary) and (
+            normalized == posixpath.normpath(str(boundary))
+            or normalized.startswith(posixpath.normpath(str(boundary)).rstrip("/") + "/")
+        )
+        for boundary in boundaries
+    )
+
+
 def _is_blocked_device_path(path: str) -> bool:
     """Return True for concrete device/fd/proc paths that can hang reads or leak process state."""
     normalized = os.path.normpath(_expand_tilde(path))
