@@ -764,8 +764,262 @@ class TestPrompt:
 
         assert state.history == []
 
+    @pytest.mark.asyncio
+    async def test_is_running_resets_and_queued_prompt_survives_real_transport_failure(
+        self, agent, mock_manager, monkeypatch
+    ):
+        """Core delivery-failure invariant, exercised over a REAL ACP
+        JSON-RPC connection instead of a mocked ``session_update`` -- a
+        mock never touches ``acp.agent.connection.AgentSideConnection`` /
+        ``MessageSender``, the actual code whose broken-pipe behavior this
+        fix depends on (per AGENTS.md: I/O-touching fixes need one real
+        path, mocks alone hide integration bugs).
 
+        Wires a genuine ``AgentSideConnection`` to a pipe whose read end is
+        closed immediately, so every outbound write fails for real, queues
+        a prompt before calling ``agent.prompt()``, and asserts the full
+        guarantee against the real transport in one shot: the call raises,
+        ``is_running`` resets to False, and the queued prompt survives
+        instead of being silently dropped.
 
+        This also exercises ``_session_update_or_raise``'s timeout bound:
+        once ``MessageSender._loop()`` dies from the FIRST failed write, ANY
+        FURTHER ``session_update`` on that same connection silently hangs
+        instead of raising (confirmed by reading acp/task/sender.py) -- the
+        drain loop's SECOND send (the "now running" notification for the
+        queued item) hits exactly that. Without the timeout this would hang
+        the test -- and a real turn -- forever instead of ever reaching the
+        reinsert-and-raise path.
+        """
+        import acp_adapter.server as server_module
+        from acp.agent.connection import AgentSideConnection
+
+        monkeypatch.setattr(server_module, "_SESSION_UPDATE_TIMEOUT_SECONDS", 0.2)
+
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+
+        def _run(*args, **kwargs):
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        loop = asyncio.get_running_loop()
+        read_fd, write_fd = os.pipe()
+        # Close the read end immediately: every write to write_fd now fails,
+        # the real-world equivalent of the client process/pipe going away.
+        os.close(read_fd)
+        write_file = os.fdopen(write_fd, "wb", buffering=0)
+        transport, protocol = await loop.connect_write_pipe(
+            asyncio.streams.FlowControlMixin, write_file
+        )
+        writer = asyncio.StreamWriter(transport, protocol, None, loop)
+        # Never read from; only needed to satisfy AgentSideConnection's
+        # StreamReader type check (listening=False skips the receive loop).
+        reader = asyncio.StreamReader(limit=1024 * 1024, loop=loop)
+
+        conn = AgentSideConnection(agent, writer, reader, listening=False)
+        # A prompt that arrived (and got queued) while this turn was
+        # already running.
+        state.queued_prompts.append("follow-up while busy")
+        try:
+            with pytest.raises(Exception):
+                await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text="hi")],
+                    session_id=resp.session_id,
+                )
+
+            assert state.is_running is False
+            # The queued item must still be there for a later retry, not lost.
+            assert state.queued_prompts == ["follow-up while busy"]
+        finally:
+            # The sender's background task already died from the same
+            # broken pipe being asserted on above; close() re-awaits that
+            # task and would otherwise re-raise its exception during
+            # cleanup. That's expected here -- the connection is known
+            # broken by design -- so only swallow the transport-level
+            # errors close() surfaces, not a real assertion failure.
+            try:
+                await conn.close()
+            except (ConnectionResetError, BrokenPipeError, OSError, asyncio.TimeoutError):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_is_running_resets_when_provenance_send_hits_dead_connection(
+        self, agent, mock_manager, monkeypatch
+    ):
+        """Compression-rotation sibling of the delivery-failure fix above: ``_finish_turn``
+        sends a pre-drain provenance update (``_send_session_info_update`` -> ``_send``)
+        BEFORE the try/finally that resets ``is_running``. That path used an unbounded
+        ``_send``, so on a connection that silently hangs instead of raising (the same
+        dead-sender behavior documented above), the provenance await never returns and the
+        reset guard below it is never reached -- the exact bug this PR fixes, just on the
+        rotation path instead of final-response delivery.
+
+        Turn 1 dies against the closed pipe for real, killing ``MessageSender``'s background
+        loop; turn 2 rotates ``agent.session_id`` so ``_finish_turn``'s FIRST write is the
+        provenance update, landing on that now-dead connection's silent-hang behavior instead
+        of a raise. ``_send`` must now be bounded by the same timeout for turn 2 to ever
+        finish instead of hanging the test (and a real turn) forever.
+        """
+        import acp_adapter.server as server_module
+        from acp.agent.connection import AgentSideConnection
+
+        monkeypatch.setattr(server_module, "_SESSION_UPDATE_TIMEOUT_SECONDS", 0.2)
+
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+        state.agent.session_id = "hermes-1"
+
+        def _run_no_rotation(*args, **kwargs):
+            return {"final_response": "ok", "messages": []}
+
+        def _run_with_rotation(*args, **kwargs):
+            # Simulate a mid-turn compression split: the internal head changes as a
+            # side effect of THIS run, so pre_turn_hermes_id (snapshotted before the
+            # executor call) differs from post_turn_hermes_id (read after it returns).
+            state.agent.session_id = "hermes-2"
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run_no_rotation
+
+        loop = asyncio.get_running_loop()
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        write_file = os.fdopen(write_fd, "wb", buffering=0)
+        transport, protocol = await loop.connect_write_pipe(asyncio.streams.FlowControlMixin, write_file)
+        writer = asyncio.StreamWriter(transport, protocol, None, loop)
+        reader = asyncio.StreamReader(limit=1024 * 1024, loop=loop)
+        conn = AgentSideConnection(agent, writer, reader, listening=False)
+        agent._conn = conn
+
+        try:
+            # Turn 1: the FIRST write on this connection fails for real (closed pipe),
+            # killing the sender's background loop -- expected to raise.
+            with pytest.raises(Exception):
+                await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text="hi")], session_id=resp.session_id
+                )
+            assert state.is_running is False
+
+            # Turn 2: the run itself rotates the internal head, so _finish_turn's first
+            # action is the provenance send, hitting the now-dead connection's
+            # hang-not-raise behavior.
+            state.agent.run_conversation = _run_with_rotation
+            with pytest.raises(Exception):
+                await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text="again")], session_id=resp.session_id
+                )
+            assert state.is_running is False
+        finally:
+            try:
+                await conn.close()
+            except (ConnectionResetError, BrokenPipeError, OSError, asyncio.TimeoutError):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_queue_drains_after_recoverable_failure_but_is_not_replayed_once_run(
+        self, agent, mock_manager
+    ):
+        """Two more facets of the same delivery-failure guarantee, covered
+        as scenario blocks in one test so the drain loop can't satisfy one
+        by breaking the other (e.g. "always retry the notification" would
+        pass scenario 1 but replay work in scenario 2).
+
+        Scenario 1 -- one-off failure, connection recovers: the ORIGINAL
+        final-response delivery fails, but the connection has recovered by
+        the time the drain loop retries the "now running" notification for
+        a queued item -- ``is_running`` must still reset AND the queued
+        item must fully drain (``self.prompt()`` actually runs it), not
+        just survive unexecuted.
+
+        Scenario 2 -- nested turn already ran: once ``self.prompt()`` picks
+        the item up, it owns it -- a failure in THAT nested turn's own
+        final-response delivery (which happens only after the nested turn
+        already ran, tools included, and persisted its history) must not
+        put the item back on the queue. Requeuing it would replay an
+        already-executed turn, side-effecting tool calls included, a
+        second time.
+        """
+
+        def _make_run(run_calls):
+            def _run(*args, **kwargs):
+                run_calls.append(1)
+                return {"final_response": "ok", "messages": []}
+
+            return _run
+
+        # --- Scenario 1: one-off failure, connection recovers -> full drain
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        run_calls: list[int] = []
+        state.agent.run_conversation = _make_run(run_calls)
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        call_count = {"n": 0}
+
+        async def flaky_session_update(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("connection dropped")
+            return None
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(side_effect=flaky_session_update)
+        agent._conn = mock_conn
+
+        # Simulate a prompt that arrived (and got queued) while this turn
+        # was already running.
+        state.queued_prompts.append("follow-up while busy")
+
+        with pytest.raises(RuntimeError):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hi")],
+                session_id=resp.session_id,
+            )
+
+        assert state.is_running is False
+        assert state.queued_prompts == []
+        assert len(run_calls) == 2  # original turn + the drained follow-up
+
+        # --- Scenario 2: nested turn already ran -> item is NOT replayed --
+        resp2 = await agent.new_session(cwd=".")
+        state2 = mock_manager.get_session(resp2.session_id)
+        run_calls2: list[int] = []
+        state2.agent.run_conversation = _make_run(run_calls2)
+        state2.agent.model = "test-model"
+        state2.agent.provider = "openrouter"
+
+        # Sequence: [1] original turn's final response (ok), [2] "now
+        # running" notification for the queued item (ok), [3] the NESTED
+        # turn's own final-response delivery (fails).
+        call_count2 = {"n": 0}
+
+        async def flaky_session_update2(*args, **kwargs):
+            call_count2["n"] += 1
+            if call_count2["n"] == 3:
+                raise RuntimeError("nested delivery failed")
+            return None
+
+        mock_conn2 = MagicMock(spec=acp.Client)
+        mock_conn2.session_update = AsyncMock(side_effect=flaky_session_update2)
+        agent._conn = mock_conn2
+        state2.queued_prompts.append("follow-up while busy")
+
+        with pytest.raises(RuntimeError):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hi")],
+                session_id=resp2.session_id,
+            )
+
+        # The nested turn actually ran -- must not be replayed.
+        assert state2.queued_prompts == []
+        assert len(run_calls2) == 2
 
 
 

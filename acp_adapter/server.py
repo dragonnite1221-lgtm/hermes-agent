@@ -58,6 +58,13 @@ _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
 # ListSessionsRequest has no client-side limit; clients paginate via `cursor`/`next_cursor`.
 _LIST_SESSIONS_PAGE_SIZE = 50
 
+# Matches the fire-and-forget bound in acp_adapter/events.py's _send_update (future.result(timeout=5)).
+# Once acp.task.sender.MessageSender's write loop has died from one failed write, ANY further
+# session_update() on that same connection silently queues and never resolves instead of raising
+# (confirmed against a real broken pipe in tests/acp_adapter/test_server.py) -- bounding the wait
+# is the only way a caller downstream of a dead connection ever gets control back.
+_SESSION_UPDATE_TIMEOUT_SECONDS = 5.0
+
 
 def _flatten_history_text(value: Any) -> str:
     """Persisted content/reasoning (str, or list of ``{"text"}`` / ``{"type": "text", "content"}``
@@ -268,13 +275,34 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         logger.info("ACP client connected")
 
     async def _send(self, session_id: str, update: Any, *, fail_msg: str, level: int = logging.WARNING) -> bool:
-        """``session_update`` that logs instead of raising; False on failure."""
+        """``session_update`` that logs instead of raising; False on failure or timeout.
+
+        Bounded to ``_SESSION_UPDATE_TIMEOUT_SECONDS`` -- same reason as
+        ``_session_update_or_raise`` below: a connection already broken by an EARLIER failed
+        write can hang instead of raising, and callers on the ``_finish_turn`` pre-drain path
+        (e.g. the provenance update) rely on this call returning so the ``is_running`` reset
+        guard downstream is actually reached instead of hanging forever.
+        """
         try:
-            await self._conn.session_update(session_id=session_id, update=update)
+            await asyncio.wait_for(
+                self._conn.session_update(session_id=session_id, update=update),
+                timeout=_SESSION_UPDATE_TIMEOUT_SECONDS,
+            )
             return True
         except Exception:
             logger.log(level, fail_msg, session_id, exc_info=True)
             return False
+
+    @staticmethod
+    async def _session_update_or_raise(conn: Any, session_id: str, update: Any) -> None:
+        """``conn.session_update()`` bounded to ``_SESSION_UPDATE_TIMEOUT_SECONDS`` so a
+        connection already broken by an EARLIER failed write can never hang this call forever.
+
+        Used only where the caller (``_finish_turn``) needs delivery failure to actually
+        propagate as an exception -- ``_send`` above is for best-effort notifications and
+        swallows the (now also bounded) failure instead of raising it.
+        """
+        await asyncio.wait_for(conn.session_update(session_id, update), timeout=_SESSION_UPDATE_TIMEOUT_SECONDS)
 
     def _schedule_soon(self, make_coro: Callable[[], Any]) -> None:
         """Run a notification coroutine right after the current response is queued."""
@@ -989,23 +1017,41 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         interrupted = bool(result.get("interrupted")) or cancelled
         suppress = interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
-        # Send the final text unless already streamed — or if a plugin hook transformed it after.
-        if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
-            update = acp.update_agent_message_text(final_response)
-            if state.message_ids is not None:
-                # A plugin-rewritten reply replaces the streamed bubble (same id); an
-                # unstreamed final response opens its own.
-                if streamed_message and result.get("response_transformed"):
-                    update.message_id = state.message_ids.last() or state.message_ids.current()
-                else:
-                    update.message_id = state.message_ids.current()
-                state.message_ids.close()
-            await conn.session_update(session_id, update)
+        delivery_error: Exception | None = None
+        try:
+            # Send the final text unless already streamed — or if a plugin hook transformed it after.
+            if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
+                update = acp.update_agent_message_text(final_response)
+                if state.message_ids is not None:
+                    # A plugin-rewritten reply replaces the streamed bubble (same id); an
+                    # unstreamed final response opens its own.
+                    if streamed_message and result.get("response_transformed"):
+                        update.message_id = state.message_ids.last() or state.message_ids.current()
+                    else:
+                        update.message_id = state.message_ids.current()
+                    state.message_ids.close()
+                await self._session_update_or_raise(conn, session_id, update)
+        except Exception as exc:
+            # Remember the failure but do not let it skip the cleanup below:
+            # is_running must still reset, and any prompt that was queued
+            # while THIS turn was running must still get drained here.
+            # Nothing else drains queued_prompts -- a fresh prompt() call
+            # for a later message would start its own new turn without ever
+            # looking at the queue, so re-raising immediately would strand
+            # already-queued work indefinitely (or let a newer prompt run
+            # ahead of it, breaking FIFO order).
+            delivery_error = exc
+        finally:
+            # Go idle before draining so recursive prompt() calls can
+            # acquire the session. This must run even if delivering the
+            # final response above raised (dropped connection,
+            # serialization error, ...) -- otherwise is_running stays True
+            # forever and every later prompt on this session just piles up
+            # in the queue without ever running.
+            with state.runtime_lock:
+                state.is_running = False
+                state.current_prompt_text = ""
 
-        # Go idle before draining so recursive prompt() calls can acquire the session.
-        with state.runtime_lock:
-            state.is_running = False
-            state.current_prompt_text = ""
         while True:
             with state.runtime_lock:
                 if not state.queued_prompts:
@@ -1027,15 +1073,62 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             else:
                 next_content_blocks = next_prompt
                 display_text = _extract_text(next_prompt).strip() or "[Image attachment]"
-            if conn:
-                await conn.session_update(
-                    session_id,
-                    acp.update_user_message_text(display_text),
-                )
+            try:
+                if conn:
+                    await self._session_update_or_raise(
+                        conn,
+                        session_id,
+                        acp.update_user_message_text(display_text),
+                    )
+            except Exception:
+                # Only the "now running" notification is guarded here.
+                # self.prompt() has not been called yet, so this item has
+                # done no work and no side effects -- it's safe to put back
+                # at the front of the queue (the connection that failed to
+                # deliver the ORIGINAL final response above may still be
+                # down) so a persistent failure here can't silently drop a
+                # user's queued prompt, then surface the failure instead of
+                # continuing to drain against a connection that keeps
+                # failing.
+                #
+                # NOTE (known, deliberately-not-fixed gap): once reinserted,
+                # nothing proactively retries this item -- the queue only
+                # drains via the recursive self.prompt() calls already in
+                # this loop, which only happen from WITHIN an active turn.
+                # If no further prompt ever arrives on this session, it
+                # stays queued indefinitely; if one does, _claim_turn_or_
+                # queue() has no way to tell "a genuinely new external
+                # prompt" apart from "the internal recursive call this very
+                # loop would make to run the next backlog item", so it
+                # can't safely special-case "is_running is False but there
+                # is a backlog" without either re-queuing the recursive
+                # call that's supposed to be running right now (breaking
+                # draining entirely) or needing a new signal threaded
+                # through self.prompt() to distinguish the two callers.
+                # That's a real architecture change (or a background
+                # scheduler), not a contained fix -- left as a known
+                # limitation rather than risking a half-verified rework of
+                # the queue/turn-claim contract under this PR's scope.
+                with state.runtime_lock:
+                    state.queued_prompts.insert(0, next_prompt)
+                raise
+            # self.prompt() takes full ownership of this item from here:
+            # whatever happens inside it (including its OWN internal
+            # final-response delivery failing after it already ran the
+            # turn and persisted history) must propagate as-is. Requeuing
+            # here would replay an already-executed turn -- including any
+            # side-effecting tool calls -- a second time.
             await self.prompt(
                 prompt=next_content_blocks,
                 session_id=session_id,
             )
+
+        if delivery_error is not None:
+            # Now that the session is idle again and any queued follow-ups
+            # have actually run, surface the original delivery failure to
+            # the caller instead of silently reporting this turn as a
+            # normal end_turn.
+            raise delivery_error
 
         usage = None
         if any(result.get(k) is not None for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
