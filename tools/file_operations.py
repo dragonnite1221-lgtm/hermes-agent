@@ -1104,6 +1104,28 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         return None
 
     @staticmethod
+    def _write_wants_pre_content(ext: str, file_ops) -> bool:
+        """Whether ``write_file()``'s real probe reads FULL pre-content
+        (feeding a CHARACTER-based ``_detect_line_ending`` call) rather than
+        a byte-capped live ``head -c 4096`` sample -- true for any
+        extension covered by in-process linting or a registered LSP server,
+        since pre-content also feeds diagnostics/lint-delta/the line-shift
+        map for those files (see ``_probe_write_target``'s ``want_pre``
+        branch).
+
+        Module-level (not just inlined in ``write_file()``) so
+        ``acp_adapter/edit_approval.py``'s preview can reach the IDENTICAL
+        decision when choosing between a byte-capped and a full-text
+        line-ending sample -- a duplicated inline check here and there
+        could silently drift apart again exactly like the byte-window fix
+        this mirrors.
+        """
+        if ext in LINTERS_INPROC:
+            return True
+        handles = getattr(file_ops, "_lsp_handles_extension", None)
+        return bool(handles and handles(ext))
+
+    @staticmethod
     def _fail_closed_syntax_error(path: str, ext: str, content: str) -> Optional[WriteResult]:
         """Fail-closed pre-write gate for ``_FAIL_CLOSED_INPROC_EXTS`` (JSON/YAML/TOML):
         a structured-format write that doesn't parse is a corrupt write, so refuse
@@ -1257,7 +1279,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
 
         # Pre-content is read only for extensions in the UNION of in-process lint and
         # LSP coverage (keeps the hot path fast for binaries).
-        want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
+        want_pre = self._write_wants_pre_content(ext, self)
         has_bom, pre_content, original_ending = self._probe_write_target(path, pre_content, want_pre)
         # read_file strips the BOM and models send bare-LF text, so a round-trip would
         # otherwise normalize CRLF files and drop the BOM (prepend only when absent).

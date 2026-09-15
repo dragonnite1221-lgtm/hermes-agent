@@ -1261,3 +1261,121 @@ def test_patch_replace_preview_line_ending_uses_the_full_character_window_not_th
     # based detection) -- the preview must normalize to match it, the
     # opposite of the write_file case above.
     assert proposal.new_text == "\U0001F600" * 3000 + "\r\nAFTER\r\n"
+
+
+def test_write_file_preview_uses_character_window_for_lint_or_lsp_covered_extensions(monkeypatch):
+    """Unlike a plain-text extension, ``write_file()``'s real probe for a
+    linted/LSP-covered extension (e.g. ``.py``) sets ``want_pre=True`` and
+    reads FULL pre-content -- detecting the line ending via
+    ``_detect_line_ending(pre_content)`` on that FULL (character-sliced)
+    text, the SAME character-based path ``patch_replace`` always takes,
+    never the byte-capped ``head -c 4096`` probe the plain-text write_file
+    case (see
+    ``test_write_file_preview_line_ending_uses_the_same_byte_window_as_the_real_write``)
+    is byte-capped to match.
+
+    Using the SAME ~3000-emoji-then-CRLF fixture, but with a ``.py`` path
+    this time: the preview must normalize to CRLF, the OPPOSITE of the
+    plain-text write_file outcome for the identical bytes.
+    """
+    from tools.file_operations import ReadResult
+
+    emoji_old_text = "\U0001F600" * 3000 + "\r\nafter\r\n"
+
+    class FakeEmojiBackend:
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content=emoji_old_text)
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeEmojiBackend()
+    )
+
+    proposal = build_edit_proposal(
+        "write_file", {"path": "emoji.py", "content": "plain new content\n"}, task_id="some-task",
+    )
+
+    assert proposal.new_text == "plain new content\r\n"
+
+
+def test_v4a_auto_approval_denies_a_non_host_symlink_escape_via_the_tmp_exemption(monkeypatch):
+    """The global-temp-dir ``AUTO_APPROVE_WORKSPACE`` exemption must ALSO go
+    through the non-host symlink-safety verification, not bypass it via an
+    unconditional early return.
+
+    ``/tmp/link`` is a symlink to ``/outside`` that only exists on a
+    non-host backend: lexically, ``/tmp/link/file.txt`` qualifies for the
+    global-tmp exemption on the host too (``tempfile.gettempdir()`` is
+    ``/tmp`` on Linux), but the backend's own shell -- which actually
+    applies the patch -- follows the real symlink and writes
+    ``/outside/file.txt`` instead. Before this fix, the tmp-dir check
+    ``return``ed immediately, so the live ``verify_backend`` gate below it
+    was never even reached for this branch.
+    """
+    from tools.file_operations import ExecuteResult, ReadResult
+
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: "/tmp")
+
+    task_id = "non-host-tmp-symlink-escape-task"
+
+    class FakeNonHostEnv:
+        cwd = "/remote/base"
+
+    class FakeNonHostBackend:
+        env = FakeNonHostEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+        def _escape_shell_arg(self, arg):
+            return f"'{arg}'"
+
+        def _exec(self, command, **kwargs):
+            # Simulates the backend's real filesystem: /tmp/link is a
+            # symlink to /outside.
+            return ExecuteResult(stdout="/outside/file.txt\n", exit_code=0)
+
+    monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend())
+
+    patch_body = "*** Update File: /tmp/link/file.txt\n@@\n-old\n+new\n"
+    proposal = build_edit_proposal("patch", {"mode": "patch", "patch": patch_body}, task_id=task_id)
+    # Absolute V4A header -- _resolve_v4a_policy_target normalizes it as-is,
+    # still lexically under /tmp.
+    assert proposal.resolved_target_paths == ("/tmp/link/file.txt",)
+
+    assert should_auto_approve_edit(proposal, "workspace_session", cwd=None, task_id=task_id) is False
+
+
+def test_verify_realpath_within_any_resolves_new_nested_paths_without_requiring_parents(tmp_path):
+    """``readlink -f``/``realpath`` require every path component but the
+    LAST to already exist, so a brand-new nested target (``write_file``/V4A
+    ADD create missing parent directories on write, e.g.
+    ``workspace/newdir/newdir2/file.py`` when neither ``newdir`` nor
+    ``newdir2`` exist yet) must not be treated as unverifiable and force an
+    unnecessary approval prompt.
+
+    ``tools.file_tools._verify_realpath_within_any`` walks up to the
+    nearest EXISTING ancestor, resolves THAT ancestor's real path, and
+    appends the missing suffix back on literally. Exercised here against a
+    REAL ``ShellFileOperations``-over-``LocalEnvironment`` backend (not a
+    fake ``_exec`` reply), so the actual shell script is proven to work on
+    a real filesystem, not just this module's handling of a canned result.
+    """
+    from tools.environments.local import LocalEnvironment
+    from tools.file_operations import ShellFileOperations
+    from tools.file_tools import _verify_realpath_within_any
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    env = LocalEnvironment(cwd=str(workspace), timeout=15)
+    real_ops = ShellFileOperations(env, cwd=str(workspace))
+
+    # newdir/newdir2 do NOT exist yet.
+    nested_new_target = str(workspace / "newdir" / "newdir2" / "file.py")
+
+    assert _verify_realpath_within_any(nested_new_target, (str(workspace),), real_ops) is True
+
+    # Sanity: the walk-up must stop at the correct existing ancestor
+    # (workspace itself), not misreport containment under an unrelated
+    # existing sibling directory.
+    (workspace / "unrelated").mkdir()
+    assert _verify_realpath_within_any(nested_new_target, (str(workspace / "unrelated"),), real_ops) is False

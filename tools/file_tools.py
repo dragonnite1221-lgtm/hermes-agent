@@ -230,13 +230,23 @@ def _verify_realpath_within_any(resolved_path: str, boundaries: tuple, file_ops)
     check (host-side ``Path.resolve()`` cannot see a symlink that only
     exists on the backend either) would still call it workspace-local.
 
-    This runs ONE bounded, read-only ``readlink -f`` round-trip against the
-    backend's own shell (the only vantage point that can see that symlink
-    at all) before letting ``should_auto_approve_edit`` skip the prompt,
-    and fails CLOSED (returns ``False``) on any probe failure, missing
-    ``_exec``/``_escape_shell_arg`` (a bare test double, or a backend that
-    cannot run commands), empty result, or non-zero exit -- "cannot
-    verify" must never be treated as "verified safe".
+    This runs ONE bounded, read-only shell round-trip against the backend's
+    own shell (the only vantage point that can see that symlink at all)
+    before letting ``should_auto_approve_edit`` skip the prompt, and fails
+    CLOSED (returns ``False``) on any probe failure, missing ``_exec``/
+    ``_escape_shell_arg`` (a bare test double, or a backend that cannot run
+    commands), empty result, or non-zero exit -- "cannot verify" must
+    never be treated as "verified safe".
+
+    ``readlink -f``/``realpath`` themselves require every component but
+    the LAST to already exist -- so a brand-new nested target
+    (``write_file``/V4A ADD create missing parent directories on write,
+    e.g. ``/workspace/newdir/file.py`` when ``newdir`` doesn't exist yet)
+    would otherwise always fail this probe and force an unnecessary
+    prompt. The script instead walks UP from ``resolved_path`` to the
+    NEAREST EXISTING ancestor, resolves THAT ancestor's real path (a
+    nonexistent path component cannot itself be a symlink, so it needs no
+    resolution), and appends the missing suffix back on literally.
     """
     exec_fn = getattr(file_ops, "_exec", None)
     quote = getattr(file_ops, "_escape_shell_arg", None)
@@ -244,7 +254,14 @@ def _verify_realpath_within_any(resolved_path: str, boundaries: tuple, file_ops)
         return False
     try:
         arg = quote(resolved_path)
-        result = exec_fn(f"readlink -f {arg} 2>/dev/null || realpath {arg} 2>/dev/null")
+        script = (
+            f"p={arg}; suffix=''; "
+            'while [ ! -e "$p" ] && [ "$p" != "/" ] && [ -n "$p" ]; do '
+            'suffix="/$(basename "$p")$suffix"; p="$(dirname "$p")"; done; '
+            'real="$(readlink -f "$p" 2>/dev/null || realpath "$p" 2>/dev/null)"; '
+            '[ -n "$real" ] && printf \'%s%s\\n\' "$real" "$suffix"'
+        )
+        result = exec_fn(script)
     except Exception:
         return False
     if getattr(result, "exit_code", 1) != 0:

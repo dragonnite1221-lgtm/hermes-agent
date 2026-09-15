@@ -274,28 +274,34 @@ def _normalize_new_text_for_preview(old_text: str | None, new_text: str, *, use_
     ``use_byte_window`` selects WHICH of the two different real-write code
     paths this proposal kind must match -- they are NOT the same:
 
-    * ``write_file`` (``use_byte_window=True``): ``write_file_tool`` calls
+    * ``write_file`` (``use_byte_window = not ShellFileOperations.
+      _write_wants_pre_content(ext, file_ops)``): ``write_file_tool`` calls
       ``ShellFileOperations.write_file()`` with NO ``pre_content``, so
-      ``_probe_write_target()`` detects the line ending from a live
-      ``head -c 4096`` probe -- a BYTE window over the ON-DISK file.
-      ``old_text`` is therefore run through ``_byte_capped_sample`` before
-      ``_detect_line_ending`` sees it: that helper's own ``sample[:4096]``
-      is a CHARACTER slice, and for an existing file with enough multibyte
-      characters ahead of its first newline (e.g. ~3000 emoji before a
-      CRLF) that the newline falls after byte 4096 but before character
-      4096, feeding it the full ``old_text`` directly would see a newline
-      the real byte-based probe does not.
+      whether ``_probe_write_target()`` detects the line ending from a
+      live ``head -c 4096`` probe (a BYTE window over the ON-DISK file) or
+      from FULL pre-content depends on the target's extension --
+      ``want_pre`` is true (full, character-based) for any extension
+      covered by in-process linting or a registered LSP server (pre-content
+      also feeds diagnostics/the line-shift map for those), false
+      (byte-capped) otherwise. Only in that false case is ``old_text`` run
+      through ``_byte_capped_sample`` before ``_detect_line_ending`` sees
+      it: that helper's own ``sample[:4096]`` is a CHARACTER slice, and for
+      an existing file with enough multibyte characters ahead of its first
+      newline (e.g. ~3000 emoji before a CRLF) that the newline falls after
+      byte 4096 but before character 4096, feeding it the full ``old_text``
+      directly would see a newline the real byte-based probe does not.
 
-    * ``patch_replace`` (``use_byte_window=False``): ``patch_replace()``
-      already has the FULL file content in hand (its own ``_cat()``, for
-      the fuzzy match) and calls ``write_file()`` WITH that content as
-      ``pre_content`` -- so ``_probe_write_target()`` takes its
-      ``pre_content`` branch instead, detecting the line ending via
-      ``_detect_line_ending(pre_content)`` on the FULL (CHARACTER-sliced)
-      text, never the byte-based probe. Byte-capping here would instead
-      make the preview disagree with patch_replace's real (character-
-      based, full-text) decision for the exact same multibyte-heavy fixture
-      the write_file case above is byte-capped to match.
+    * ``patch_replace`` (``use_byte_window=False``, unconditionally):
+      ``patch_replace()`` already has the FULL file content in hand (its
+      own ``_cat()``, for the fuzzy match) and calls ``write_file()`` WITH
+      that content as ``pre_content`` -- so ``_probe_write_target()`` takes
+      its ``pre_content`` branch regardless of extension, detecting the
+      line ending via ``_detect_line_ending(pre_content)`` on the FULL
+      (CHARACTER-sliced) text, never the byte-based probe. Byte-capping
+      here would instead make the preview disagree with patch_replace's
+      real (character-based, full-text) decision for the exact same
+      multibyte-heavy fixture a non-lint/LSP write_file case is byte-capped
+      to match.
     """
     if old_text is None:
         return new_text
@@ -318,7 +324,18 @@ def _proposal_for_write_file(arguments: dict[str, Any], task_id: str = "default"
     # "cleaned" version would hide real bytes the file actually holds from
     # the user's approval review; see _read_text_if_exists's docstring.
     old_text = _read_text_if_exists(path, task_id, strip_fence_leaks=False)
-    new_text = _normalize_new_text_for_preview(old_text, str(content), use_byte_window=True)
+    # use_byte_window mirrors write_file()'s own want_pre decision (see
+    # ShellFileOperations._write_wants_pre_content): for a linted/LSP-
+    # covered extension (e.g. .py) the real write reads FULL pre-content
+    # and detects the line ending from that (character-based), same as
+    # patch_replace -- only an extension outside that coverage falls back
+    # to the real write's byte-capped `head -c 4096` probe.
+    from tools.file_operations import ShellFileOperations
+    from tools.file_tools import _get_file_ops
+
+    ext = os.path.splitext(path)[1].lower()
+    wants_pre = ShellFileOperations._write_wants_pre_content(ext, _get_file_ops(task_id))
+    new_text = _normalize_new_text_for_preview(old_text, str(content), use_byte_window=not wants_pre)
     return EditProposal(
         "write_file", path, old_text, new_text, dict(arguments),
         resolved_target_paths=(resolved,),
@@ -524,9 +541,12 @@ def _is_single_path_auto_approvable(
         path = Path(resolved_path).expanduser().resolve(strict=False)
         # tempfile.gettempdir() is the real temp root on every platform
         # (``/private/tmp`` on macOS since resolve() follows the symlink).
-        if path.is_relative_to(Path(tempfile.gettempdir()).resolve(strict=False)):
-            return True
-        in_boundary = any(
+        # This is just ANOTHER acceptable boundary, not an early return: it
+        # must go through the SAME verify_backend gate below, or a
+        # non-host backend's own /tmp (reached through a backend-only
+        # parent symlink, e.g. /tmp/link -> /outside) could auto-approve
+        # unverified.
+        in_boundary = path.is_relative_to(Path(tempfile.gettempdir()).resolve(strict=False)) or any(
             bool(cwd) and path.is_relative_to(Path(cwd).expanduser().resolve(strict=False))
             for cwd in cwd_candidates
         )
