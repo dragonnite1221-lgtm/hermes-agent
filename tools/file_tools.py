@@ -11,6 +11,7 @@ import errno
 import json
 import logging
 import os
+import posixpath
 import re
 import stat
 import threading
@@ -146,6 +147,25 @@ _V4A_SINGLE_HEADER_RE = re.compile(r'^(\*\*\*\s*(Update|Add|Delete)\s+File:\s*)(
 _V4A_MOVE_HEADER_RE = re.compile(r'^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$', re.MULTILINE)
 
 
+def _apply_v4a_header_rewrite(patch: str, path_to_resolved: dict) -> str:
+    """Substitute each V4A header path present in ``path_to_resolved`` with
+    its resolved value; a header path absent from the mapping is left
+    untouched.
+
+    Shared substitution core for ``_rewrite_v4a_patch_paths_for_host``
+    (host-paths backends, rewriting to host-resolved paths) and
+    ``acp_adapter.edit_approval``'s non-host approval-freeze step
+    (rewriting to the backend-canonical paths approval was granted for) --
+    one regex-substitution implementation for both callers.
+    """
+    def _res(raw: str) -> str:
+        raw = raw.strip()
+        return path_to_resolved.get(raw) or raw
+
+    patch = _V4A_SINGLE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_res(m.group(3))}", patch)
+    return _V4A_MOVE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_res(m.group(2))} -> {_res(m.group(3))}", patch)
+
+
 def _rewrite_v4a_patch_paths_for_host(patch: str, path_to_resolved: dict, file_ops) -> str:
     """Rewrite V4A file headers to the resolved host paths (host backends only).
 
@@ -155,13 +175,195 @@ def _rewrite_v4a_patch_paths_for_host(patch: str, path_to_resolved: dict, file_o
     """
     if not _file_ops_uses_host_paths(file_ops):
         return patch
+    return _apply_v4a_header_rewrite(patch, path_to_resolved)
 
-    def _res(raw: str) -> str:
-        raw = raw.strip()
-        return path_to_resolved.get(raw) or raw
 
-    patch = _V4A_SINGLE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_res(m.group(3))}", patch)
-    return _V4A_MOVE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_res(m.group(2))} -> {_res(m.group(3))}", patch)
+def _resolve_v4a_policy_target(path: str, file_ops) -> str | None:
+    """Backend-canonical form of a raw V4A header path, for the auto-approval
+    BOUNDARY CHECK only -- never for the patch body actually sent to the backend.
+
+    For a non-host (SSH/container/sandbox) backend, ``_rewrite_v4a_patch_paths_for_host``
+    deliberately leaves a relative header untouched: ``read_file_raw()`` and
+    ``patch_v4a()`` hand it straight to the backend's shell, which resolves it
+    against THAT backend's own live cwd (``ShellFileOperations._exec`` always
+    runs with ``cwd=effective_cwd`` from ``self.env.cwd``/``self.cwd``).
+    ``acp_adapter/edit_approval.py`` used to store that identical raw string as
+    the auto-approval policy target, which ``should_auto_approve_edit`` then fed
+    to a HOST-side ``pathlib.Path.resolve()`` -- resolving a path meant for the
+    backend's namespace against this ACP process's own cwd instead. If the ACP
+    process happened to be launched inside the workspace, a relative header that
+    actually lands OUTSIDE the workspace on the backend (because the agent
+    ``cd``-ed there) could still resolve, on the host, to something that looks
+    workspace-local -- misclassifying an out-of-workspace write as safe to
+    auto-approve.
+
+    This reproduces the backend's OWN resolution rule instead, with no shell
+    round-trip: the same no-exec join ``tools/file_operations_search.py``'s
+    ``_effective_macos_search_exclusions`` already uses for the identical
+    "where does this land on a non-host backend" question. An absolute header
+    is normalized as-is; a relative one is joined onto the backend's live
+    ``env.cwd`` (falling back to ``file_ops.cwd``) and normalized with
+    ``posixpath`` (every non-host backend -- SSH, Docker, Singularity, Modal,
+    Daytona, Vercel Sandbox -- is POSIX).
+
+    A leading ``~`` is intentionally NOT expanded here (that needs a live shell
+    round-trip against the backend's own ``$HOME``, see
+    ``ShellFileOperations._expand_path``) -- a tilde-prefixed header returns
+    ``None`` instead of guessing, so the caller fails CLOSED.
+
+    Returns ``None`` when no backend cwd is knowable at all (a malformed
+    environment or bare test double): callers must treat that as "cannot
+    verify workspace membership" and deny auto-approval rather than falling
+    back to a host-side guess -- the exact failure mode this function exists
+    to close.
+    """
+    if path.startswith("~"):
+        return None
+    if posixpath.isabs(path):
+        return posixpath.normpath(path)
+    cwd = getattr(getattr(file_ops, "env", None), "cwd", None) or getattr(file_ops, "cwd", None)
+    if not cwd:
+        return None
+    return posixpath.normpath(posixpath.join(str(cwd), path))
+
+
+def _verify_realpath_within_any(
+    resolved_path: str, boundaries: tuple, file_ops, *, dereference_final: bool = True,
+) -> bool:
+    """Confirm ``resolved_path`` -- a LEXICALLY workspace-local V4A policy
+    target on a non-host (SSH/container/sandbox) backend, from
+    ``_resolve_v4a_policy_target`` -- ALSO stays within one of
+    ``boundaries`` once the backend follows any REAL symlink along the way.
+
+    ``_resolve_v4a_policy_target``'s plain ``posixpath.normpath`` join never
+    inspects the backend's actual filesystem: a workspace-internal symlink
+    the host cannot see (e.g. ``/workspace/link -> /outside``) makes an
+    apparently in-workspace target (``/workspace/link/file``) resolve, once
+    the backend's own shell actually applies the patch, to a location
+    entirely outside every boundary -- silently escaping the workspace
+    without ever prompting for approval, since a purely lexical containment
+    check (host-side ``Path.resolve()`` cannot see a symlink that only
+    exists on the backend either) would still call it workspace-local.
+
+    This runs ONE bounded, read-only shell round-trip against the backend's
+    own shell (the only vantage point that can see that symlink at all)
+    before letting ``should_auto_approve_edit`` skip the prompt, and fails
+    CLOSED (returns ``False``) on any probe failure, missing ``_exec``/
+    ``_escape_shell_arg`` (a bare test double, or a backend that cannot run
+    commands), empty result, or non-zero exit -- "cannot verify" must
+    never be treated as "verified safe".
+
+    ``readlink -f``/``realpath`` themselves require every component but
+    the LAST to already exist -- so a brand-new nested target
+    (``write_file``/V4A ADD create missing parent directories on write,
+    e.g. ``/workspace/newdir/file.py`` when ``newdir`` doesn't exist yet)
+    would otherwise always fail this probe and force an unnecessary
+    prompt. The script instead walks UP from ``resolved_path`` to the
+    NEAREST EXISTING ancestor, resolves THAT ancestor's real path (a
+    nonexistent path component cannot itself be a symlink, so it needs no
+    resolution), and appends the missing suffix back on literally.
+
+    The walk-up stops at (and resolves) a DANGLING symlink too, not just a
+    missing path: a plain ``-e`` test follows symlinks, so a symlink whose
+    target doesn't exist (e.g. ``/workspace/link -> /outside/new.txt``,
+    ``new.txt`` not yet created) reads as "missing" and a ``-e``-only loop
+    would walk PAST it to its parent, reconstructing the symlink's own
+    lexical path and never resolving where it actually points -- the exact
+    escape this function exists to catch, since the real ``_atomic_write()``
+    explicitly checks ``-L`` and follows a dangling symlink the same as a
+    live one. ``readlink -f`` handles a dangling symlink correctly (it
+    resolves to the link's target even when that target doesn't exist).
+
+    Every ``boundary`` is resolved through this SAME walk-up-and-canonicalize
+    script too, in the SAME round-trip as ``resolved_path`` -- not compared
+    against its own lexical spelling. If the workspace boundary itself is a
+    symlink on the backend (e.g. ``/workspace -> /srv/project``), a target
+    the backend reports as ``/srv/project/file`` would otherwise never match
+    the unresolved ``/workspace`` string, failing every legitimate
+    ``workspace_session`` edit closed and defeating the auto-approval
+    feature entirely for that (common) setup.
+
+    ``dereference_final`` -- when False (a V4A ``Delete`` target or a
+    ``Move``'s source: see ``EditProposal.target_dereference_final`` and
+    ``_extract_v4a_patch_paths``) -- resolves only ``resolved_path``'s
+    PARENT chain and reattaches its own basename literally, WITHOUT ever
+    following a symlink that sits at the target's own final path
+    component. ``Path.unlink()`` and a ``mv`` source operate on the
+    filesystem entry itself, never on whatever it points to, so verifying
+    via the fully-dereferenced target (the default, correct for a
+    write-through op like ``write_file``/``patch_replace``/V4A
+    ``Update``/``Add``) would check the WRONG location here: a
+    workspace-local symlink pointing outside the workspace must still
+    count as an in-workspace target for a delete or move-source, since
+    removing or moving away the link itself never touches whatever it
+    points to. Every boundary is still fully dereferenced regardless of
+    this flag -- it only changes how the TARGET's own final component is
+    treated.
+    """
+    exec_fn = getattr(file_ops, "_exec", None)
+    quote = getattr(file_ops, "_escape_shell_arg", None)
+    if exec_fn is None or quote is None:
+        return False
+
+    def _walkup_snippet(tag: str, value: str) -> str:
+        arg = quote(value)
+        return (
+            f"p={arg}; suffix=''; "
+            'while [ ! -e "$p" ] && [ ! -L "$p" ] && [ "$p" != "/" ] && [ -n "$p" ]; do '
+            'suffix="/$(basename "$p")$suffix"; p="$(dirname "$p")"; done; '
+            'real="$(readlink -f "$p" 2>/dev/null || realpath "$p" 2>/dev/null)"; '
+            f'[ -n "$real" ] && printf \'{tag}\\t%s%s\\n\' "$real" "$suffix"'
+        )
+
+    def _walkup_snippet_no_final_deref(tag: str, value: str) -> str:
+        # Same walk-up, but seeded from the PARENT of `value` with the
+        # target's own basename pre-loaded into `suffix` -- so `readlink
+        # -f`/`realpath` is only ever invoked on an ancestor, never on
+        # `value` itself, even when `value` exists and is itself a symlink.
+        arg = quote(value)
+        return (
+            f'full={arg}; base="$(basename "$full")"; p="$(dirname "$full")"; suffix="/$base"; '
+            'while [ ! -e "$p" ] && [ ! -L "$p" ] && [ "$p" != "/" ] && [ -n "$p" ]; do '
+            'suffix="/$(basename "$p")$suffix"; p="$(dirname "$p")"; done; '
+            'real="$(readlink -f "$p" 2>/dev/null || realpath "$p" 2>/dev/null)"; '
+            f'[ -n "$real" ] && printf \'{tag}\\t%s%s\\n\' "$real" "$suffix"'
+        )
+
+    target_snippet = (
+        _walkup_snippet("T", resolved_path)
+        if dereference_final
+        else _walkup_snippet_no_final_deref("T", resolved_path)
+    )
+    named_boundaries = [(f"B{i}", b) for i, b in enumerate(boundaries) if b]
+    try:
+        script = "; ".join(
+            [target_snippet]
+            + [_walkup_snippet(tag, str(b)) for tag, b in named_boundaries]
+        )
+        result = exec_fn(script)
+    except Exception:
+        return False
+    if getattr(result, "exit_code", 1) != 0:
+        return False
+    output = (getattr(result, "stdout", "") or "").strip()
+    if not output:
+        return False
+    resolved_by_tag: dict[str, str] = {}
+    for line in output.splitlines():
+        tag, _, value = line.partition("\t")
+        if value:
+            resolved_by_tag[tag] = value
+    target_real = resolved_by_tag.get("T")
+    if not target_real:
+        return False
+    normalized = posixpath.normpath(target_real)
+    return any(
+        (tag in resolved_by_tag) and (
+            normalized == posixpath.normpath(resolved_by_tag[tag])
+            or normalized.startswith(posixpath.normpath(resolved_by_tag[tag]).rstrip("/") + "/")
+        )
+        for tag, _ in named_boundaries
+    )
 
 
 def _is_blocked_device_path(path: str) -> bool:

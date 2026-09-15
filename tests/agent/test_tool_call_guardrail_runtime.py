@@ -282,7 +282,8 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
         observed["plugin"].append((name, dict(args)))
         return (None, None)
 
-    def observe_approval(name, args):
+    def observe_approval(name, args, **kwargs):
+        del kwargs
         observed["approval"].append((name, dict(args)))
         return None
 

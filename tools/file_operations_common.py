@@ -25,9 +25,17 @@ class ReadResult:
     dimensions: Optional[str] = None  # For images: "WIDTHxHEIGHT"
     error: Optional[str] = None
     similar_files: List[str] = field(default_factory=list)
+    # Leading-underscore: internal-only, deliberately excluded from to_dict()
+    # (whose key set is pinned by tests / read by the model) -- True when
+    # read_file_raw() stripped a leading UTF-8 BOM from `content`. A caller
+    # that must reproduce a BYTE-accurate window of the ON-DISK file (see
+    # acp_adapter/edit_approval.py's _byte_capped_sample use) needs this to
+    # account for the 3 BOM bytes `content` itself no longer has.
+    _had_bom: bool = False
 
     def to_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items() if v is not None and v != []}
+        return {k: v for k, v in self.__dict__.items()
+                if not k.startswith("_") and v is not None and v != []}
 
 
 @dataclass
@@ -204,13 +212,48 @@ def _detect_line_ending(sample: str) -> Optional[str]:
     """Dominant line ending of ``sample`` (``\\r\\n`` if any CRLF in the first 4KB,
     else ``\\n``), or None for empty/single-line content. Preserves a file's
     endings across write_file/patch: bare-LF tool args would otherwise silently
-    normalize CRLF files, and patch would produce mixed endings."""
+    normalize CRLF files, and patch would produce mixed endings.
+
+    ``sample[:4096]`` here is a CHARACTER slice, not a byte slice: a caller
+    that already holds the full file text (rather than a live ``head -c
+    4096`` probe result) should pass it through ``_byte_capped_sample``
+    first if it must agree with that byte-based probe -- see that
+    function's docstring.
+    """
     head = sample[:4096] if sample else ""
     if "\r\n" in head:
         return "\r\n"
     if "\n" in head:
         return "\n"
     return None
+
+
+def _byte_capped_sample(text: str, limit_bytes: int = 4096) -> str:
+    """Return the longest prefix of ``text`` whose UTF-8 encoding is at most
+    ``limit_bytes`` bytes -- the same BYTE window a live ``head -c
+    <limit_bytes>`` probe reads (see
+    ``ShellFileOperations._probe_write_target``), reproduced in pure Python
+    for a caller that already holds the full text in memory and must not
+    pay a second shell round-trip just to derive it.
+
+    ``_detect_line_ending``'s own ``sample[:4096]`` is a CHARACTER slice:
+    for text with enough multibyte characters that the encoded byte length
+    diverges meaningfully from the character length (e.g. thousands of
+    emoji ahead of the first newline), character index 4096 can sit well
+    PAST byte offset 4096 -- seeing a newline the real ``head -c 4096``
+    probe never would, and so disagreeing with it about the file's
+    dominant line ending. Slicing by encoded byte length first keeps the
+    two in agreement.
+    """
+    if not text:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit_bytes:
+        return text
+    # Decode the byte-limited prefix, tolerating a multibyte codepoint the
+    # cut point lands in the middle of (exactly the same ambiguous boundary
+    # a live `head -c N` probe can hand back) rather than raising.
+    return encoded[:limit_bytes].decode("utf-8", errors="ignore")
 
 
 def _normalize_line_endings(text: str, target: str) -> str:

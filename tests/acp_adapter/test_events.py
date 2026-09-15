@@ -70,6 +70,34 @@ class TestToolProgressCallback:
         assert mock_conn.session_update.called or coro is not None
 
 
+    def test_edit_preview_uses_root_session_id_as_task_id(self, mock_conn, event_loop_fixture):
+        """A root (non-delegated) write_file/patch preview must resolve
+        against the session's own task id, not the "default" task."""
+        loop = event_loop_fixture
+        captured = {}
+
+        def fake_build_edit_proposal(name, args, task_id="default"):
+            captured["task_id"] = task_id
+            return None
+
+        cb = make_tool_progress_cb(
+            mock_conn, "root-session", loop, {}, {},
+            edit_approval_policy_getter=lambda: ("session", None),
+        )
+
+        with (
+            patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts,
+            patch(
+                "acp_adapter.edit_approval.build_edit_proposal",
+                side_effect=fake_build_edit_proposal,
+            ),
+        ):
+            future = MagicMock(spec=Future)
+            future.result.return_value = None
+            mock_rcts.return_value = future
+            cb("tool.started", "write_file", None, {"path": "x.txt", "content": "y"})
+
+        assert captured["task_id"] == "root-session"
 
     def test_duplicate_same_name_tool_calls_use_fifo_ids(self, mock_conn, event_loop_fixture):
         """Multiple same-name tool calls should be tracked independently in order."""

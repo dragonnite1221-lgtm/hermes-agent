@@ -556,6 +556,69 @@ class TestApplyDelete:
         # unified_diff produces nothing for two empty inputs — fallback comment expected
         assert "Deleted" in result.diff or result.diff.strip() == ""
 
+    def test_delete_of_non_image_binary_file_succeeds(self):
+        """A DELETE targeting a real (non-image) binary file must succeed.
+
+        read_file_raw() legitimately sets ``.error`` for binary content it
+        can't decode as text (``is_binary=True``, unlike an image, which
+        sets no ``.error`` at all) -- but the path DOES exist either way.
+        Deleting it (``file_ops.delete_file()`` -> ``Path.unlink()``) never
+        needs to read that content, so validation/apply must not conflate
+        "exists but unreadable as text" with "file not found for deletion"
+        the way a genuinely missing path is.
+        """
+        patch = """\
+*** Begin Patch
+*** Delete File: binary.dat
+*** End Patch"""
+        ops, err = parse_v4a_patch(patch)
+        assert err is None
+
+        class FakeFileOps:
+            deleted = False
+
+            def read_file_raw(self, path):
+                return SimpleNamespace(
+                    content="", error="Binary file (17 bytes) -- content not shown",
+                    is_binary=True, is_image=False,
+                )
+
+            def delete_file(self, path):
+                self.deleted = True
+                return SimpleNamespace(error=None)
+
+        file_ops = FakeFileOps()
+        result = apply_v4a_operations(ops, file_ops)
+
+        assert result.success is True, result.error
+        assert file_ops.deleted is True
+
+    def test_delete_of_genuinely_missing_file_still_fails(self):
+        """The binary carve-out above must never become a blanket accept
+        for every read error: a path with NO is_binary/is_image flag at
+        all (a plain "does not exist") must still fail deletion, and
+        delete_file() must never even be called for it."""
+        patch = """\
+*** Begin Patch
+*** Delete File: ghost.py
+*** End Patch"""
+        ops, err = parse_v4a_patch(patch)
+        assert err is None
+
+        class FakeFileOps:
+            def read_file_raw(self, path):
+                return SimpleNamespace(
+                    content=None, error=f"File not found: {path}",
+                    is_binary=False, is_image=False,
+                )
+
+            def delete_file(self, path):
+                raise AssertionError("delete_file must not be called for a missing path")
+
+        result = apply_v4a_operations(ops, FakeFileOps())
+        assert result.success is False
+        assert "not found" in result.error.lower()
+
 
 class TestCountOccurrences:
     def test_basic(self):

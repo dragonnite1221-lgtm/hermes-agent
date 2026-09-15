@@ -161,6 +161,31 @@ def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> Lis
         r = file_ops.read_file_raw(path)
         return (None, r.error) if r.error else (r.content, None)
 
+    def _exists(path: str) -> bool:
+        """Whether `path` currently exists, per the SAME overlay `_read()`
+        consults -- but, unlike `_read()`, a binary/image file that exists
+        and simply can't be decoded as TEXT still counts as existing here.
+        DELETE and a MOVE's source/destination checks only need to know
+        whether an entry is present, never its text content, so
+        read_file_raw()'s binary ``.error`` (a real message, but with
+        ``is_binary``/``is_image`` set -- the path WAS found, just not
+        readable as text) must never be conflated with a genuinely missing
+        path, the only case that should legitimately block a delete or
+        move. UPDATE keeps using `_read()` directly and correctly still
+        fails on binary content, since applying text hunks to it is
+        meaningless regardless of whether the path exists.
+        """
+        if path in pending_content:
+            return True
+        if path in removed_paths:
+            return False
+        r = file_ops.read_file_raw(path)
+        # getattr: some test doubles (and any future minimal file_ops
+        # implementation) only set .content/.error, not .is_binary/
+        # .is_image -- those are meaningless in the same request there, and
+        # ReadResult's own real default for both is False.
+        return not r.error or getattr(r, "is_binary", False) or getattr(r, "is_image", False)
+
     def _validate_update(op: PatchOperation) -> None:
         nonlocal real_change_count
         simulated, read_err = _read(op.file_path)
@@ -208,7 +233,7 @@ def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> Lis
             continue
         real_change_count += 1
         if op.operation == OperationType.DELETE:
-            if _read(op.file_path)[1]:
+            if not _exists(op.file_path):
                 errors.append(f"{op.file_path}: file not found for deletion")
             else:
                 _remove(op.file_path)
@@ -216,12 +241,13 @@ def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> Lis
             if not op.new_path:
                 errors.append(f"{op.file_path}: MOVE operation missing destination path")
                 continue
-            src_content, src_err = _read(op.file_path)
-            if src_err:
+            src_exists = _exists(op.file_path)
+            if not src_exists:
                 errors.append(f"{op.file_path}: source file not found for move")
-            if not _read(op.new_path)[1]:
+            if _exists(op.new_path):
                 errors.append(f"{op.new_path}: destination already exists — move would overwrite")
-            elif not src_err:  # only a cleanly-validated move updates the overlay
+            elif src_exists:  # only a cleanly-validated move updates the overlay
+                src_content, _src_err = _read(op.file_path)
                 pending_content[op.new_path] = src_content if src_content is not None else ""
                 _remove(op.file_path)
         elif op.operation == OperationType.ADD:
@@ -337,7 +363,14 @@ def _apply_add(op: PatchOperation, file_ops: Any) -> ApplyResult:
 def _apply_delete(op: PatchOperation, file_ops: Any) -> ApplyResult:
     """Delete a file, producing a real unified diff of the removed content."""
     read_result = file_ops.read_file_raw(op.file_path)  # re-read guards validate/apply races
-    if read_result.error:
+    # A binary/image file's read_file_raw() legitimately sets .error (it
+    # can't be decoded as text) while still confirming the path EXISTS
+    # (is_binary/is_image=True) -- deleting it needs no text content at
+    # all, so only a genuinely missing path (.error set, neither flag)
+    # should fail this. See _validate_operations's matching `_exists()`.
+    if read_result.error and not getattr(read_result, "is_binary", False) and not getattr(
+        read_result, "is_image", False
+    ):
         return _fail(f"Cannot delete {op.file_path}: file not found")
     result = file_ops.delete_file(op.file_path)
     diff = _unified_diff(op.file_path, read_result.content, None) or f"# Deleted: {op.file_path}"

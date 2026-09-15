@@ -507,6 +507,20 @@ def _resolve_task_host_cwd(config: Dict[str, Any], task_id: Optional[str]) -> Op
     """
     if config.get("env_type") != "docker" or not config.get("docker_mount_cwd_to_workspace"):
         return None
+    # Mirrors DockerEnvironment._mount_args()'s own precedence: an explicit
+    # user docker_volumes entry already bound at /workspace ("workspace_
+    # explicitly_mounted" there) takes priority over the automatic cwd
+    # mount, which _mount_args() then skips entirely regardless of
+    # docker_mount_cwd_to_workspace (bind_host_cwd requires `not
+    # workspace_explicitly_mounted`). Reporting host_cwd here anyway would
+    # tell every caller of this function -- including edit_approval.py's
+    # _resolve_workspace_boundary -- that /workspace maps to the client's
+    # project cwd when the container's ACTUAL /workspace is some unrelated
+    # user-configured volume, letting workspace_session auto-approve edits
+    # to files outside the client's project entirely.
+    volumes = config.get("docker_volumes") or []
+    if any(isinstance(vol, str) and ":/workspace" in vol for vol in volumes):
+        return None
     # Top-level CLI parent ("default") is a single-session process — legacy behavior.
     if not _docker_session_isolation_enabled() or _resolve_container_task_id(task_id) == "default":
         return config.get("host_cwd")

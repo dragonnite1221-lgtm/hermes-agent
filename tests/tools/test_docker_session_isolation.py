@@ -218,6 +218,31 @@ class TestSessionScopedMountResolution:
         cfg["env_type"] = "modal"
         assert terminal_tool._resolve_task_host_cwd(cfg, "t") is None
 
+    def test_explicit_workspace_volume_overrides_the_cwd_mount(self, monkeypatch):
+        """DockerEnvironment._mount_args() skips its automatic host-cwd
+        bind mount entirely once a user ``docker_volumes`` entry already
+        claims ``/workspace`` (``workspace_explicitly_mounted`` there) --
+        the explicit volume wins, regardless of
+        ``docker_mount_cwd_to_workspace``. This function must agree,
+        or ``edit_approval.py``'s ``_resolve_workspace_boundary`` would
+        treat that unrelated user volume as the ACP client's own project
+        boundary, letting ``workspace_session`` auto-approve edits to
+        files entirely outside the client's actual project.
+        """
+        _disable_isolation(monkeypatch)
+        cfg = self._config()
+        cfg["docker_volumes"] = ["/srv/other-project:/workspace"]
+        assert terminal_tool._resolve_task_host_cwd(cfg, "tui:sess-1") is None
+
+    def test_unrelated_docker_volume_does_not_suppress_the_cwd_mount(self, monkeypatch):
+        """A docker_volumes entry mounting somewhere OTHER than /workspace
+        must not be mistaken for an explicit workspace override -- the
+        ordinary automatic cwd mount still applies."""
+        _disable_isolation(monkeypatch)
+        cfg = self._config()
+        cfg["docker_volumes"] = ["/srv/cache:/root/.cache"]
+        assert terminal_tool._resolve_task_host_cwd(cfg, "tui:sess-1") == "/Users/prev/dev/oldrepo"
+
 
 class TestRecordedHostCwdDiscardedOnContainers:
     """_resolve_command_cwd must not cd to a recorded HOST path in a sandbox.

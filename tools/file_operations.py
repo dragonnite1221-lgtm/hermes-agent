@@ -101,8 +101,16 @@ class FileOperations(ABC):
         """Read a file with pagination support."""
 
     @abstractmethod
-    def read_file_raw(self, path: str) -> ReadResult:
-        """Whole file as a plain string: no pagination, line numbers or clamping."""
+    def read_file_raw(self, path: str, *, strip_fence_leaks: bool = True) -> ReadResult:
+        """Whole file as a plain string: no pagination, line numbers or clamping.
+
+        ``strip_fence_leaks=False`` skips ``_strip_terminal_fence_leaks``'s
+        cleanup of leaked terminal wrapper noise (OSC sequences, fence
+        markers) so callers that must match the real ``patch_replace()``
+        write path -- which reads OLD content via a bare shell read with no
+        such stripping -- see identical bytes to what will actually be
+        matched/written. Default True preserves the normal read-tool/V4A
+        behavior."""
 
     @abstractmethod
     def write_file(self, path: str, content: str, pre_content: Optional[str] = None) -> WriteResult:
@@ -980,8 +988,13 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         scored.sort(key=lambda x: -x[0])
         return ReadResult(error=f"File not found: {path}", similar_files=[fp for _, fp in scored[:5]])
 
-    def read_file_raw(self, path: str) -> ReadResult:
-        """Whole file as a plain string (no pagination/line numbers/clamping)."""
+    def read_file_raw(self, path: str, *, strip_fence_leaks: bool = True) -> ReadResult:
+        """Whole file as a plain string (no pagination/line numbers/clamping).
+
+        ``strip_fence_leaks=False``: see the abstract method's docstring --
+        used when a caller must match ``patch_replace()``'s own unstripped
+        read of OLD content (that method reads via a bare shell command, not
+        this one, and applies no such stripping)."""
         path = self._expand_path(path)
         file_size, status = self._probe_regular_file(path)
         if status == "missing":
@@ -1000,8 +1013,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             return ReadResult(error=f"Failed to read file: {cat_result.stdout}")
         # Strip a leading BOM (a phantom U+FEFF defeats an exact first-line match);
         # write_file re-probes disk and restores it.
-        raw_content, _ = _strip_bom(_strip_terminal_fence_leaks(cat_result.stdout))
-        return ReadResult(content=raw_content, file_size=file_size)
+        stdout = _strip_terminal_fence_leaks(cat_result.stdout) if strip_fence_leaks else cat_result.stdout
+        raw_content, had_bom = _strip_bom(stdout)
+        return ReadResult(content=raw_content, file_size=file_size, _had_bom=had_bom)
 
     def read_file_bytes(self, path: str, max_bytes: Optional[int] = None) -> ReadResult:
         """Read binary-safe bytes (as base64) from any shell-backed environment."""
@@ -1088,6 +1102,28 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                 f"surrogate character ({m.group(0)!r}) that cannot be "
                 "encoded as UTF-8. The file was NOT created or modified."))
         return None
+
+    @staticmethod
+    def _write_wants_pre_content(ext: str, file_ops) -> bool:
+        """Whether ``write_file()``'s real probe reads FULL pre-content
+        (feeding a CHARACTER-based ``_detect_line_ending`` call) rather than
+        a byte-capped live ``head -c 4096`` sample -- true for any
+        extension covered by in-process linting or a registered LSP server,
+        since pre-content also feeds diagnostics/lint-delta/the line-shift
+        map for those files (see ``_probe_write_target``'s ``want_pre``
+        branch).
+
+        Module-level (not just inlined in ``write_file()``) so
+        ``acp_adapter/edit_approval.py``'s preview can reach the IDENTICAL
+        decision when choosing between a byte-capped and a full-text
+        line-ending sample -- a duplicated inline check here and there
+        could silently drift apart again exactly like the byte-window fix
+        this mirrors.
+        """
+        if ext in LINTERS_INPROC:
+            return True
+        handles = getattr(file_ops, "_lsp_handles_extension", None)
+        return bool(handles and handles(ext))
 
     @staticmethod
     def _fail_closed_syntax_error(path: str, ext: str, content: str) -> Optional[WriteResult]:
@@ -1243,7 +1279,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
 
         # Pre-content is read only for extensions in the UNION of in-process lint and
         # LSP coverage (keeps the hot path fast for binaries).
-        want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
+        want_pre = self._write_wants_pre_content(ext, self)
         has_bom, pre_content, original_ending = self._probe_write_target(path, pre_content, want_pre)
         # read_file strips the BOM and models send bare-LF text, so a round-trip would
         # otherwise normalize CRLF files and drop the BOM (prepend only when absent).

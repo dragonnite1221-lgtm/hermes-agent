@@ -82,7 +82,28 @@ def make_tool_progress_cb(
     Signature: ``tool_progress_callback(event_type, name, preview, args, **kwargs)``.
     Emits ``ToolCallStart`` for ``tool.started`` and tracks IDs in a FIFO per tool
     name so parallel same-name calls complete against the right ACP tool call.
-    Other event types (``tool.completed``, ``reasoning.available``) are ignored."""
+    Other event types (``tool.completed``, ``reasoning.available``) are ignored.
+
+    NOTE on delegated (``delegate_task``) children: ``tools/delegate_tool.py``
+    relays a child's tool-started event to this SAME callback as event type
+    ``"subagent.tool"``, not ``"tool.started"`` -- so it is filtered out
+    below and never reaches ``ToolCallStart``/the auto-approval preview at
+    all today. Accepting ``"subagent.tool"`` here was tried and reverted:
+    ``make_step_cb``'s completion pairing pops IDs from the SAME name-keyed
+    FIFO queue driven only by the ROOT agent's own ``prev_tools``, so a
+    child's queued id would get silently completed by an unrelated root call
+    of the same tool name (or never completed at all), corrupting ACP
+    tool-call lifecycle tracking for BOTH the child and whatever root call
+    popped its id. Because of that, this callback -- and the edit-approval
+    preview it builds below -- only ever runs for the ROOT agent's own calls,
+    so ``task_id`` is always ``session_id``. Surfacing delegated children's
+    tool calls (and their own edit-approval previews) correctly needs their
+    own start/complete correlation (e.g. keyed by ``subagent_id`` + tool
+    name) -- a separate, not-yet-built feature; do not thread a per-event
+    ``subagent_id`` through here as groundwork for it without that real
+    correlation, since it would never actually run (see above) and is
+    untestable against the real relay path.
+    """
 
     def _tool_progress(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
         if event_type != "tool.started":
@@ -109,10 +130,15 @@ def make_tool_progress_cb(
             try:
                 from acp_adapter.edit_approval import build_edit_proposal, should_auto_approve_edit
 
-                proposal = build_edit_proposal(name, args)
+                # session_id doubles as the ACP task id for the root call
+                # (see acp_adapter/session.py's _register_task_cwd). This
+                # callback only ever fires for the root agent's own calls
+                # (see the NOTE in make_tool_progress_cb's docstring), so
+                # session_id is always the right task id here.
+                proposal = build_edit_proposal(name, args, task_id=session_id)
                 if proposal is not None:
                     policy, cwd = edit_approval_policy_getter()
-                    if should_auto_approve_edit(proposal, policy, cwd):
+                    if should_auto_approve_edit(proposal, policy, cwd, task_id=session_id):
                         edit_diff = proposal
             except Exception:
                 logger.debug("Failed to prepare auto-approved ACP edit diff for %s", name, exc_info=True)
