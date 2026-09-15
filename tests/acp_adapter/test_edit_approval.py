@@ -20,6 +20,30 @@ def teardown_function() -> None:
     set_edit_approval_requester(None)
 
 
+def _fake_walkup_exec(command: str, overrides: dict[str, str] | None = None):
+    """Test double for a non-host backend's ``_exec``, matching
+    ``tools.file_tools._verify_realpath_within_any``'s combined walk-up
+    script: it resolves the target AND every boundary in ONE round-trip,
+    each tagged (``T`` for the target, ``B0``/``B1``/... for the
+    boundaries, in order) and emitted as ``TAG\\t<value>`` lines.
+
+    By default every requested path "resolves" to itself (no symlink
+    involved) -- pass ``overrides`` (``{requested_path: real_path}``) to
+    simulate a symlink for a specific one (typically the target, to
+    exercise the escape-detection path; a boundary override exercises the
+    boundary-is-itself-a-symlink case).
+    """
+    import re
+
+    from tools.file_operations import ExecuteResult
+
+    overrides = overrides or {}
+    tags = re.findall(r"printf '(\w+)\\t", command)
+    requested = re.findall(r"p='([^']*)';", command)
+    lines = [f"{tag}\t{overrides.get(raw, raw)}" for tag, raw in zip(tags, requested)]
+    return ExecuteResult(stdout="\n".join(lines) + "\n", exit_code=0)
+
+
 def test_acp_permission_tool_call_uses_edit_kind_and_diff_content():
     proposal = EditProposal(
         tool_name="write_file",
@@ -853,16 +877,23 @@ def test_v4a_preview_on_non_host_backend_does_not_resolve_via_host_resolver(monk
     host-resolved paths ONLY for a host-paths backend
     (``_file_ops_uses_host_paths``); for a non-host (SSH/container/sandbox)
     backend it leaves headers untouched and lets THAT backend's own shell
-    resolve them against its own live cwd. The preview must do the same --
-    resolving via ``_resolve_edit_path`` (host-anchored) would preview a
-    path the real V4A apply never even looks at.
+    resolve them against its own live cwd. The preview must never call the
+    HOST resolver (``_resolve_edit_path``/``_resolve_path_for_task``) for
+    such a target -- that would preview a path the real V4A apply never
+    even looks at.
 
-    ``resolved_target_paths`` (used only by ``should_auto_approve_edit``'s
-    policy check, never for the patch body itself) must still land on a
-    BACKEND-canonical location -- ``tools.file_tools._resolve_v4a_policy_target``
-    joining the raw header onto the backend's own live ``env.cwd`` with a
-    plain ``posixpath`` join, no shell round-trip -- rather than the raw,
-    un-anchored header string a bare host resolve was leaving behind.
+    The preview instead reads via the SAME backend-canonical path
+    (``tools.file_tools._resolve_v4a_policy_target``, joining the raw
+    header onto the backend's own live ``env.cwd`` with a plain
+    ``posixpath`` join, no shell round-trip) that
+    ``resolved_target_paths`` uses for the policy check -- resolving ONCE
+    and reading that SAME resolved value (rather than handing the backend
+    the raw relative header to resolve itself, independently, at read
+    time) closes a shared-backend race between the preview read and the
+    policy/freeze resolution; see
+    ``test_v4a_preview_reads_the_same_snapshot_used_for_policy_resolution``.
+    The patch BODY sent to the backend for actual execution stays
+    untouched either way (asserted via the patch string itself below).
     """
     from tools.file_operations import ReadResult
 
@@ -875,7 +906,8 @@ def test_v4a_preview_on_non_host_backend_does_not_resolve_via_host_resolver(monk
         env = FakeNonHostEnv()
 
         def read_file_raw(self, path, **kwargs):
-            assert path == "relative.txt"  # raw, unresolved
+            # The backend-canonical resolved path, NOT the raw header.
+            assert path == "/remote/base/relative.txt"
             return ReadResult(content="container content\n")
 
     monkeypatch.setattr(
@@ -894,9 +926,11 @@ def test_v4a_preview_on_non_host_backend_does_not_resolve_via_host_resolver(monk
 
     assert proposal.old_text == "container content\n"
     # The policy-check target is backend-canonical ("/remote/base/relative.txt"),
-    # NOT the raw un-anchored header -- but the patch body handed to the
-    # backend (asserted inside read_file_raw above) stays untouched.
+    # NOT the raw un-anchored header -- and the patch BODY handed to the
+    # backend for actual execution stays untouched (relative header intact;
+    # freezing only happens after approval, in maybe_require_edit_approval).
     assert proposal.resolved_target_paths == ("/remote/base/relative.txt",)
+    assert proposal.new_text == patch_body
 
 
 def test_v4a_auto_approval_on_non_host_backend_uses_backend_cwd_not_host_resolve(
@@ -1076,9 +1110,7 @@ def test_workspace_auto_approval_maps_boundary_into_docker_workspace_mount(tmp_p
             return f"'{arg}'"
 
         def _exec(self, command, **kwargs):
-            from tools.file_operations import ExecuteResult
-
-            return ExecuteResult(stdout="/workspace/x.txt\n", exit_code=0)
+            return _fake_walkup_exec(command)
 
     monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeDockerBackend())
     monkeypatch.setattr(
@@ -1129,7 +1161,7 @@ def test_v4a_auto_approval_denies_a_non_host_symlink_escape(tmp_path, monkeypatc
     reports a real location outside every boundary.
     """
     import tools.terminal_tool as terminal_tool
-    from tools.file_operations import ExecuteResult, ReadResult
+    from tools.file_operations import ReadResult
 
     task_id = "non-host-symlink-escape-task"
     host_workspace = tmp_path / "host-workspace"
@@ -1151,7 +1183,7 @@ def test_v4a_auto_approval_denies_a_non_host_symlink_escape(tmp_path, monkeypatc
             # Simulates the backend's real filesystem: /workspace/link is a
             # symlink to /outside, so the target's REAL path lands entirely
             # outside both /workspace and the host-mapped boundary.
-            return ExecuteResult(stdout="/outside/file.txt\n", exit_code=0)
+            return _fake_walkup_exec(command, {"/workspace/link/file.txt": "/outside/file.txt"})
 
     monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeDockerBackend())
     monkeypatch.setattr(
@@ -1311,7 +1343,7 @@ def test_v4a_auto_approval_denies_a_non_host_symlink_escape_via_the_tmp_exemptio
     ``return``ed immediately, so the live ``verify_backend`` gate below it
     was never even reached for this branch.
     """
-    from tools.file_operations import ExecuteResult, ReadResult
+    from tools.file_operations import ReadResult
 
     monkeypatch.setattr(tempfile, "gettempdir", lambda: "/tmp")
 
@@ -1332,7 +1364,7 @@ def test_v4a_auto_approval_denies_a_non_host_symlink_escape_via_the_tmp_exemptio
         def _exec(self, command, **kwargs):
             # Simulates the backend's real filesystem: /tmp/link is a
             # symlink to /outside.
-            return ExecuteResult(stdout="/outside/file.txt\n", exit_code=0)
+            return _fake_walkup_exec(command, {"/tmp/link/file.txt": "/outside/file.txt"})
 
     monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend())
 
@@ -1442,7 +1474,7 @@ def test_verify_backend_accepts_the_remote_temp_root_alongside_workspace_boundar
     ``tempfile.gettempdir()``) would be wrongly denied by the verify step
     for landing outside the (unrelated) workspace.
     """
-    from tools.file_operations import ExecuteResult, ReadResult
+    from tools.file_operations import ReadResult
 
     monkeypatch.setattr(tempfile, "gettempdir", lambda: "/tmp")
 
@@ -1463,7 +1495,7 @@ def test_verify_backend_accepts_the_remote_temp_root_alongside_workspace_boundar
         def _exec(self, command, **kwargs):
             # No symlink involved: the backend reports the target's own
             # real path unchanged.
-            return ExecuteResult(stdout="/tmp/x.txt\n", exit_code=0)
+            return _fake_walkup_exec(command)
 
     monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend())
 
@@ -1491,7 +1523,7 @@ def test_verify_backend_uses_the_selected_backends_own_temp_dir_not_the_controll
     a genuinely-in-backend-/tmp edit must still be recognized via the
     backend's OWN reported temp dir instead.
     """
-    from tools.file_operations import ExecuteResult, ReadResult
+    from tools.file_operations import ReadResult
 
     # The controller's "global" temp dir looks nothing like the backend's
     # own /tmp.
@@ -1515,7 +1547,7 @@ def test_verify_backend_uses_the_selected_backends_own_temp_dir_not_the_controll
             return f"'{arg}'"
 
         def _exec(self, command, **kwargs):
-            return ExecuteResult(stdout="/tmp/x.txt\n", exit_code=0)
+            return _fake_walkup_exec(command)
 
     monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend())
 
@@ -1539,7 +1571,7 @@ def test_workspace_auto_approval_drops_the_host_path_once_docker_mapping_is_conf
     container's actual mounted workspace.
     """
     import tools.terminal_tool as terminal_tool
-    from tools.file_operations import ExecuteResult, ReadResult
+    from tools.file_operations import ReadResult
 
     # Keep the global-tmp exemption out of the way: tmp_path itself lives
     # under the real system temp dir, which would otherwise let the target
@@ -1568,7 +1600,7 @@ def test_workspace_auto_approval_drops_the_host_path_once_docker_mapping_is_conf
         def _exec(self, command, **kwargs):
             # No symlink involved -- the backend reports the (foreign,
             # un-mounted) literal path unchanged.
-            return ExecuteResult(stdout=f"{host_workspace}/out.txt\n", exit_code=0)
+            return _fake_walkup_exec(command)
 
     monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeDockerBackend())
     monkeypatch.setattr(
@@ -1751,3 +1783,159 @@ def test_write_file_preview_derives_extension_from_the_resolved_symlink_target(t
     # which DOES see the CRLF -- must normalize to CRLF, the opposite of
     # what byte-window (from the alias's own ".txt" extension) would give.
     assert proposal.new_text == "plain new content\r\n"
+
+
+def test_v4a_preview_reads_the_same_snapshot_used_for_policy_resolution(monkeypatch):
+    """A non-host V4A preview must read via the ALREADY-RESOLVED
+    backend-canonical path (the SAME snapshot ``resolved_target_paths``
+    uses), not the raw relative header re-resolved independently.
+
+    If two ACP sessions share a persistent non-host environment, resolving
+    the preview read and the policy/freeze target SEPARATELY (each its own
+    live ``env.cwd`` lookup) lets the other session's ``cd`` land between
+    them -- the preview would then show content read from ONE file while
+    the (later-frozen) execution target is a DIFFERENT one. Resolving once
+    and reading that SAME resolved path removes the gap entirely.
+    """
+    from tools.file_operations import ReadResult
+
+    task_id = "single-snapshot-v4a-task"
+    captured_paths = []
+
+    class FakeNonHostEnv:
+        cwd = "/workspace"
+
+    class FakeNonHostBackend:
+        env = FakeNonHostEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            captured_paths.append(path)
+            return ReadResult(content="old\n")
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend()
+    )
+
+    patch_body = "*** Update File: relative.txt\n@@\n-old\n+new\n"
+    proposal = build_edit_proposal("patch", {"mode": "patch", "patch": patch_body}, task_id=task_id)
+
+    assert proposal.resolved_target_paths == ("/workspace/relative.txt",)
+    # The preview read must have used the SAME resolved absolute path, not
+    # the raw relative header re-resolved against a possibly-different
+    # later env.cwd snapshot.
+    assert captured_paths == ["/workspace/relative.txt"]
+
+
+def test_freeze_rewrites_only_the_resolvable_targets_in_a_mixed_v4a_patch(monkeypatch):
+    """A mixed multi-file non-host V4A patch -- one unresolvable target
+    (e.g. a tilde header) alongside a resolvable relative one -- must still
+    freeze the RESOLVABLE header, not abandon the whole patch's freeze just
+    because one target couldn't be canonicalized.
+    """
+    from acp_adapter.edit_approval import maybe_require_edit_approval
+    from tools.file_operations import ReadResult
+
+    task_id = "mixed-freeze-v4a-task"
+
+    class FakeNonHostEnv:
+        cwd = "/workspace"
+
+    class FakeNonHostBackend:
+        env = FakeNonHostEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend()
+    )
+
+    arguments = {
+        "mode": "patch",
+        "patch": (
+            "*** Update File: ~/notes\n@@\n-old\n+new\n"
+            "*** Update File: src/x.py\n@@\n-old\n+new\n"
+        ),
+    }
+    set_edit_approval_requester(lambda _proposal: True)
+    try:
+        result = maybe_require_edit_approval("patch", arguments, task_id=task_id)
+    finally:
+        set_edit_approval_requester(None)
+
+    assert result is None
+    # The resolvable header is frozen to its backend-canonical path...
+    assert "*** Update File: /workspace/src/x.py" in arguments["patch"]
+    # ...while the unresolvable tilde header is left exactly as written,
+    # for the backend's own live resolution.
+    assert "*** Update File: ~/notes" in arguments["patch"]
+
+
+def test_verify_realpath_within_any_resolves_a_symlinked_boundary_too(tmp_path):
+    """When the workspace BOUNDARY itself is a symlink on the backend
+    (e.g. ``/workspace -> /srv/project``), a target the backend reports as
+    living under the boundary's REAL path must still be recognized as
+    contained -- comparing against the boundary's own unresolved spelling
+    would fail every legitimate edit closed and defeat auto-approval
+    entirely for this common setup. Exercised against a REAL
+    ``ShellFileOperations``-over-``LocalEnvironment`` backend with a
+    genuine symlinked directory.
+    """
+    from tools.environments.local import LocalEnvironment
+    from tools.file_operations import ShellFileOperations
+    from tools.file_tools import _verify_realpath_within_any
+
+    real_project = tmp_path / "srv-project"
+    real_project.mkdir()
+    workspace_link = tmp_path / "workspace"
+    workspace_link.symlink_to(real_project)
+
+    target = real_project / "file.txt"
+    target.write_text("hi", encoding="utf-8")
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+    real_ops = ShellFileOperations(env, cwd=str(tmp_path))
+
+    # The target is addressed THROUGH the symlinked boundary spelling.
+    target_via_link = str(workspace_link / "file.txt")
+    assert _verify_realpath_within_any(target_via_link, (str(workspace_link),), real_ops) is True
+
+
+def test_freeze_does_not_rewrite_a_traversal_header(monkeypatch):
+    """A V4A header containing a ``..`` traversal component must NEVER be
+    frozen, regardless of what it resolves to: ``patch_tool()``'s own
+    ``_collect_v4a_header_paths()`` unconditionally rejects any header
+    containing ``..`` before execution. Rewriting it to its normalized
+    (``..``-free) absolute form here would silently launder it past that
+    check, letting ACP execute an input every other dispatch path refuses.
+    """
+    from acp_adapter.edit_approval import maybe_require_edit_approval
+    from tools.file_operations import ReadResult
+
+    task_id = "traversal-freeze-task"
+
+    class FakeNonHostEnv:
+        cwd = "/workspace"
+
+    class FakeNonHostBackend:
+        env = FakeNonHostEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend()
+    )
+
+    original_patch = "*** Update File: ../outside.txt\n@@\n-old\n+new\n"
+    arguments = {"mode": "patch", "patch": original_patch}
+    set_edit_approval_requester(lambda _proposal: True)
+    try:
+        result = maybe_require_edit_approval("patch", arguments, task_id=task_id)
+    finally:
+        set_edit_approval_requester(None)
+
+    assert result is None
+    # Left completely untouched -- the raw ".." header survives so
+    # patch_tool()'s own traversal rejection still sees and rejects it.
+    assert arguments["patch"] == original_patch

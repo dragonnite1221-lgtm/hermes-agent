@@ -271,44 +271,60 @@ def _verify_realpath_within_any(resolved_path: str, boundaries: tuple, file_ops)
     explicitly checks ``-L`` and follows a dangling symlink the same as a
     live one. ``readlink -f`` handles a dangling symlink correctly (it
     resolves to the link's target even when that target doesn't exist).
+
+    Every ``boundary`` is resolved through this SAME walk-up-and-canonicalize
+    script too, in the SAME round-trip as ``resolved_path`` -- not compared
+    against its own lexical spelling. If the workspace boundary itself is a
+    symlink on the backend (e.g. ``/workspace -> /srv/project``), a target
+    the backend reports as ``/srv/project/file`` would otherwise never match
+    the unresolved ``/workspace`` string, failing every legitimate
+    ``workspace_session`` edit closed and defeating the auto-approval
+    feature entirely for that (common) setup.
     """
     exec_fn = getattr(file_ops, "_exec", None)
     quote = getattr(file_ops, "_escape_shell_arg", None)
     if exec_fn is None or quote is None:
         return False
-    try:
-        arg = quote(resolved_path)
-        script = (
+
+    def _walkup_snippet(tag: str, value: str) -> str:
+        arg = quote(value)
+        return (
             f"p={arg}; suffix=''; "
-            # `-e` alone is wrong here: it follows symlinks, so a DANGLING
-            # symlink (its target doesn't exist) reads as "missing" and the
-            # loop would walk PAST it to its parent, reconstructing the
-            # symlink's own path lexically and never resolving where it
-            # actually points -- exactly the escape this function exists to
-            # catch (the real _atomic_write() explicitly checks `-L` and
-            # follows a dangling symlink too). Stop walking as soon as `$p`
-            # is EITHER a normal entry OR a symlink (dangling or not); only
-            # a component that is NEITHER counts as "missing".
             'while [ ! -e "$p" ] && [ ! -L "$p" ] && [ "$p" != "/" ] && [ -n "$p" ]; do '
             'suffix="/$(basename "$p")$suffix"; p="$(dirname "$p")"; done; '
             'real="$(readlink -f "$p" 2>/dev/null || realpath "$p" 2>/dev/null)"; '
-            '[ -n "$real" ] && printf \'%s%s\\n\' "$real" "$suffix"'
+            f'[ -n "$real" ] && printf \'{tag}\\t%s%s\\n\' "$real" "$suffix"'
+        )
+
+    named_boundaries = [(f"B{i}", b) for i, b in enumerate(boundaries) if b]
+    try:
+        script = "; ".join(
+            [_walkup_snippet("T", resolved_path)]
+            + [_walkup_snippet(tag, str(b)) for tag, b in named_boundaries]
         )
         result = exec_fn(script)
     except Exception:
         return False
     if getattr(result, "exit_code", 1) != 0:
         return False
-    real = (getattr(result, "stdout", "") or "").strip()
-    if not real:
+    output = (getattr(result, "stdout", "") or "").strip()
+    if not output:
         return False
-    normalized = posixpath.normpath(real)
+    resolved_by_tag: dict[str, str] = {}
+    for line in output.splitlines():
+        tag, _, value = line.partition("\t")
+        if value:
+            resolved_by_tag[tag] = value
+    target_real = resolved_by_tag.get("T")
+    if not target_real:
+        return False
+    normalized = posixpath.normpath(target_real)
     return any(
-        bool(boundary) and (
-            normalized == posixpath.normpath(str(boundary))
-            or normalized.startswith(posixpath.normpath(str(boundary)).rstrip("/") + "/")
+        (tag in resolved_by_tag) and (
+            normalized == posixpath.normpath(resolved_by_tag[tag])
+            or normalized.startswith(posixpath.normpath(resolved_by_tag[tag]).rstrip("/") + "/")
         )
-        for boundary in boundaries
+        for tag, _ in named_boundaries
     )
 
 

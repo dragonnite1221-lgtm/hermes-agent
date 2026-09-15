@@ -459,13 +459,37 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
     file_ops = _get_file_ops(task_id)
     uses_host_paths = _file_ops_uses_host_paths(file_ops)
 
+    # Snapshot each target's resolution ONCE, BEFORE reading the preview --
+    # not after. On a non-host backend shared by another ACP session, that
+    # other session's `cd` between "read the preview" and "resolve the
+    # policy/freeze target" could otherwise make _resolve_v4a_policy_target
+    # (which reads the backend's LIVE env.cwd) capture a DIFFERENT cwd than
+    # whatever env.cwd was in effect moments earlier when the preview read
+    # ran -- showing the user a diff of one file while the (later-frozen)
+    # execution target is a different one entirely. Resolving first and
+    # reading the SAME resolved path removes that gap: both the preview and
+    # the policy/freeze target now come from one snapshot.
+    resolved_target_paths = (
+        tuple(_resolve_edit_path(p, task_id) for p in paths) if uses_host_paths
+        else tuple(_resolve_v4a_policy_target(p, file_ops) for p in paths)
+    )
+
     # V4A applies no line-ending normalization at all (see
     # _normalize_new_text_for_preview's docstring), so had_bom is never
     # consulted here -- only the content itself is needed.
     v4a_old_text = None
     if single:
+        # Host: read via the raw path, letting _read_text_if_exists apply
+        # _resolve_edit_path itself (deterministic, no shared-backend race).
+        # Non-host: read via the ALREADY-resolved backend-canonical path
+        # from the SAME snapshot above (resolve=False -- hand it to the
+        # backend as-is, an absolute path is cwd-independent so no further
+        # resolution is needed or wanted); fall back to the raw header only
+        # when it could not be canonicalized at all (e.g. a tilde header),
+        # matching this function's existing "cannot verify" handling.
+        read_path = paths[0] if uses_host_paths else (resolved_target_paths[0] or paths[0])
         v4a_old_text, _had_bom = _read_text_if_exists(
-            paths[0], task_id, deny_binary=not is_delete_only, resolve=uses_host_paths,
+            read_path, task_id, deny_binary=not is_delete_only, resolve=uses_host_paths,
         )
 
     # ACP only supports a single diff payload: surface the exact V4A patch as new_text so
@@ -499,10 +523,7 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
         # gets resolved via that SAME no-shell backend-canonical join
         # instead, for the policy check only -- the patch body handed to
         # the backend above is untouched either way.
-        resolved_target_paths=(
-            tuple(_resolve_edit_path(p, task_id) for p in paths) if uses_host_paths
-            else tuple(_resolve_v4a_policy_target(p, file_ops) for p in paths)
-        ),
+        resolved_target_paths=resolved_target_paths,
     )
 
 
@@ -861,11 +882,25 @@ def _freeze_non_host_v4a_targets(
     dependency entirely: whatever was approved is now the literal target,
     regardless of what any other session does afterward.
 
-    A no-op for anything other than a V4A patch, a host-paths backend
-    (already frozen at dispatch time in ``tools/file_tools.py``), or a
-    proposal with an unresolvable (``None``) target -- there is nothing
-    safe to freeze it to, so the header is left for the backend's own live
-    resolution, matching this module's existing "cannot verify" handling.
+    A no-op for anything other than a V4A patch or a host-paths backend
+    (already frozen at dispatch time in ``tools/file_tools.py``). Each
+    target is otherwise frozen INDEPENDENTLY -- a mixed multi-file patch
+    with one unresolvable (``None``) target (e.g. a tilde header) alongside
+    a resolvable one must still freeze the resolvable one; leaving the
+    WHOLE patch unfrozen just because one header couldn't be canonicalized
+    would needlessly leave a target that COULD be protected exposed to the
+    same live-cwd race. The unresolvable one is simply left as-is, for the
+    backend's own live resolution, matching this module's existing "cannot
+    verify" handling.
+
+    A target whose RAW header contains a ``..`` traversal component is
+    NEVER frozen, regardless of what it resolves to: ``patch_tool()``'s own
+    ``_collect_v4a_header_paths()`` unconditionally rejects any header
+    containing ``..`` before execution, independent of where it would
+    resolve -- rewriting such a header to its normalized (``..``-free)
+    absolute form here would silently launder it past that check, letting
+    ACP execute an input every other dispatch path refuses. Leaving the
+    raw ``..`` header untouched preserves that rejection.
     """
     if tool_name != "patch" or arguments.get("mode") != "patch":
         return
@@ -873,18 +908,23 @@ def _freeze_non_host_v4a_targets(
     resolved_paths = proposal.resolved_target_paths
     if not target_paths or not resolved_paths or len(target_paths) != len(resolved_paths):
         return
-    if any(r is None for r in resolved_paths):
-        return
     patch_body = arguments.get("patch")
     if not isinstance(patch_body, str):
         return
     try:
         from tools.file_tools import _apply_v4a_header_rewrite, _file_ops_uses_host_paths, _get_file_ops
+        from tools.path_security import has_traversal_component
 
         file_ops = _get_file_ops(task_id)
         if _file_ops_uses_host_paths(file_ops):
             return
-        arguments["patch"] = _apply_v4a_header_rewrite(patch_body, dict(zip(target_paths, resolved_paths)))
+        path_to_resolved = {
+            raw: resolved for raw, resolved in zip(target_paths, resolved_paths)
+            if resolved is not None and not has_traversal_component(raw)
+        }
+        if not path_to_resolved:
+            return
+        arguments["patch"] = _apply_v4a_header_rewrite(patch_body, path_to_resolved)
     except Exception:
         logger.debug("Failed to freeze non-host V4A patch headers after approval", exc_info=True)
 
