@@ -203,19 +203,44 @@ def snapshot_resource_link_now(block: PromptBlock) -> PromptBlock:
     if path is None:
         return block
     mime_type = _attr(block, "mime_type")
+    # Same inference _resource_link_to_parts uses: an explicit image
+    # mime_type wins, else fall back to the file suffix -- a resource_link
+    # with no mimeType set at all must still be recognized as an image
+    # (and therefore be size-gated and embedded as a blob, not read as
+    # text) exactly like the non-queued path does.
+    image_mime = mime_type if _is_image_resource(mime_type) else _IMAGE_SUFFIX_MIME.get(path.suffix.lower())
+    is_image = bool(image_mime and _is_image_resource(image_mime))
     try:
-        data = path.read_bytes()
+        size = path.stat().st_size
     except OSError:
         return block
-    sample = data[:_MAX_ACP_RESOURCE_BYTES]
-    text = _decode_text_bytes(sample, mime_type)
-    if text is not None and not _is_image_resource(mime_type):
+    if is_image and size > _MAX_ACP_RESOURCE_BYTES:
+        # Mirror _resource_link_to_parts' oversized-image guard: never read
+        # (let alone truncate) an oversized image file. A truncated blob
+        # would replay as a corrupt, non-decodable image_url instead of the
+        # clear "too large" notice the non-queued path already gives.
         resource: TextResourceContents | BlobResourceContents = TextResourceContents(
-            uri=uri, text=text, mimeType=mime_type
+            uri=uri,
+            text=f"[Image too large to inline: {size} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]",
+            mimeType=mime_type,
         )
+        return EmbeddedResourceContentBlock(type="resource", resource=resource)
+    try:
+        # Bounded read: never pull more than the cap into memory, even for
+        # a huge non-image file (this call runs synchronously inside
+        # _claim_turn_or_queue, under state.runtime_lock, on the asyncio
+        # event loop thread -- reading an entire multi-GB file here would
+        # block every other session, not just this one).
+        with path.open("rb") as fh:
+            sample = fh.read(_MAX_ACP_RESOURCE_BYTES)
+    except OSError:
+        return block
+    text = None if is_image else _decode_text_bytes(sample, mime_type)
+    if text is not None:
+        resource = TextResourceContents(uri=uri, text=text, mimeType=mime_type)
     else:
         resource = BlobResourceContents(
-            uri=uri, blob=base64.b64encode(sample).decode("ascii"), mimeType=mime_type
+            uri=uri, blob=base64.b64encode(sample).decode("ascii"), mimeType=image_mime or mime_type
         )
     return EmbeddedResourceContentBlock(type="resource", resource=resource)
 

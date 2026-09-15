@@ -47,6 +47,41 @@ def test_audio_only_prompt_becomes_a_text_placeholder_not_empty():
     assert content.strip()
 
 
+def test_snapshot_resource_link_now_handles_oversized_and_mimeless_images(tmp_path):
+    """snapshot_resource_link_now must mirror _resource_link_to_parts'
+    two image-specific behaviors instead of treating every resource_link
+    as generic bytes:
+
+    1. An oversized image is never read (let alone truncated) -- a
+       truncated blob would replay as a corrupt, non-decodable
+       image_url instead of a clear "too large" notice.
+    2. A resource_link with no explicit mimeType is still recognized as
+       an image via its file suffix, so it embeds as an image blob
+       instead of "binary embedded file omitted".
+    """
+    from acp_adapter.content import _MAX_ACP_RESOURCE_BYTES, snapshot_resource_link_now
+
+    oversized = tmp_path / "huge.png"
+    oversized.write_bytes(b"\x89PNG" + b"\x00" * (_MAX_ACP_RESOURCE_BYTES + 1))
+    oversized_block = ResourceContentBlock(
+        type="resource_link", name="huge.png", uri=oversized.as_uri(), mimeType="image/png"
+    )
+    snapshotted = snapshot_resource_link_now(oversized_block)
+    assert isinstance(snapshotted, EmbeddedResourceContentBlock)
+    assert isinstance(snapshotted.resource, TextResourceContents)
+    assert "too large" in snapshotted.resource.text.lower()
+
+    small_png_bytes = base64.b64decode("aGVsbG8=")
+    mimeless = tmp_path / "photo.png"
+    mimeless.write_bytes(small_png_bytes)
+    mimeless_block = ResourceContentBlock(type="resource_link", name="photo.png", uri=mimeless.as_uri())
+    snapshotted_mimeless = snapshot_resource_link_now(mimeless_block)
+    assert isinstance(snapshotted_mimeless, EmbeddedResourceContentBlock)
+    assert isinstance(snapshotted_mimeless.resource, BlobResourceContents)
+    assert snapshotted_mimeless.resource.mime_type == "image/png"
+    assert base64.b64decode(snapshotted_mimeless.resource.blob) == small_png_bytes
+
+
 def test_text_only_acp_blocks_stay_string_for_legacy_prompt_path():
     content = _content_blocks_to_openai_user_content([
         TextContentBlock(type="text", text="/help"),

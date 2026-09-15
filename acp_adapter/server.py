@@ -823,7 +823,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
-        if not user_text and not (isinstance(user_content, list) and user_content):
+        # user_content is either a non-empty str or a non-empty list whenever
+        # there is anything at all to send (see
+        # _content_blocks_to_openai_user_content -- it falls back to
+        # _extract_text(prompt), which is "" for a genuinely empty/
+        # unconvertible prompt). Checking only "isinstance(..., list)"
+        # here missed a prompt that produces a meaningful non-empty STRING
+        # even though user_text (from _extract_text, real TextContentBlocks
+        # only) is empty -- e.g. an audio-only prompt, whose placeholder
+        # text lives in user_content but was never a real text block.
+        if not user_text and not user_content:
             return PromptResponse(stop_reason="end_turn")
 
         user_text, user_content = self._rewrite_prompt_for_interrupt(state, user_text, user_content, text_only_prompt)

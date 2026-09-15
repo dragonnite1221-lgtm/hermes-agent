@@ -414,6 +414,48 @@ class TestPrompt:
         assert resp.stop_reason == "refusal"
 
     @pytest.mark.asyncio
+    async def test_audio_only_prompt_actually_reaches_the_agent(self, agent, mock_manager):
+        """An audio-only prompt must still invoke run_conversation.
+
+        _extract_text(prompt) is "" for an audio-only prompt (it only sees
+        real TextContentBlocks), and _content_blocks_to_openai_user_content
+        collapses an audio placeholder-only result to a plain string, not a
+        list. The prompt() empty-content guard checked
+        "isinstance(user_content, list) and user_content", which is False
+        for that string -- so an audio-only prompt was rejected as empty
+        and never reached run_conversation at all, even after the
+        placeholder fix made the CONVERTER stop returning a truly empty
+        string.
+        """
+        from acp.schema import AudioContentBlock
+
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+
+        run_calls = []
+
+        def _run(*args, **kwargs):
+            run_calls.append(kwargs)
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt_resp = await agent.prompt(
+            prompt=[AudioContentBlock(type="audio", data="aGVsbG8=", mimeType="audio/wav")],
+            session_id=resp.session_id,
+        )
+
+        assert isinstance(prompt_resp, PromptResponse)
+        assert len(run_calls) == 1
+        assert "audio/wav" in str(run_calls[0].get("user_message"))
+
+    @pytest.mark.asyncio
     async def test_queued_image_prompt_preserves_attachment_data(self, agent):
         """A prompt that arrives while a turn is already running gets
         queued for the next turn. If it carries an image, the queued item
