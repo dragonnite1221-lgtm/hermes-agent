@@ -847,6 +847,81 @@ class TestPrompt:
                 pass
 
     @pytest.mark.asyncio
+    async def test_is_running_resets_when_provenance_send_hits_dead_connection(
+        self, agent, mock_manager, monkeypatch
+    ):
+        """Compression-rotation sibling of the delivery-failure fix above: ``_finish_turn``
+        sends a pre-drain provenance update (``_send_session_info_update`` -> ``_send``)
+        BEFORE the try/finally that resets ``is_running``. That path used an unbounded
+        ``_send``, so on a connection that silently hangs instead of raising (the same
+        dead-sender behavior documented above), the provenance await never returns and the
+        reset guard below it is never reached -- the exact bug this PR fixes, just on the
+        rotation path instead of final-response delivery.
+
+        Turn 1 dies against the closed pipe for real, killing ``MessageSender``'s background
+        loop; turn 2 rotates ``agent.session_id`` so ``_finish_turn``'s FIRST write is the
+        provenance update, landing on that now-dead connection's silent-hang behavior instead
+        of a raise. ``_send`` must now be bounded by the same timeout for turn 2 to ever
+        finish instead of hanging the test (and a real turn) forever.
+        """
+        import acp_adapter.server as server_module
+        from acp.agent.connection import AgentSideConnection
+
+        monkeypatch.setattr(server_module, "_SESSION_UPDATE_TIMEOUT_SECONDS", 0.2)
+
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+        state.agent.session_id = "hermes-1"
+
+        def _run_no_rotation(*args, **kwargs):
+            return {"final_response": "ok", "messages": []}
+
+        def _run_with_rotation(*args, **kwargs):
+            # Simulate a mid-turn compression split: the internal head changes as a
+            # side effect of THIS run, so pre_turn_hermes_id (snapshotted before the
+            # executor call) differs from post_turn_hermes_id (read after it returns).
+            state.agent.session_id = "hermes-2"
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run_no_rotation
+
+        loop = asyncio.get_running_loop()
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        write_file = os.fdopen(write_fd, "wb", buffering=0)
+        transport, protocol = await loop.connect_write_pipe(asyncio.streams.FlowControlMixin, write_file)
+        writer = asyncio.StreamWriter(transport, protocol, None, loop)
+        reader = asyncio.StreamReader(limit=1024 * 1024, loop=loop)
+        conn = AgentSideConnection(agent, writer, reader, listening=False)
+        agent._conn = conn
+
+        try:
+            # Turn 1: the FIRST write on this connection fails for real (closed pipe),
+            # killing the sender's background loop -- expected to raise.
+            with pytest.raises(Exception):
+                await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text="hi")], session_id=resp.session_id
+                )
+            assert state.is_running is False
+
+            # Turn 2: the run itself rotates the internal head, so _finish_turn's first
+            # action is the provenance send, hitting the now-dead connection's
+            # hang-not-raise behavior.
+            state.agent.run_conversation = _run_with_rotation
+            with pytest.raises(Exception):
+                await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text="again")], session_id=resp.session_id
+                )
+            assert state.is_running is False
+        finally:
+            try:
+                await conn.close()
+            except (ConnectionResetError, BrokenPipeError, OSError, asyncio.TimeoutError):
+                pass
+
+    @pytest.mark.asyncio
     async def test_queue_drains_after_recoverable_failure_but_is_not_replayed_once_run(
         self, agent, mock_manager
     ):

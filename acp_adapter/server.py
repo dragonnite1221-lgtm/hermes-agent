@@ -275,9 +275,19 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         logger.info("ACP client connected")
 
     async def _send(self, session_id: str, update: Any, *, fail_msg: str, level: int = logging.WARNING) -> bool:
-        """``session_update`` that logs instead of raising; False on failure."""
+        """``session_update`` that logs instead of raising; False on failure or timeout.
+
+        Bounded to ``_SESSION_UPDATE_TIMEOUT_SECONDS`` -- same reason as
+        ``_session_update_or_raise`` below: a connection already broken by an EARLIER failed
+        write can hang instead of raising, and callers on the ``_finish_turn`` pre-drain path
+        (e.g. the provenance update) rely on this call returning so the ``is_running`` reset
+        guard downstream is actually reached instead of hanging forever.
+        """
         try:
-            await self._conn.session_update(session_id=session_id, update=update)
+            await asyncio.wait_for(
+                self._conn.session_update(session_id=session_id, update=update),
+                timeout=_SESSION_UPDATE_TIMEOUT_SECONDS,
+            )
             return True
         except Exception:
             logger.log(level, fail_msg, session_id, exc_info=True)
@@ -289,9 +299,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         connection already broken by an EARLIER failed write can never hang this call forever.
 
         Used only where the caller (``_finish_turn``) needs delivery failure to actually
-        propagate as an exception -- ``_send`` above is for best-effort notifications where
-        that distinction doesn't matter, so it isn't bounded here too (out of scope for this
-        fix; a hang there would need the same treatment separately).
+        propagate as an exception -- ``_send`` above is for best-effort notifications and
+        swallows the (now also bounded) failure instead of raising it.
         """
         await asyncio.wait_for(conn.session_update(session_id, update), timeout=_SESSION_UPDATE_TIMEOUT_SECONDS)
 
