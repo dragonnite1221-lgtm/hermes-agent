@@ -1379,3 +1379,100 @@ def test_verify_realpath_within_any_resolves_new_nested_paths_without_requiring_
     # existing sibling directory.
     (workspace / "unrelated").mkdir()
     assert _verify_realpath_within_any(nested_new_target, (str(workspace / "unrelated"),), real_ops) is False
+
+    # A DANGLING symlink (its target doesn't exist yet) must be resolved,
+    # not treated as "missing" and walked past: `-e` alone follows symlinks
+    # and would see /workspace/link as absent, walk up to /workspace, and
+    # reconstruct the symlink's own lexical path -- never noticing it
+    # actually points outside the workspace. The real _atomic_write()
+    # explicitly checks `-L` and follows a dangling symlink the same as a
+    # live one, so this verifier must too.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    dangling_target = outside / "new.txt"  # does not exist yet
+    danglink = workspace / "link"
+    danglink.symlink_to(dangling_target)
+
+    assert _verify_realpath_within_any(str(danglink), (str(workspace),), real_ops) is False
+    assert _verify_realpath_within_any(str(danglink), (str(outside),), real_ops) is True
+
+
+def test_write_file_preview_line_ending_accounts_for_a_stripped_bom(monkeypatch):
+    """The preview's byte-capped line-ending sample must account for a
+    leading UTF-8 BOM that ``read_file_raw()`` already stripped from
+    ``old_text``: the real ``head -c 4096`` probe reads the RAW on-disk
+    bytes, BOM included, so its 4096-byte window covers 3 FEWER bytes of
+    actual content than a naive 4096-byte cap of the (already BOM-less)
+    ``old_text`` would.
+
+    Fixture: 4092 ASCII characters then CRLF then more text. With the BOM
+    counted in (as the real probe does), the on-disk window (bytes 0-4095)
+    is BOM(3) + 4092 A's + the bare '\\r' of the CRLF at byte 4095 -- it
+    ends exactly one byte before the '\\n', so the real write's probe sees
+    NEITHER "\\r\\n" nor a bare "\\n" and does not normalize. A byte cap
+    that ignores the missing BOM bytes would instead cover 3 bytes further
+    into old_text, landing past the full "\\r\\n" and wrongly normalizing.
+    """
+    from tools.file_operations import ReadResult
+
+    old_text = "A" * 4092 + "\r\nrest\r\n"
+
+    class FakeBomBackend:
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content=old_text, _had_bom=True)
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeBomBackend()
+    )
+
+    proposal = build_edit_proposal(
+        "write_file", {"path": "bom.txt", "content": "plain new content\n"}, task_id="some-task",
+    )
+
+    # Must NOT be normalized to CRLF: accounting for the stripped BOM, the
+    # real write's byte-capped probe window ends one byte before the '\n'.
+    assert proposal.new_text == "plain new content\n"
+
+
+def test_verify_backend_accepts_the_remote_temp_root_alongside_workspace_boundaries(monkeypatch):
+    """The non-host symlink-safety verification must accept the backend's
+    OWN temp root as a SECOND valid boundary, not just the workspace
+    boundary candidates -- otherwise an ordinary, non-escaping remote
+    ``/tmp/x`` edit (which the lexical check already exempts via
+    ``tempfile.gettempdir()``) would be wrongly denied by the verify step
+    for landing outside the (unrelated) workspace.
+    """
+    from tools.file_operations import ExecuteResult, ReadResult
+
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: "/tmp")
+
+    task_id = "non-host-tmp-legitimate-task"
+
+    class FakeNonHostEnv:
+        cwd = "/remote/base"
+
+    class FakeNonHostBackend:
+        env = FakeNonHostEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+        def _escape_shell_arg(self, arg):
+            return f"'{arg}'"
+
+        def _exec(self, command, **kwargs):
+            # No symlink involved: the backend reports the target's own
+            # real path unchanged.
+            return ExecuteResult(stdout="/tmp/x.txt\n", exit_code=0)
+
+    monkeypatch.setattr("tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend())
+
+    patch_body = "*** Update File: /tmp/x.txt\n@@\n-old\n+new\n"
+    proposal = build_edit_proposal("patch", {"mode": "patch", "patch": patch_body}, task_id=task_id)
+    assert proposal.resolved_target_paths == ("/tmp/x.txt",)
+
+    # cwd (workspace boundary) is unrelated to /tmp -- only the temp-root
+    # candidate the verify step must also accept makes this legitimate.
+    assert should_auto_approve_edit(
+        proposal, "workspace_session", cwd="/remote/base/some-other-workspace", task_id=task_id,
+    ) is True

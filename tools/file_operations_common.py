@@ -25,9 +25,17 @@ class ReadResult:
     dimensions: Optional[str] = None  # For images: "WIDTHxHEIGHT"
     error: Optional[str] = None
     similar_files: List[str] = field(default_factory=list)
+    # Leading-underscore: internal-only, deliberately excluded from to_dict()
+    # (whose key set is pinned by tests / read by the model) -- True when
+    # read_file_raw() stripped a leading UTF-8 BOM from `content`. A caller
+    # that must reproduce a BYTE-accurate window of the ON-DISK file (see
+    # acp_adapter/edit_approval.py's _byte_capped_sample use) needs this to
+    # account for the 3 BOM bytes `content` itself no longer has.
+    _had_bom: bool = False
 
     def to_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items() if v is not None and v != []}
+        return {k: v for k, v in self.__dict__.items()
+                if not k.startswith("_") and v is not None and v != []}
 
 
 @dataclass

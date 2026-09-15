@@ -247,6 +247,17 @@ def _verify_realpath_within_any(resolved_path: str, boundaries: tuple, file_ops)
     NEAREST EXISTING ancestor, resolves THAT ancestor's real path (a
     nonexistent path component cannot itself be a symlink, so it needs no
     resolution), and appends the missing suffix back on literally.
+
+    The walk-up stops at (and resolves) a DANGLING symlink too, not just a
+    missing path: a plain ``-e`` test follows symlinks, so a symlink whose
+    target doesn't exist (e.g. ``/workspace/link -> /outside/new.txt``,
+    ``new.txt`` not yet created) reads as "missing" and a ``-e``-only loop
+    would walk PAST it to its parent, reconstructing the symlink's own
+    lexical path and never resolving where it actually points -- the exact
+    escape this function exists to catch, since the real ``_atomic_write()``
+    explicitly checks ``-L`` and follows a dangling symlink the same as a
+    live one. ``readlink -f`` handles a dangling symlink correctly (it
+    resolves to the link's target even when that target doesn't exist).
     """
     exec_fn = getattr(file_ops, "_exec", None)
     quote = getattr(file_ops, "_escape_shell_arg", None)
@@ -256,7 +267,16 @@ def _verify_realpath_within_any(resolved_path: str, boundaries: tuple, file_ops)
         arg = quote(resolved_path)
         script = (
             f"p={arg}; suffix=''; "
-            'while [ ! -e "$p" ] && [ "$p" != "/" ] && [ -n "$p" ]; do '
+            # `-e` alone is wrong here: it follows symlinks, so a DANGLING
+            # symlink (its target doesn't exist) reads as "missing" and the
+            # loop would walk PAST it to its parent, reconstructing the
+            # symlink's own path lexically and never resolving where it
+            # actually points -- exactly the escape this function exists to
+            # catch (the real _atomic_write() explicitly checks `-L` and
+            # follows a dangling symlink too). Stop walking as soon as `$p`
+            # is EITHER a normal entry OR a symlink (dangling or not); only
+            # a component that is NEITHER counts as "missing".
+            'while [ ! -e "$p" ] && [ ! -L "$p" ] && [ "$p" != "/" ] && [ -n "$p" ]; do '
             'suffix="/$(basename "$p")$suffix"; p="$(dirname "$p")"; done; '
             'real="$(readlink -f "$p" 2>/dev/null || realpath "$p" 2>/dev/null)"; '
             '[ -n "$real" ] && printf \'%s%s\\n\' "$real" "$suffix"'

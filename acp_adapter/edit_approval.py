@@ -127,8 +127,16 @@ def _resolve_edit_path(path: str, task_id: str = "default") -> str:
 def _read_text_if_exists(
     path: str, task_id: str = "default", *, strip_fence_leaks: bool = True, deny_binary: bool = True,
     resolve: bool = True,
-) -> str | None:
+) -> tuple[str | None, bool]:
     """Read ``path``'s current content for the approval diff.
+
+    Returns ``(content, had_bom)``: ``had_bom`` is whether
+    ``read_file_raw()`` stripped a leading UTF-8 BOM from ``content`` --
+    ``_normalize_new_text_for_preview`` needs it to account for those 3
+    bytes when reproducing the real write's BYTE-based (not
+    character-based) line-ending probe window; see its docstring. Always
+    ``False`` for the early-return binary/image placeholder and the
+    confirmed-missing (``None``) case, neither of which carry BOM state.
 
     Reads through ``tools.file_tools._get_file_ops(task_id)`` -- the same
     ``ShellFileOperations`` backend ``write_file_tool``/``patch_tool`` use
@@ -197,7 +205,7 @@ def _read_text_if_exists(
     if result.is_binary or result.is_image:
         if not deny_binary:
             kind = "image" if result.is_image else "binary"
-            return f"[existing {kind} file, {result.file_size} bytes -- content not shown]"
+            return f"[existing {kind} file, {result.file_size} bytes -- content not shown]", False
         # An existing image sets NO .error at all -- just is_image=True,
         # is_binary=True, and empty (default) .content -- so checking only
         # .error below would fall through to `return result.content` and
@@ -235,9 +243,9 @@ def _read_text_if_exists(
             # proposal closed exactly like every other unreadable-for-a-
             # different-reason case. See tools/file_operations.py's
             # _probe_regular_file/read_file_raw.
-            return None
+            return None, False
         raise OSError(f"Cannot read current content of {path!r}: {result.error}")
-    return result.content
+    return result.content, getattr(result, "_had_bom", False)
 
 
 def _required_path(arguments: dict[str, Any]) -> str:
@@ -247,7 +255,9 @@ def _required_path(arguments: dict[str, Any]) -> str:
     return path
 
 
-def _normalize_new_text_for_preview(old_text: str | None, new_text: str, *, use_byte_window: bool) -> str:
+def _normalize_new_text_for_preview(
+    old_text: str | None, new_text: str, *, use_byte_window: bool, had_bom: bool = False,
+) -> str:
     """Match ``write_file()``/``patch_replace()``'s own line-ending
     normalization, so the preview's ``new_text`` uses the SAME ending the
     real write will produce.
@@ -302,12 +312,25 @@ def _normalize_new_text_for_preview(old_text: str | None, new_text: str, *, use_
       real (character-based, full-text) decision for the exact same
       multibyte-heavy fixture a non-lint/LSP write_file case is byte-capped
       to match.
+
+    ``had_bom`` (only meaningful when ``use_byte_window`` is true): whether
+    ``read_file_raw()`` stripped a leading UTF-8 BOM from ``old_text``. The
+    real ``head -c 4096`` probe reads the RAW on-disk bytes, BOM included;
+    ``old_text`` no longer has those 3 bytes, so byte-capping it to the
+    full 4096 would cover 3 bytes MORE of actual content than the real
+    probe's window does. For a file where the first newline sits close
+    enough to the boundary that those 3 bytes matter, this shrinks the cap
+    to 4093 bytes so both windows cover the identical on-disk range.
     """
     if old_text is None:
         return new_text
     from tools.file_operations_common import _byte_capped_sample, _detect_line_ending, _normalize_line_endings
 
-    sample = _byte_capped_sample(old_text) if use_byte_window else old_text
+    if use_byte_window:
+        limit = 4096 - (3 if had_bom else 0)
+        sample = _byte_capped_sample(old_text, limit)
+    else:
+        sample = old_text
     file_ending = _detect_line_ending(sample)
     return _normalize_line_endings(new_text, file_ending) if file_ending else new_text
 
@@ -323,7 +346,7 @@ def _proposal_for_write_file(arguments: dict[str, Any], task_id: str = "default"
     # old content at all -- so this old_text is pure display. Showing a
     # "cleaned" version would hide real bytes the file actually holds from
     # the user's approval review; see _read_text_if_exists's docstring.
-    old_text = _read_text_if_exists(path, task_id, strip_fence_leaks=False)
+    old_text, had_bom = _read_text_if_exists(path, task_id, strip_fence_leaks=False)
     # use_byte_window mirrors write_file()'s own want_pre decision (see
     # ShellFileOperations._write_wants_pre_content): for a linted/LSP-
     # covered extension (e.g. .py) the real write reads FULL pre-content
@@ -335,7 +358,8 @@ def _proposal_for_write_file(arguments: dict[str, Any], task_id: str = "default"
 
     ext = os.path.splitext(path)[1].lower()
     wants_pre = ShellFileOperations._write_wants_pre_content(ext, _get_file_ops(task_id))
-    new_text = _normalize_new_text_for_preview(old_text, str(content), use_byte_window=not wants_pre)
+    new_text = _normalize_new_text_for_preview(
+        old_text, str(content), use_byte_window=not wants_pre, had_bom=had_bom)
     return EditProposal(
         "write_file", path, old_text, new_text, dict(arguments),
         resolved_target_paths=(resolved,),
@@ -353,7 +377,9 @@ def _proposal_for_patch_replace(arguments: dict[str, Any], task_id: str = "defau
     # the default stripped read could compute a new_text that diverges from
     # what patch_replace() actually produces once approved. See
     # _read_text_if_exists's docstring.
-    old_text = _read_text_if_exists(path, task_id, strip_fence_leaks=False)
+    # use_byte_window is always False for patch_replace (see below), so its
+    # had_bom flag is never consulted here.
+    old_text, _had_bom = _read_text_if_exists(path, task_id, strip_fence_leaks=False)
     if old_text is None:
         raise ValueError(f"Failed to read file: {path}")
 
@@ -423,6 +449,15 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
     file_ops = _get_file_ops(task_id)
     uses_host_paths = _file_ops_uses_host_paths(file_ops)
 
+    # V4A applies no line-ending normalization at all (see
+    # _normalize_new_text_for_preview's docstring), so had_bom is never
+    # consulted here -- only the content itself is needed.
+    v4a_old_text = None
+    if single:
+        v4a_old_text, _had_bom = _read_text_if_exists(
+            paths[0], task_id, deny_binary=not is_delete_only, resolve=uses_host_paths,
+        )
+
     # ACP only supports a single diff payload: surface the exact V4A patch as new_text so
     # patch-mode calls are permissioned and denied patches cannot mutate.
     return EditProposal(
@@ -432,9 +467,7 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
         # new content from old, so #5's overwrite-masking protection does
         # not apply) -- see _read_text_if_exists's docstring and
         # tools/patch_parser.py's _apply_delete.
-        old_text=_read_text_if_exists(
-            paths[0], task_id, deny_binary=not is_delete_only, resolve=uses_host_paths,
-        ) if single else None,
+        old_text=v4a_old_text,
         # ACP only supports a single diff payload here.  Surface the exact V4A
         # patch content before execution so patch-mode calls are permissioned
         # and denied patches cannot mutate.
@@ -687,7 +720,13 @@ def should_auto_approve_edit(
     escape the workspace unprompted once the backend's own shell follows it
     for real. This is skipped for a host-paths (local) backend, where
     ``Path.resolve()`` already followed any real symlink on the SAME
-    filesystem the write happens on.
+    filesystem the write happens on. The boundary set passed to that
+    verification includes ``tempfile.gettempdir()`` alongside
+    ``cwd_candidates`` -- the SAME two acceptable namespaces
+    ``_is_single_path_auto_approvable``'s own lexical check already grants,
+    so an ordinary remote ``/tmp`` edit that lexically qualifies for the
+    global-tmp exemption isn't then rejected by the verify step for landing
+    outside the (unrelated) workspace boundary alone.
     """
 
     policy = str(policy or AUTO_APPROVE_ASK).strip()
@@ -701,8 +740,9 @@ def should_auto_approve_edit(
 
             file_ops = _get_file_ops(task_id)
             if not _file_ops_uses_host_paths(file_ops):
-                verify_backend = lambda resolved, _fo=file_ops: _verify_realpath_within_any(
-                    resolved, cwd_candidates, _fo)
+                verify_boundaries = cwd_candidates + (tempfile.gettempdir(),)
+                verify_backend = lambda resolved, _fo=file_ops, _b=verify_boundaries: _verify_realpath_within_any(
+                    resolved, _b, _fo)
         except Exception:
             # Could not even determine the backend type for this task --
             # fail closed rather than silently skipping the symlink check.

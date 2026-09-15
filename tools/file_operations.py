@@ -1014,8 +1014,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         # Strip a leading BOM (a phantom U+FEFF defeats an exact first-line match);
         # write_file re-probes disk and restores it.
         stdout = _strip_terminal_fence_leaks(cat_result.stdout) if strip_fence_leaks else cat_result.stdout
-        raw_content, _ = _strip_bom(stdout)
-        return ReadResult(content=raw_content, file_size=file_size)
+        raw_content, had_bom = _strip_bom(stdout)
+        return ReadResult(content=raw_content, file_size=file_size, _had_bom=had_bom)
 
     def read_file_bytes(self, path: str, max_bytes: Optional[int] = None) -> ReadResult:
         """Read binary-safe bytes (as base64) from any shell-backed environment."""
