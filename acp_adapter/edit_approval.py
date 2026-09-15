@@ -206,14 +206,48 @@ def _required_path(arguments: dict[str, Any]) -> str:
     return path
 
 
+def _normalize_new_text_for_preview(old_text: str | None, new_text: str) -> str:
+    """Match ``write_file()``/``patch_replace()``'s own line-ending
+    normalization, so the preview's ``new_text`` uses the SAME ending the
+    real write will produce.
+
+    ``ShellFileOperations.write_file()`` (and ``patch_replace()``, which
+    calls it) preserve an existing file's dominant line ending: when the
+    on-disk content is CRLF, the incoming (usually bare-LF, since models
+    send bare-LF) content/replacement is normalized to CRLF before writing
+    -- see ``tools/file_operations.py``'s ``write_file()`` (``original_ending``
+    from ``_probe_write_target()``) and ``patch_replace()`` (``file_ending
+    = _detect_line_ending(content)``). Without this, the preview's diff
+    compares the model's bare-LF ``new_text`` against CRLF ``old_text`` and
+    shows every unchanged line as modified (or a mixed-ending result),
+    misrepresenting a write that will not actually touch those bytes.
+
+    ``_detect_line_ending`` is the exact same pure helper
+    ``_probe_write_target()`` uses on its own pre-content/sample, so this
+    reproduces the real write's decision without a second shell round-trip
+    (the preview already has ``old_text`` from ``_read_text_if_exists``).
+    V4A's real apply path (``tools/patch_parser.py``) does no such
+    normalization at all, so its preview (which also skips this) already
+    matches.
+    """
+    if old_text is None:
+        return new_text
+    from tools.file_operations_common import _detect_line_ending, _normalize_line_endings
+
+    file_ending = _detect_line_ending(old_text)
+    return _normalize_line_endings(new_text, file_ending) if file_ending else new_text
+
+
 def _proposal_for_write_file(arguments: dict[str, Any], task_id: str = "default") -> EditProposal:
     path = _required_path(arguments)
     content = arguments.get("content")
     if content is None:
         raise ValueError("content required")
     resolved = _resolve_edit_path(path, task_id)
+    old_text = _read_text_if_exists(path, task_id)
+    new_text = _normalize_new_text_for_preview(old_text, str(content))
     return EditProposal(
-        "write_file", path, _read_text_if_exists(path, task_id), str(content), dict(arguments),
+        "write_file", path, old_text, new_text, dict(arguments),
         resolved_target_paths=(resolved,),
     )
 
@@ -239,6 +273,11 @@ def _proposal_for_patch_replace(arguments: dict[str, Any], task_id: str = "defau
         old_text, str(old_string), str(new_string), bool(arguments.get("replace_all", False)))
     if error or match_count == 0:
         raise ValueError(error or f"Could not find match for old_string in {path}")
+    # Same normalization patch_replace() itself applies after the fuzzy
+    # replace (file_ending = _detect_line_ending(content); new_content =
+    # _normalize_line_endings(new_content, file_ending)) -- old_text here IS
+    # that same content (BOM-stripped, fence-leak-unstripped cat output).
+    new_text = _normalize_new_text_for_preview(old_text, new_text)
     resolved = _resolve_edit_path(path, task_id)
     return EditProposal("patch", path, old_text, new_text, dict(arguments), resolved_target_paths=(resolved,))
 

@@ -629,3 +629,63 @@ def test_preview_reads_through_a_real_unmocked_shell_backend(tmp_path, monkeypat
     )
 
     assert proposal.old_text == "real content on disk\n"
+
+
+def test_write_file_preview_normalizes_new_text_to_match_existing_crlf_ending(monkeypatch):
+    """ShellFileOperations.write_file() preserves an existing CRLF file's
+    line ending when the model supplies the usual bare-LF content (see
+    write_file()'s original_ending handling in tools/file_operations.py).
+    The preview's new_text must match that same normalization, or the ACP
+    diff compares bare-LF new_text against CRLF old_text and shows every
+    UNCHANGED line as modified, even though those exact bytes will not be
+    touched by the real write.
+    """
+    from tools.file_operations import ReadResult
+
+    crlf_content = "line one\r\nline two\r\nline three\r\n"
+
+    class FakeBackend:
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content=crlf_content)
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeBackend()
+    )
+
+    proposal = build_edit_proposal(
+        "write_file",
+        {"path": "sample.txt", "content": "line one\nline two changed\nline three\n"},
+        task_id="some-task",
+    )
+
+    assert proposal.new_text == "line one\r\nline two changed\r\nline three\r\n"
+
+
+def test_patch_replace_preview_normalizes_new_text_to_match_existing_crlf_ending(monkeypatch):
+    """patch_replace() itself normalizes its fuzzy-replace result to the
+    file's dominant line ending (file_ending = _detect_line_ending(content);
+    new_content = _normalize_line_endings(new_content, file_ending)) after
+    computing it -- a step this preview skipped, so a replacement
+    introducing a bare-LF newline (a realistic case: a multi-line
+    new_string) would preview a MIXED-ending result the real write will
+    never actually produce.
+    """
+    from tools.file_operations import ReadResult
+
+    crlf_content = "alpha\r\nbeta\r\ngamma\r\n"
+
+    class FakeBackend:
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content=crlf_content)
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeBackend()
+    )
+
+    proposal = build_edit_proposal(
+        "patch",
+        {"mode": "replace", "path": "sample.txt", "old_string": "beta", "new_string": "beta\nextra"},
+        task_id="some-task",
+    )
+
+    assert proposal.new_text == "alpha\r\nbeta\r\nextra\r\ngamma\r\n"
