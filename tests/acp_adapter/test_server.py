@@ -464,6 +464,43 @@ class TestPrompt:
 
         assert state.history == []
 
+    @pytest.mark.asyncio
+    async def test_session_state_terminates_when_final_response_delivery_raises(
+        self, agent, mock_manager
+    ):
+        """An exception while delivering the final response must not leave
+        the session permanently stuck "running".
+
+        Regression: ``state.is_running = False`` was only reset by code that
+        ran *after* the (unguarded) ``await conn.session_update(...)`` call
+        for the final response. If that call raised (dropped connection,
+        serialization error, ...), the exception propagated straight out of
+        ``prompt()`` and ``state.is_running`` was never reset -- every
+        subsequent prompt on that session would see ``is_running=True``
+        forever and just pile up in the queue, never actually running.
+        """
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+
+        def _run(*args, **kwargs):
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(side_effect=RuntimeError("connection dropped"))
+        agent._conn = mock_conn
+
+        with pytest.raises(RuntimeError):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hi")],
+                session_id=resp.session_id,
+            )
+
+        assert state.is_running is False
+
 
 
 

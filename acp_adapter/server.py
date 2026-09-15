@@ -911,23 +911,41 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         interrupted = bool(result.get("interrupted")) or cancelled
         suppress = interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
-        # Send the final text unless already streamed — or if a plugin hook transformed it after.
-        if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
-            update = acp.update_agent_message_text(final_response)
-            if state.message_ids is not None:
-                # A plugin-rewritten reply replaces the streamed bubble (same id); an
-                # unstreamed final response opens its own.
-                if streamed_message and result.get("response_transformed"):
-                    update.message_id = state.message_ids.last() or state.message_ids.current()
-                else:
-                    update.message_id = state.message_ids.current()
-                state.message_ids.close()
-            await conn.session_update(session_id, update)
+        delivery_error: Exception | None = None
+        try:
+            # Send the final text unless already streamed — or if a plugin hook transformed it after.
+            if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
+                update = acp.update_agent_message_text(final_response)
+                if state.message_ids is not None:
+                    # A plugin-rewritten reply replaces the streamed bubble (same id); an
+                    # unstreamed final response opens its own.
+                    if streamed_message and result.get("response_transformed"):
+                        update.message_id = state.message_ids.last() or state.message_ids.current()
+                    else:
+                        update.message_id = state.message_ids.current()
+                    state.message_ids.close()
+                await conn.session_update(session_id, update)
+        except Exception as exc:
+            # Remember the failure but do not let it skip the cleanup below:
+            # is_running must still reset, and any prompt that was queued
+            # while THIS turn was running must still get drained here.
+            # Nothing else drains queued_prompts -- a fresh prompt() call
+            # for a later message would start its own new turn without ever
+            # looking at the queue, so re-raising immediately would strand
+            # already-queued work indefinitely (or let a newer prompt run
+            # ahead of it, breaking FIFO order).
+            delivery_error = exc
+        finally:
+            # Go idle before draining so recursive prompt() calls can
+            # acquire the session. This must run even if delivering the
+            # final response above raised (dropped connection,
+            # serialization error, ...) -- otherwise is_running stays True
+            # forever and every later prompt on this session just piles up
+            # in the queue without ever running.
+            with state.runtime_lock:
+                state.is_running = False
+                state.current_prompt_text = ""
 
-        # Go idle before draining so recursive prompt() calls can acquire the session.
-        with state.runtime_lock:
-            state.is_running = False
-            state.current_prompt_text = ""
         while True:
             with state.runtime_lock:
                 if not state.queued_prompts:
