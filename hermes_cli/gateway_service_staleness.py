@@ -10,27 +10,31 @@ from __future__ import annotations
 import re
 
 
-def normalize_systemd_unit_for_comparison(text: str) -> str:
+def normalize_systemd_unit_for_comparison(text: str, *, is_wsl: bool) -> str:
     """Normalize unit text for staleness checks, dropping only the WSL-interop entries from the PATH
     payload: ``_build_wsl_interop_paths()`` scrapes ``/mnt/...`` entries straight out of the invoking
     shell's live ``PATH`` (plus ``shutil.which()`` hits for powershell.exe/cmd.exe/etc., which resolve
-    under the same ``/mnt/...`` prefix) only when ``is_wsl()`` is true, so those entries genuinely
-    differ across Windows sessions and would flag a perfectly current unit as outdated forever.
+    under the same ``/mnt/...`` prefix) only when running on WSL, so those entries genuinely differ
+    across Windows sessions and would flag a perfectly current unit as outdated forever.
+
+    ``is_wsl`` is passed in as plain data by the caller (``hermes_cli.gateway.is_wsl()``, the real
+    platform check) rather than queried here, so this stays a pure, host-independent function --
+    AGENTS.md's "don't fake the host OS" rule: a test exercises both branches with a bool, never by
+    making the interpreter believe it's on another platform.
 
     On a non-WSL host ``_build_wsl_interop_paths()`` never contributes anything, so any ``/mnt/...``
     entry there comes from a real source (a managed Node install, a mounted toolchain resolved via
     ``shutil.which()``) and must still be compared verbatim -- masking it there would let a genuine
-    change go unrepaired by ``gateway start``/``restart``/``install``. Gating on ``is_wsl()`` keeps
-    that path fully verbatim; every other PATH entry -- managed Node, ``~/.local/bin`` and friends
+    change go unrepaired by ``gateway start``/``restart``/``install``. When ``is_wsl`` is false that
+    path stays fully verbatim; every other PATH entry -- managed Node, ``~/.local/bin`` and friends
     from ``_append_node_dir_for_service()``/``_build_user_local_paths()`` -- is compared verbatim on
     every platform for the same reason. (This still assumes ``$HOME`` itself isn't under
     ``/mnt/...`` on WSL, true for a standard distro install; that combination isn't supported here.)
     """
-    from hermes_constants import is_wsl
     from hermes_cli.gateway import _normalize_service_definition
 
     normalized = _normalize_service_definition(text)
-    if not is_wsl():
+    if not is_wsl:
         return normalized
 
     def _drop_wsl_interop_entries(match: "re.Match[str]") -> str:

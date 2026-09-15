@@ -172,15 +172,16 @@ WantedBy=default.target
         monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
         assert gw.systemd_unit_is_current(system=False) is False
 
-    def test_unit_is_current_ignores_wsl_interop_drift_but_not_real_changes(
+    def test_unit_is_current_still_catches_real_path_and_non_path_changes(
         self, tmp_path, monkeypatch,
     ):
-        """On WSL, /mnt/... PATH drift from a different invoking shell is ignored (#35240
-        follow-up); a real change -- elsewhere, or a non-/mnt/... PATH entry such as a moved
-        managed Node install -- must still be caught (#16 review)."""
+        """#16 review: systemd_unit_is_current() must keep catching every real change --
+        PATH or not -- end to end, with the real (host-native) is_wsl() wired through
+        normalize_systemd_unit_for_comparison() rather than faked. The complementary
+        "WSL interop drift is ignored" contract is proven host-independently, as plain
+        data, in TestNormalizeSystemdUnitForComparison below."""
         from hermes_cli import gateway as gw
 
-        monkeypatch.setattr("hermes_constants.is_wsl", lambda: True)
         unit_file = tmp_path / "hermes-gateway.service"
         monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
 
@@ -191,17 +192,7 @@ WantedBy=default.target
         )
         unit_file.write_text(installed)
 
-        # A different invoking shell regenerates the same deployment with different /mnt/...
-        # interop noise -- everything that actually matters is unchanged.
-        monkeypatch.setattr(
-            gw, "generate_systemd_unit",
-            lambda system=False, run_as_user=None: installed.replace(
-                "PATH=", "PATH=/mnt/c/some/other/tool:"
-            ),
-        )
-        assert gw.systemd_unit_is_current(system=False) is True
-
-        # The managed Node directory itself changed -- a real deployment change, not noise.
+        # The managed Node directory itself changed -- a real deployment change.
         monkeypatch.setattr(
             gw, "generate_systemd_unit",
             lambda system=False, run_as_user=None: installed.replace(
@@ -226,16 +217,14 @@ WantedBy=default.target
 
 
 class TestNormalizeSystemdUnitForComparison:
-    def test_masks_mnt_entries_only_under_is_wsl(self, monkeypatch):
+    def test_masks_mnt_entries_only_when_is_wsl_true(self):
         """The /mnt/... masking is WSL-interop-specific: on a non-WSL host, `_build_wsl_interop_paths()`
         never contributes anything, so a /mnt/... entry there is a real mount (e.g. a managed Node
-        install or mounted toolchain) that must be compared verbatim, not masked away (#16 review)."""
+        install or mounted toolchain) that must be compared verbatim, not masked away (#16 review).
+        `is_wsl` is passed in as plain data -- the platform is never faked (AGENTS.md)."""
         from hermes_cli.gateway_service_staleness import normalize_systemd_unit_for_comparison
 
         text = '[Service]\nEnvironment="PATH=/a:/mnt/c/windows/thing:/b"\n'
 
-        monkeypatch.setattr("hermes_constants.is_wsl", lambda: True)
-        assert "/mnt/c/windows/thing" not in normalize_systemd_unit_for_comparison(text)
-
-        monkeypatch.setattr("hermes_constants.is_wsl", lambda: False)
-        assert "/mnt/c/windows/thing" in normalize_systemd_unit_for_comparison(text)
+        assert "/mnt/c/windows/thing" not in normalize_systemd_unit_for_comparison(text, is_wsl=True)
+        assert "/mnt/c/windows/thing" in normalize_systemd_unit_for_comparison(text, is_wsl=False)
