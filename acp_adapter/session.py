@@ -175,6 +175,13 @@ class SessionManager:
         self._lock = threading.Lock()
         self._agent_factory = agent_factory
         self._db_instance = db  # None → lazy-init on first use
+        # Set by _get_db() whenever its lazy acquire() attempt raises;
+        # cleared on a successful acquire. _restore() uses this to tell a
+        # genuine acquisition failure (corruption, permissions, a busy
+        # registry) apart from "no db was ever configured" -- both leave
+        # _db_instance at None, but only the former means a session that
+        # actually exists might be unreachable rather than genuinely absent.
+        self._db_acquire_error: Exception | None = None
 
     # ---- public API ---------------------------------------------------------
 
@@ -292,8 +299,10 @@ class SessionManager:
             try:
                 from hermes_state_registry import acquire
                 self._db_instance = acquire(get_hermes_home() / "state.db")
-            except Exception:
+                self._db_acquire_error = None
+            except Exception as exc:
                 logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
+                self._db_acquire_error = exc
         return self._db_instance
 
     def _persist(self, state: SessionState) -> None:
@@ -351,6 +360,13 @@ class SessionManager:
         """Load an ACP session from the database into memory, recreating the AIAgent."""
         db = self._get_db()
         if db is None:
+            if self._db_acquire_error is not None:
+                # The DB is not simply "not configured" -- the just-now
+                # acquire() attempt raised (corruption, permissions, a busy
+                # registry, ...). A session that genuinely exists could be
+                # unreachable right now; that must not look identical to
+                # "no such session" the way a bare None return would.
+                raise SessionHistoryUnavailable(session_id) from self._db_acquire_error
             return None
         try:
             row = db.get_session(session_id)

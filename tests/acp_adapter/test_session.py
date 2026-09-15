@@ -340,16 +340,20 @@ class TestPersistence:
         }]
 
 
-    @pytest.mark.parametrize("failing_db_method", ["get_session", "get_messages_as_conversation"])
+    @pytest.mark.parametrize(
+        "failing_db_method", ["get_session", "get_messages_as_conversation", "db_acquire"]
+    )
     def test_restore_raises_on_db_failure_instead_of_faking_empty_or_missing(
         self, tmp_path, monkeypatch, failing_db_method
     ):
-        """A DB exception -- whether fetching the session row itself or its
-        message history -- must not be swallowed into "not found" or "the
-        conversation was just empty".
+        """A DB exception -- fetching the session row itself, fetching its
+        message history, or re-acquiring the SessionDB handle entirely --
+        must not be swallowed into "not found" or "the conversation was
+        just empty".
 
-        Before the fix, ``_restore`` caught any exception from either
-        ``db.get_session`` or ``db.get_messages_as_conversation`` and
+        Before the fix, ``_restore`` caught any exception from
+        ``db.get_session``/``db.get_messages_as_conversation`` (or a
+        ``None`` from ``_get_db()`` after a failed ``acquire()``) and
         treated it the same as "row not found" / "empty history", so
         ``get_session`` returned either ``None`` or an apparently-
         successful ``SessionState`` with the persisted transcript silently
@@ -371,7 +375,15 @@ class TestPersistence:
         def _boom(*args, **kwargs):
             raise RuntimeError("db timeout")
 
-        monkeypatch.setattr(db, failing_db_method, _boom)
+        if failing_db_method == "db_acquire":
+            # Force _get_db() to re-attempt acquisition on the next call
+            # (its guard is `if self._db_instance is None`) and make that
+            # attempt fail, as if state.db had become unreachable
+            # (corruption, permissions, a busy registry) between requests.
+            manager._db_instance = None
+            monkeypatch.setattr("hermes_state_registry.acquire", _boom)
+        else:
+            monkeypatch.setattr(db, failing_db_method, _boom)
 
         with pytest.raises(acp_session.SessionHistoryUnavailable):
             manager.get_session(state.session_id)
