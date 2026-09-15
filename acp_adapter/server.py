@@ -949,6 +949,21 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             # full original content-block list (a rich prompt queued while
             # a turn was running) -- rebuild the exact prompt to replay in
             # either case so attachments queued alongside text survive.
+            # NOTE: an AudioContentBlock queued this way still won't reach
+            # the model -- that's not specific to queuing, though.
+            # acp_adapter.content._content_blocks_to_openai_user_content()
+            # (called unconditionally at the top of prompt(), for every
+            # prompt whether queued or not) has no audio branch at all, so
+            # an immediate (non-queued) audio-only prompt is silently
+            # dropped the exact same way. Fixing that means adding real
+            # audio-to-model conversion in a shared, always-on code path --
+            # out of scope for the queuing fix here.
+            # Explicitly typed as list[PromptBlock] (not left to inference):
+            # the two branches would otherwise infer list[TextContentBlock]
+            # and list[PromptBlock] respectively, and a bare `list[X] |
+            # list[PromptBlock]` union is not assignable to prompt()'s
+            # list[PromptBlock] parameter -- mutable lists are invariant.
+            next_content_blocks: list[PromptBlock]
             if isinstance(next_prompt, str):
                 next_content_blocks = [TextContentBlock(type="text", text=next_prompt)]
                 display_text = next_prompt
