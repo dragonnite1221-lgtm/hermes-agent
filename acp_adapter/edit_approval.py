@@ -441,13 +441,31 @@ def _is_sensitive_auto_approve_path(path: str) -> bool:
     return bool(lowered & {".git", ".ssh"}) or Path(path).name.lower() in SENSITIVE_AUTO_APPROVE_NAMES
 
 
-def _is_single_path_auto_approvable(raw_path: str, policy: str, cwd: str | None) -> bool:
+def _is_single_path_auto_approvable(
+    raw_path: str, policy: str, cwd: str | None, resolved_path: str | None = None,
+) -> bool:
+    """``raw_path`` is the ORIGINAL (pre-canonicalization) target, always a
+    real string -- used for the sensitive-path guard and, under
+    ``AUTO_APPROVE_SESSION`` ("Don't Ask"), that guard is the ONLY check:
+    a session-wide accept auto-allows every non-sensitive edit regardless of
+    where it lands, so it must not depend on knowing a canonical location.
+
+    ``resolved_path`` is the backend-canonical location used ONLY for the
+    ``AUTO_APPROVE_WORKSPACE`` boundary check; it can be ``None`` (a non-host
+    V4A target ``tools.file_tools._resolve_v4a_policy_target`` could not
+    canonicalize -- a tilde header, or no backend cwd at all), in which case
+    that check fails closed (denies auto-approval) rather than guessing --
+    but this must NOT also deny ``AUTO_APPROVE_SESSION``, which never
+    inspects the boundary in the first place.
+    """
     if _is_sensitive_auto_approve_path(raw_path):
         return False
-    path = Path(raw_path).expanduser().resolve(strict=False)
     if policy == AUTO_APPROVE_SESSION:
         return True
     if policy == AUTO_APPROVE_WORKSPACE:
+        if resolved_path is None:
+            return False
+        path = Path(resolved_path).expanduser().resolve(strict=False)
         # tempfile.gettempdir() is the real temp root on every platform
         # (``/private/tmp`` on macOS since resolve() follows the symlink).
         return path.is_relative_to(Path(tempfile.gettempdir()).resolve(strict=False)) or (
@@ -533,21 +551,33 @@ def should_auto_approve_edit(
 
     A ``None`` entry in ``resolved_target_paths`` (only ``tools.file_tools
     ._resolve_v4a_policy_target`` produces one, for a non-host V4A target it
-    could not canonicalize against the backend's own cwd) fails the whole
-    patch closed rather than falling back to the raw string — comparing an
-    un-canonicalized backend-namespace path via host ``Path.resolve()`` is
-    exactly the false-workspace-local misclassification this function exists
-    to prevent.
+    could not canonicalize against the backend's own cwd) fails ONLY the
+    ``AUTO_APPROVE_WORKSPACE`` boundary check for that target closed, rather
+    than falling back to the raw string — comparing an un-canonicalized
+    backend-namespace path via host ``Path.resolve()`` is exactly the
+    false-workspace-local misclassification this function exists to prevent.
+    It does not affect ``AUTO_APPROVE_SESSION`` ("Don't Ask"), which never
+    inspects the workspace boundary — a session-wide accept still
+    auto-allows a non-sensitive edit whose canonical location is unknown;
+    see ``_is_single_path_auto_approvable``.
     """
 
     policy = str(policy or AUTO_APPROVE_ASK).strip()
     if policy == AUTO_APPROVE_ASK:
         return False
     cwd = _resolve_workspace_boundary(cwd, task_id)
-    targets = proposal.resolved_target_paths or proposal.target_paths or (proposal.path,)
+    raw_targets = proposal.target_paths or (proposal.path,)
+    resolved_targets = proposal.resolved_target_paths
+    if resolved_targets is None:
+        resolved_targets = raw_targets
+    elif len(resolved_targets) != len(raw_targets):
+        # Builder invariant violated (every real builder keeps these the
+        # same length) -- don't guess an alignment, fail every target's
+        # workspace check closed instead of pairing the wrong entries.
+        resolved_targets = (None,) * len(raw_targets)
     return all(
-        target is not None and _is_single_path_auto_approvable(target, policy, cwd)
-        for target in targets
+        _is_single_path_auto_approvable(raw, policy, cwd, resolved)
+        for raw, resolved in zip(raw_targets, resolved_targets)
     )
 
 

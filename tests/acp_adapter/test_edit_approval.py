@@ -975,3 +975,45 @@ def test_v4a_auto_approval_on_non_host_backend_uses_backend_cwd_not_host_resolve
         ) is False
     finally:
         terminal_tool.clear_task_env_overrides(task_id)
+
+
+def test_v4a_session_policy_auto_approves_non_host_tilde_target(monkeypatch):
+    """``AUTO_APPROVE_SESSION`` ("Don't Ask") auto-allows every non-sensitive
+    edit for the session regardless of where it lands -- it never inspects
+    the workspace boundary at all (unlike ``AUTO_APPROVE_WORKSPACE``).
+
+    A non-host V4A header that ``tools.file_tools._resolve_v4a_policy_target``
+    cannot canonicalize (a tilde-prefixed path needs a live shell round-trip
+    against the backend's own ``$HOME`` -- see that function's docstring) must
+    still be auto-approved under this policy: failing the workspace-boundary
+    check closed for an unresolvable target is right for
+    ``AUTO_APPROVE_WORKSPACE``, but wrongly denying ``AUTO_APPROVE_SESSION``
+    too would contradict the ACP "Don't Ask" contract and force an
+    unnecessary prompt (or a timeout-denial) for an ordinary edit.
+    """
+    from tools.file_operations import ReadResult
+
+    class FakeNonHostEnv:
+        """Not a LocalEnvironment -- _file_ops_uses_host_paths() reads this."""
+
+        cwd = "/remote/base"
+
+    class FakeNonHostBackend:
+        env = FakeNonHostEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            return ReadResult(content="old\n")
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend()
+    )
+
+    patch_body = "*** Update File: ~/notes.txt\n@@\n-old\n+new\n"
+    proposal = build_edit_proposal(
+        "patch", {"mode": "patch", "patch": patch_body}, task_id="session-policy-task",
+    )
+
+    # Unresolvable (tilde-prefixed) on a non-host backend.
+    assert proposal.resolved_target_paths == (None,)
+
+    assert should_auto_approve_edit(proposal, "session") is True
