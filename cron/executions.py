@@ -1,8 +1,8 @@
 """Profile-local durable audit ledger for cron execution attempts.
 
-The ledger records what is known about each attempt; it is not a retry queue.
-Interrupted attempts become ``unknown`` only after their exact owner process is
-proved gone. Terminal states are immutable.
+The ledger records what is known about each attempt; it is not a retry queue. Interrupted attempts
+become ``unknown`` only after their exact owner process is proved gone. Terminal states are
+immutable.
 """
 
 from __future__ import annotations
@@ -41,21 +41,23 @@ _recovery_intent_lock = threading.RLock()
 _recovery_intent_ids: Set[str] = set()
 
 
+# --- executions ledger --------------------------------------------------------------------------
+
 def _connect() -> sqlite3.Connection:
+    # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
+    # ``hermes_cli.sqlite_util`` / ``cron.jobs`` cached, so new names must be resolved at call time,
+    # not at import time (the guarantee cron/ledger.py used to carry, see e24c8499).
     from cron.jobs import _ensure_cron_dir
+    from hermes_cli.sqlite_util import open_db
 
     path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
     _ensure_cron_dir(path.parent)
-    return sqlite3.connect(path, timeout=5)
+    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_wal_with_fallback
+    from hermes_cli.sqlite_util import add_column_if_missing
 
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    apply_wal_with_fallback(conn, db_label="cron/executions.db")
-    conn.execute("PRAGMA synchronous=FULL")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS executions (
              id TEXT PRIMARY KEY,
@@ -122,30 +124,29 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
            )"""
     )
     _prune_foreign_lease_observations_unlocked(conn)
+    add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
+    add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
+        "ON executions(job_id, scheduled_instant) WHERE status='completed'"
+    )
 
 
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
-    """Open a connection, commit/rollback on exit, always close.
+    from hermes_cli.sqlite_util import transaction
 
-    ``sqlite3.Connection.__enter__``/``__exit__`` only commit or roll back
-    the transaction; it does not close the connection. Relying on that alone
-    leaks a connection (and its WAL/SHM file descriptors) on every call,
-    since closing then depends on the garbage collector. Schema init runs
-    inside the ``try`` too, so a PRAGMA/DDL failure after a successful
-    ``connect()`` still closes the connection instead of leaking it.
-    """
-    with _lock:
-        conn = _connect()
-        try:
-            _initialize_schema(conn)
-            with conn:
-                yield conn
-        finally:
-            conn.close()
+    with _lock, transaction(_connect()) as conn:
+        yield conn
+
+
+def _fetch(conn: sqlite3.Connection, execution_id: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
+    return dict(row) if row is not None else None
 
 
 def _record(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    """Convert an already-fetched executions row to a dict (or None)."""
     return dict(row) if row is not None else None
 
 
@@ -349,22 +350,24 @@ def _prune_foreign_lease_observations_unlocked(conn: sqlite3.Connection) -> None
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
              ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
-        (limit,),
+        (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
     )
     _prune_foreign_lease_observations_unlocked(conn)
 
 
 def create_execution(
-    job_id: str, *, source: str, fire_claim_acquired: bool = True
+    job_id: str, *, source: str, fire_claim_acquired: bool = True,
+    scheduled_instant: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Persist a claimed attempt before executor/provider dispatch."""
+    from cron.occurrences import scheduled_instant as canonical_instant
+
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
@@ -373,16 +376,13 @@ def create_execution(
             """INSERT INTO executions
                (id, job_id, source, process_id, machine_id, boot_id, pid_namespace,
                 pid, process_started_at,
-                status, claimed_at, heartbeat_at, fire_claim_acquired)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
+                status, claimed_at, heartbeat_at, fire_claim_acquired, scheduled_instant)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, _machine_id(),
              _boot_id(), _pid_namespace_id(), pid, _process_start_time(pid), now,
-             now, int(fire_claim_acquired)),
+             now, int(fire_claim_acquired), canonical_instant(scheduled_instant)),
         )
-        row = conn.execute(
-            "SELECT * FROM executions WHERE id=?", (execution_id,)
-        ).fetchone()
-    record = _record(row)
+        record = _fetch(conn, execution_id)
     # Ledger-first external dispatches are provisional until the jobs-store
     # fire-claim CAS is durably fenced below.  Emitting here and again from
     # ``mark_fire_claim_acquired`` produces two indistinguishable ``claimed``
@@ -391,6 +391,20 @@ def create_execution(
     if fire_claim_acquired:
         _emit_execution_state(record)
     return record  # type: ignore[return-value]
+
+
+def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:
+    """Bind the store-claimed snapshot before a provider hands it to a worker."""
+    from cron.occurrences import scheduled_instant
+
+    with _transaction() as conn:
+        cur = conn.execute(
+            "UPDATE executions SET scheduled_instant=? WHERE id=? AND status='claimed' "
+            "AND handoff_pending=0 AND process_id=? AND pid=?",
+            (scheduled_instant(instant), execution_id, _PROCESS_ID, os.getpid()),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Cron occurrence could not be bound before dispatch")
 
 
 def mark_execution_handoff_pending(execution_id: str) -> Optional[Dict[str, Any]]:
@@ -405,9 +419,7 @@ def mark_execution_handoff_pending(execution_id: str) -> Optional[Dict[str, Any]
         )
         if cur.rowcount != 1:
             return None
-        record = _record(conn.execute(
-            "SELECT * FROM executions WHERE id=?", (execution_id,)
-        ).fetchone())
+        record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record
 
@@ -433,9 +445,7 @@ def adopt_claimed_execution(execution_id: str) -> Optional[Dict[str, Any]]:
         )
         if cur.rowcount != 1:
             return None
-        record = _record(conn.execute(
-            "SELECT * FROM executions WHERE id=?", (execution_id,)
-        ).fetchone())
+        record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record
 
@@ -454,9 +464,7 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
         )
         if cur.rowcount != 1:
             return None
-        record = _record(conn.execute(
-            "SELECT * FROM executions WHERE id=?", (execution_id,)
-        ).fetchone())
+        record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record
 
@@ -473,17 +481,15 @@ def finish_execution(
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL
+                   handoff_started_at=NULL, delivery_outcome=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
         _prune_unlocked(conn)
-        record = _record(conn.execute(
-            "SELECT * FROM executions WHERE id=?", (execution_id,)
-        ).fetchone())
+        record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     if record is not None:
         with _recovery_intent_lock:
@@ -1224,9 +1230,7 @@ def _recover_dead_owner_executions(
                  row["handoff_pending"], row["handoff_started_at"], row["heartbeat_at"]),
             )
             if cur.rowcount:
-                record = _record(conn.execute(
-                    "SELECT * FROM executions WHERE id=?", (row["id"],)
-                ).fetchone())
+                record = _fetch(conn, row["id"])
                 if record is not None:
                     recovered.append(record)
         if recovered:
@@ -1382,8 +1386,7 @@ def recover_interrupted_executions() -> int:
 
 
 def list_executions(
-    *, job_id: Optional[str] = None, limit: int = 50,
-    before_claimed_at: Optional[str] = None,
+    *, job_id: Optional[str] = None, limit: int = 50, before_claimed_at: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return indexed, newest-first execution history with cursor pagination."""
     clauses: List[str] = []

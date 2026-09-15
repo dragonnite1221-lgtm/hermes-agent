@@ -1,27 +1,11 @@
-"""
-A2A protocol helpers — Agent Card construction, JSON-RPC framing, task store,
-and disk-backed conversation persistence.
-
-Wire shape follows A2A Protocol v1.0 (JSON-RPC 2.0 binding over HTTP):
-  - Agent Card served at GET /.well-known/agent-card.json (canonical v1.0; legacy agent.json also answers)
-  - Tasks via POST {jsonrpc:"2.0", method:"message/send", params:{...}}
-  - Streaming via ``message/stream`` → SSE; events are StreamResponse objects
-    discriminated by member presence (``statusUpdate`` / ``artifactUpdate``),
-    stream closure signals the terminal state (no ``final`` field in v1.0)
-  - Task states / message roles are v1.0 SCREAMING_SNAKE_CASE enums
-  - Parts are the v1.0 unified shape ({"text": ..., "mediaType": ...}),
-    discriminated by member presence (no ``kind`` field)
-  - Push notification configs carry ``configId`` + ``createdAt`` and can be
-    passed inline in ``message/send`` via configuration.taskPushNotificationConfig
-
-We deliberately implement the subset of A2A needed for text task exchange with
-stdlib only (no a2a-sdk). ``extract_text`` stays tolerant of v0.3 peers.
-"""
+"""A2A protocol helpers — Agent Card, JSON-RPC framing, task store, conversation persistence.
+Wire shape is A2A v1.0: SCREAMING_SNAKE_CASE states/roles; Parts and StreamResponse events are
+discriminated by member presence (no ``kind``/``final``); SSE closure signals the terminal state.
+Stdlib only. ``extract_text`` stays tolerant of v0.3 peers."""
 
 from __future__ import annotations
 
 import json
-import copy
 import os
 import threading
 import time
@@ -32,65 +16,57 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from gateway.platforms._shared import coerce_port as _coerce_int
+from hermes_constants import get_hermes_home
+
 PROTOCOL_VERSION = "1.0"
 
-# A2A v1.0 task lifecycle states.
-STATE_SUBMITTED = "TASK_STATE_SUBMITTED"
-STATE_WORKING = "TASK_STATE_WORKING"
-STATE_INPUT_REQUIRED = "TASK_STATE_INPUT_REQUIRED"
-STATE_AUTH_REQUIRED = "TASK_STATE_AUTH_REQUIRED"
-STATE_COMPLETED = "TASK_STATE_COMPLETED"
-STATE_FAILED = "TASK_STATE_FAILED"
-STATE_CANCELED = "TASK_STATE_CANCELED"
-STATE_REJECTED = "TASK_STATE_REJECTED"
+# A2A v1.0 task lifecycle states + message roles.
+STATE_SUBMITTED, STATE_WORKING, STATE_INPUT_REQUIRED = (
+    "TASK_STATE_SUBMITTED",
+    "TASK_STATE_WORKING",
+    "TASK_STATE_INPUT_REQUIRED",
+)
+STATE_COMPLETED, STATE_FAILED = "TASK_STATE_COMPLETED", "TASK_STATE_FAILED"
+STATE_CANCELED, STATE_REJECTED = "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"
+TERMINAL_STATES = frozenset({
+    STATE_COMPLETED,
+    STATE_FAILED,
+    STATE_CANCELED,
+    STATE_REJECTED,
+})
+ROLE_USER, ROLE_AGENT = "ROLE_USER", "ROLE_AGENT"
 
-TERMINAL_STATES = frozenset({STATE_COMPLETED, STATE_FAILED, STATE_CANCELED, STATE_REJECTED})
-
-# A2A v1.0 message roles.
-ROLE_USER = "ROLE_USER"
-ROLE_AGENT = "ROLE_AGENT"
-
-# The agent starts its reply with this marker when it needs clarification from
-# the peer before it can complete the task; the adapter maps such replies to
-# TASK_STATE_INPUT_REQUIRED (marker stripped, text in status.message).
+# A reply starting with this marker is a clarification request -> TASK_STATE_INPUT_REQUIRED (marker stripped).
 INPUT_REQUIRED_MARKER = "[INPUT_REQUIRED]"
 
-# JSON-RPC / A2A error codes.
-# -32001..-32003 are A2A spec-defined and used only with their spec semantics.
-# Custom errors live at -32050..-32059 (JSON-RPC implementation-defined server
-# error space, clear of the A2A-reserved block).
-ERR_PARSE = -32700
-ERR_INVALID_PARAMS = -32602
-ERR_METHOD_NOT_FOUND = -32601
-ERR_TASK_NOT_FOUND = -32001        # A2A spec: TaskNotFoundError
-ERR_TASK_NOT_CANCELABLE = -32002   # A2A spec: TaskNotCancelableError
-ERR_PUSH_NOT_SUPPORTED = -32003    # A2A spec: PushNotificationNotSupportedError
-ERR_UNAUTHORIZED = -32050
-ERR_RATE_LIMITED = -32051
-ERR_UNTRUSTED_PEER = -32052
+# JSON-RPC / A2A error codes. -32001..-32003 are A2A spec-defined; custom errors
+# live at -32050..-32059 (implementation-defined space, clear of the A2A block).
+ERR_PARSE, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND = -32700, -32602, -32601
+ERR_TASK_NOT_FOUND, ERR_TASK_NOT_CANCELABLE = (
+    -32001,
+    -32002,
+)  # A2A spec: TaskNotFoundError / TaskNotCancelableError
+ERR_UNAUTHORIZED, ERR_RATE_LIMITED, ERR_UNTRUSTED_PEER = -32050, -32051, -32052
 
-# Maximum turns an A2A conversation can have before anti-loop kicks in.
-# Default 5, configurable via A2A_MAX_PINGPONG_TURNS env (max 20).
-_DEFAULT_MAX_PINGPONG = 5
-_HARD_MAX_PINGPONG = 20
+# Anti-loop: max inbound turns per context. A2A_MAX_PINGPONG_TURNS env, capped at 20.
+_DEFAULT_MAX_PINGPONG, _HARD_MAX_PINGPONG = 5, 20
+_RATE_LIMIT_DEFAULT, _RATE_WINDOW = 60, 60.0  # requests per minute, window seconds
+
+
+def _env_int(name: str, default: int) -> int:
+    return _coerce_int(os.getenv(name, default), default)
 
 
 def max_pingpong_turns() -> int:
-    try:
-        v = int(os.getenv("A2A_MAX_PINGPONG_TURNS", str(_DEFAULT_MAX_PINGPONG)))
-        return max(1, min(v, _HARD_MAX_PINGPONG))
-    except (ValueError, TypeError):
-        return _DEFAULT_MAX_PINGPONG
+    v = _env_int("A2A_MAX_PINGPONG_TURNS", _DEFAULT_MAX_PINGPONG)
+    return max(1, min(v, _HARD_MAX_PINGPONG))
 
 
 def now_iso() -> str:
     """ISO 8601 UTC timestamp with millisecond precision (A2A v1.0)."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
-
-# --------------------------------------------------------------------------
-# Agent Card (v1.0)
-# --------------------------------------------------------------------------
 
 def build_agent_card(
     *,
@@ -103,19 +79,14 @@ def build_agent_card(
     auth_required: bool = False,
     tenant: str = "",
 ) -> dict:
-    """Construct an A2A v1.0 Agent Card document.
-
-    ``tenant`` is the optional v1.0 multi-tenancy routing key advertised on
-    AgentInterface. When present, clients MUST echo it in request params.
-    """
+    """A2A v1.0 Agent Card. ``tenant`` is the optional multi-tenancy routing key on
+    AgentInterface; when present, clients MUST echo it in request params."""
     iface: dict[str, Any] = {
         "url": url,
         "protocolBinding": "JSONRPC",
         "protocolVersion": PROTOCOL_VERSION,
+        **({"tenant": tenant} if tenant else {}),
     }
-    if tenant:
-        iface["tenant"] = tenant
-
     card: dict[str, Any] = {
         "name": name,
         "description": description,
@@ -137,51 +108,36 @@ def build_agent_card(
         "skills": skills or [],
     }
     if auth_required:
-        card["securitySchemes"] = {
-            "bearer": {"type": "http", "scheme": "bearer"}
-        }
+        card["securitySchemes"] = {"bearer": {"type": "http", "scheme": "bearer"}}
         card["security"] = [{"bearer": []}]
     return card
 
 
-def skills_from_toolsets(toolsets: "list[str] | dict[str, list[str]] | None") -> list[dict]:
-    """Derive A2A skill descriptors from the agent's toolsets.
-
-    Accepts either a plain list of toolset names, or a mapping of toolset name
-    → tool names (built from the live tool registry for dynamic Agent Cards —
-    tool names become tags so peers can match tasks to us).
-    """
-    skills = []
-    if isinstance(toolsets, dict):
-        for ts_name in sorted(toolsets.keys()):
-            tool_names = [str(t) for t in (toolsets[ts_name] or [])]
-            skills.append({
-                "id": f"toolset.{ts_name}",
-                "name": ts_name,
-                "description": f"Hermes '{ts_name}' capabilities",
-                "tags": [ts_name] + tool_names[:10],
-            })
-    else:
-        for ts in sorted(set(toolsets or [])):
-            skills.append({
-                "id": f"toolset.{ts}",
-                "name": ts,
-                "description": f"Hermes '{ts}' capabilities",
-                "tags": [ts],
-            })
-    if not skills:
-        skills.append({
+def skills_from_toolsets(
+    toolsets: "list[str] | dict[str, list[str]] | None",
+) -> list[dict]:
+    """A2A skill descriptors from toolset names or a toolset -> tool-names mapping (tool names
+    become tags, max 10)."""
+    if not isinstance(toolsets, dict):
+        toolsets = {ts: [] for ts in set(toolsets or [])}
+    skills = [
+        {
+            "id": f"toolset.{name}",
+            "name": name,
+            "description": f"Hermes '{name}' capabilities",
+            "tags": [name] + [str(t) for t in (toolsets[name] or [])][:10],
+        }
+        for name in sorted(toolsets)
+    ]
+    return skills or [
+        {
             "id": "general",
             "name": "general",
             "description": "General-purpose conversational agent",
             "tags": ["general"],
-        })
-    return skills
+        }
+    ]
 
-
-# --------------------------------------------------------------------------
-# JSON-RPC framing
-# --------------------------------------------------------------------------
 
 def jsonrpc_result(req_id: Any, result: Any) -> dict:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
@@ -192,19 +148,14 @@ def jsonrpc_error(req_id: Any, code: int, message: str) -> dict:
 
 
 def send_message_response(payload: dict) -> dict:
-    """A2A v1.0 SendMessageResponse oneof wrapper.
-
-    The JSON-RPC ``SendMessage`` result is not a bare Task/Message; it is a
-    wrapper containing exactly one of ``task`` or ``message``. Legacy methods
-    still return bare payloads for compatibility.
-    """
+    """v1.0 SendMessageResponse oneof: exactly one of ``task`` / ``message``."""
     if isinstance(payload, dict) and payload.get("status") and payload.get("id"):
         return {"task": payload}
     return {"message": payload}
 
 
 def unwrap_send_message_response(result: Any) -> Any:
-    """Return the Task/Message inside a v1.0 response, or pass legacy through."""
+    """Task/Message inside a v1.0 response; legacy bare payloads pass through."""
     if isinstance(result, dict):
         if isinstance(result.get("task"), dict):
             return result["task"]
@@ -218,11 +169,6 @@ def stream_task(task: dict) -> dict:
     return {"task": task}
 
 
-def stream_message(message: dict) -> dict:
-    """v1.0 StreamResponse with a message member."""
-    return {"message": message}
-
-
 def new_task_id() -> str:
     return "task-" + uuid.uuid4().hex[:16]
 
@@ -232,12 +178,56 @@ def new_context_id() -> str:
 
 
 def text_part(text: str) -> dict:
-    """Build a v1.0 text Part (member-presence discriminated, no ``kind``)."""
+    """v1.0 text Part (member-presence discriminated, no ``kind``)."""
     return {"text": text, "mediaType": "text/plain"}
 
 
-def file_part(url: str = "", raw: str = "", filename: str = "",
-              media_type: str = "application/octet-stream") -> dict:
+def text_message(role: str, text: str, context_id: str = "") -> dict:
+    """A2A v1.0 Message with a single text Part."""
+    msg: dict[str, Any] = {
+        "role": role,
+        "parts": [text_part(text)],
+        "messageId": uuid.uuid4().hex,
+    }
+    if context_id:
+        msg["contextId"] = context_id
+    return msg
+
+
+def _file_note(fname: str, body: str, mtype: str) -> str:
+    label = f"[file: {fname}]" if fname else "[file]"
+    return f"{label} {body}" + (f" ({mtype})" if mtype else "")
+
+
+def _json_or_str(data: Any) -> str:
+    try:
+        return json.dumps(data, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(data)
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+import copy  # noqa: F401,E402
+
+ERR_PUSH_NOT_SUPPORTED = -32003  # A2A spec: PushNotificationNotSupportedError
+
+STATE_AUTH_REQUIRED = "TASK_STATE_AUTH_REQUIRED"
+
+
+def data_part(data: Any, media_type: str = "application/json") -> dict:
+    """Build a v1.0 data Part (structured data, no ``kind`` field)."""
+    return {"data": data, "mediaType": media_type}
+
+
+def file_part(
+    url: str = "",
+    raw: str = "",
+    filename: str = "",
+    media_type: str = "application/octet-stream",
+) -> dict:
     """Build a v1.0 file Part.
 
     Either ``url`` (file reference) or ``raw`` (base64-encoded bytes) must be
@@ -251,23 +241,6 @@ def file_part(url: str = "", raw: str = "", filename: str = "",
     elif raw:
         part["raw"] = raw
     return part
-
-
-def data_part(data: Any, media_type: str = "application/json") -> dict:
-    """Build a v1.0 data Part (structured data, no ``kind`` field)."""
-    return {"data": data, "mediaType": media_type}
-
-
-def text_message(role: str, text: str, context_id: str = "") -> dict:
-    """Build an A2A v1.0 Message with a single text Part."""
-    msg: dict[str, Any] = {
-        "role": role,  # ROLE_USER | ROLE_AGENT
-        "parts": [text_part(text)],
-        "messageId": uuid.uuid4().hex,
-    }
-    if context_id:
-        msg["contextId"] = context_id
-    return msg
 
 
 def message_with_parts(role: str, parts: list[dict], context_id: str = "") -> dict:
@@ -389,10 +362,12 @@ def build_task(
     if agent_text:
         task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
         if state == STATE_COMPLETED:
-            task["artifacts"] = [{
-                "artifactId": uuid.uuid4().hex,
-                "parts": [text_part(agent_text)],
-            }]
+            task["artifacts"] = [
+                {
+                    "artifactId": uuid.uuid4().hex,
+                    "parts": [text_part(agent_text)],
+                }
+            ]
     return task
 
 
@@ -400,12 +375,15 @@ def build_task(
 # Streaming (v1.0 StreamResponse events)
 # --------------------------------------------------------------------------
 
+
 def status_update(task_id: str, context_id: str, state: str, text: str = "") -> dict:
     """v1.0 StreamResponse with a statusUpdate member."""
     status: dict[str, Any] = {"state": state, "timestamp": now_iso()}
     if text:
         status["message"] = text_message(ROLE_AGENT, text, context_id)
-    return {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}
+    return {
+        "statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}
+    }
 
 
 def artifact_update(task_id: str, context_id: str, text: str) -> dict:
@@ -451,6 +429,7 @@ def sse_done() -> str:
 # Anti-loop ping-pong protection (per-adapter instance)
 # --------------------------------------------------------------------------
 
+
 class TurnTracker:
     """Counts inbound turns per context_id to stop infinite agent↔agent loops.
 
@@ -469,7 +448,9 @@ class TurnTracker:
         """Increment and return the turn count; prunes stale contexts."""
         with self._lock:
             now = time.time()
-            stale = [cid for cid, ts in self._timestamps.items() if now - ts > self._TTL]
+            stale = [
+                cid for cid, ts in self._timestamps.items() if now - ts > self._TTL
+            ]
             for cid in stale:
                 self._counts.pop(cid, None)
                 self._timestamps.pop(cid, None)
@@ -523,6 +504,7 @@ class RateLimiter:
 # Metrics collection
 # --------------------------------------------------------------------------
 
+
 # Module-level singleton shared by the inbound adapter and the outbound client
 # tools so /metrics and a2a_list report both directions. Not persisted.
 class Metrics:
@@ -574,6 +556,7 @@ metrics = Metrics()
 # Task store — pending AND completed tasks (queryable via tasks/get, tasks/list)
 # --------------------------------------------------------------------------
 
+
 class TaskStore:
     """In-memory store of A2A tasks, kept after completion for tasks/get.
 
@@ -605,8 +588,14 @@ class TaskStore:
             return False
         return True
 
-    def create(self, task_id: str, context_id: str, peer: str,
-               agent_slug: str = "", tenant: str = "") -> dict:
+    def create(
+        self,
+        task_id: str,
+        context_id: str,
+        peer: str,
+        agent_slug: str = "",
+        tenant: str = "",
+    ) -> dict:
         rec = {
             "task_id": task_id,
             "context_id": context_id,
@@ -630,9 +619,14 @@ class TaskStore:
             if rec and rec["state"] not in TERMINAL_STATES:
                 rec["state"] = state
 
-    def set_push_config(self, task_id: str, url: str,
-                        agent_slug: str = "", tenant: str = "",
-                        peer: str = "") -> Optional[dict]:
+    def set_push_config(
+        self,
+        task_id: str,
+        url: str,
+        agent_slug: str = "",
+        tenant: str = "",
+        peer: str = "",
+    ) -> Optional[dict]:
         """Attach a push notification config; returns the stored config or None."""
         with self._lock:
             rec = self._tasks.get(task_id)
@@ -652,12 +646,21 @@ class TaskStore:
             "pushNotificationConfig": {"url": rec.get("push_url") or ""},
         }
 
-    def get_push_config(self, task_id: str, config_id: str = "",
-                        agent_slug: str = "", tenant: str = "",
-                        peer: str = "") -> Optional[dict]:
+    def get_push_config(
+        self,
+        task_id: str,
+        config_id: str = "",
+        agent_slug: str = "",
+        tenant: str = "",
+        peer: str = "",
+    ) -> Optional[dict]:
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or not self._in_scope(rec, agent_slug, tenant, peer) or not rec.get("push_url"):
+            if (
+                not rec
+                or not self._in_scope(rec, agent_slug, tenant, peer)
+                or not rec.get("push_url")
+            ):
                 return None
             if config_id and rec.get("push_config_id") != config_id:
                 return None
@@ -672,16 +675,29 @@ class TaskStore:
     ) -> list[dict]:
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or not self._in_scope(rec, agent_slug, tenant, peer) or not rec.get("push_url"):
+            if (
+                not rec
+                or not self._in_scope(rec, agent_slug, tenant, peer)
+                or not rec.get("push_url")
+            ):
                 return []
             return [self._push_config_view(rec)]
 
-    def delete_push_config(self, task_id: str, config_id: str = "",
-                           agent_slug: str = "", tenant: str = "",
-                           peer: str = "") -> bool:
+    def delete_push_config(
+        self,
+        task_id: str,
+        config_id: str = "",
+        agent_slug: str = "",
+        tenant: str = "",
+        peer: str = "",
+    ) -> bool:
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or not self._in_scope(rec, agent_slug, tenant, peer) or not rec.get("push_url"):
+            if (
+                not rec
+                or not self._in_scope(rec, agent_slug, tenant, peer)
+                or not rec.get("push_url")
+            ):
                 return False
             if config_id and rec.get("push_config_id") != config_id:
                 return False
@@ -772,18 +788,23 @@ class TaskStore:
         if state:
             recs = [r for r in recs if r["state"] == state]
         total = len(recs)
-        page = recs[offset:offset + page_size]
+        page = recs[offset : offset + page_size]
         next_offset = offset + page_size if offset + page_size < total else 0
         if with_total:
             return page, next_offset, total
         return page, next_offset
 
-    def fail_orphans(self, timeout_seconds: int = 300) -> list[str]:
+    def fail_orphans(
+        self, timeout_seconds: int = 300, *, exclude: set[str] | None = None
+    ) -> list[str]:
+        excluded = exclude or set()
         with self._lock:
             now = time.time()
             stale = [
-                tid for tid, rec in self._tasks.items()
-                if rec["state"] not in TERMINAL_STATES
+                tid
+                for tid, rec in self._tasks.items()
+                if tid not in excluded
+                and rec["state"] not in TERMINAL_STATES
                 and now - rec["created_at"] > timeout_seconds
             ]
         failed = []
@@ -793,13 +814,17 @@ class TaskStore:
         return failed
 
     def _trim_locked(self) -> None:
-        terminal = [tid for tid, rec in self._tasks.items() if rec["state"] in TERMINAL_STATES]
+        terminal = [
+            tid for tid, rec in self._tasks.items() if rec["state"] in TERMINAL_STATES
+        ]
         excess = len(terminal) - self._MAX_TERMINAL
-        for tid in terminal[:max(0, excess)]:
+        for tid in terminal[: max(0, excess)]:
             self._tasks.pop(tid, None)
 
     @staticmethod
-    def to_task(rec: dict, history_length: Optional[int] = None, include_artifacts: bool = True) -> dict:
+    def to_task(
+        rec: dict, history_length: Optional[int] = None, include_artifacts: bool = True
+    ) -> dict:
         """Render a stored record as an A2A v1.0 Task object."""
         task = build_task(
             rec["task_id"],
@@ -814,13 +839,16 @@ class TaskStore:
             task.pop("history", None)
         return copy.deepcopy(task)
 
+
 # --------------------------------------------------------------------------
 # Conversation persistence (outside the context-compaction pipeline)
 # --------------------------------------------------------------------------
 
+
 def _conv_dir() -> Path:
     try:
         from hermes_constants import get_hermes_home
+
         base = Path(get_hermes_home())
     except Exception:
         base = Path(os.path.expanduser("~/.hermes"))
@@ -828,7 +856,10 @@ def _conv_dir() -> Path:
 
 
 def _safe_name(context_id: str) -> str:
-    return "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_") or "default"
+    return (
+        "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_")
+        or "default"
+    )
 
 
 def persist_message(context_id: str, role: str, text: str, task_id: str = "") -> None:
@@ -870,3 +901,11 @@ def list_conversations() -> list[str]:
     if not d.exists():
         return []
     return sorted(p.stem for p in d.glob("*.jsonl"))
+
+
+def stream_message(message: dict) -> dict:
+    """v1.0 StreamResponse with a message member."""
+    return {"message": message}
+
+
+# ---- END PLUGIN-COMPAT ----

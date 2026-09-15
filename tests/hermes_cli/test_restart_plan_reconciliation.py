@@ -219,13 +219,35 @@ def test_launchd_named_profile_gateway_restart_matches():
     assert report_unaccounted_runtimes(outcomes) is False
 
 
-def test_launchd_default_profile_gateway_restart_matches():
+def test_launchd_default_gateway_restarted_via_ai_hermes_label():
+    """macOS restart bookkeeping records ``ai.hermes.gateway``, which does not
+    contain the substring ``hermes-gateway``. The default-profile gateway must
+    still count as restarted — otherwise every Desktop update on launchd
+    exits 1 after a successful kickstart (receipt outcome=partial, tripwire
+    'never touched')."""
     outcomes = match_runtime_outcomes(
-        _plan(_rt("default", 501, supervisor="launchd")),
+        _plan(_rt("default", 400, supervisor="launchd")),
         restarted_services=["ai.hermes.gateway"], relaunched_profiles=[],
         externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
     )
     assert outcomes[0]["outcome"] == "restarted"
+    assert report_unaccounted_runtimes(outcomes) is False
+
+
+def test_launchd_named_profile_and_failed_label():
+    restarted = match_runtime_outcomes(
+        _plan(_rt("work", 401, supervisor="launchd")),
+        restarted_services=["ai.hermes.gateway-work"], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+    )
+    assert restarted[0]["outcome"] == "restarted"
+    failed = match_runtime_outcomes(
+        _plan(_rt("default", 402, supervisor="launchd")),
+        restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(),
+        failed_units=["ai.hermes.gateway"],
+    )
+    assert failed[0]["outcome"] == "failed"
 
 
 def test_desktop_survivor_probe_overrides_supervision():

@@ -378,7 +378,13 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
         or {"id": jid, "name": "t", "fire_claim": {"by": "exact-owner"}},
         raising=False,
     )
-    monkeypatch.setattr(executions, "create_execution", lambda *_a, **_kw: {"id": "exec-1"})
+    # Delegate to the REAL create_execution (rather than a disconnected fake id): the
+    # provider's claim_fire also calls set_execution_occurrence, which persists against
+    # the actual row and needs it to genuinely exist.
+    monkeypatch.setattr(
+        executions, "create_execution",
+        lambda jid, _create=executions.create_execution, **kw: _create(jid, **kw),
+    )
     monkeypatch.setattr(
         sched,
         "run_one_job",
@@ -386,8 +392,10 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     )
 
     assert InProcessCronScheduler().fire_due("j1") is True
+    assert len(claims) == 1
+    exec_id = claims[0][1]["execution_id"]
     assert claims == [
-        ("j1", {"return_job": True, "execution_id": "exec-1", "force": False})
+        ("j1", {"return_job": True, "execution_id": exec_id, "force": False, "manual": False})
     ]
     assert ran == [("j1", "exact-owner")]
 
@@ -410,7 +418,8 @@ def test_fire_due_propagates_pre_run_abort(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(
-        executions, "create_execution", lambda *_a, **_kw: {"id": "exec-1"}
+        executions, "create_execution",
+        lambda jid, _create=executions.create_execution, **kw: _create(jid, **kw),
     )
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: False)
 
@@ -433,7 +442,8 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
     monkeypatch.setattr(
         executions,
         "create_execution",
-        lambda jid, source, **_kwargs: events.append("ledger") or {"id": "exec-1"},
+        lambda jid, source, _create=executions.create_execution, **kwargs:
+        events.append("ledger") or _create(jid, source=source, **kwargs),
     )
     monkeypatch.setattr(
         sched,
@@ -446,9 +456,9 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
 
     assert events == ["ledger", "claim"]
     assert claimed is not None
-    assert claimed["execution_id"] == "exec-1"
+    assert executions.get_execution(claimed["execution_id"])["status"] == "claimed"
     assert provider.fire_claimed(claimed) is True
-    assert events == ["ledger", "claim", ("run", "exec-1")]
+    assert events == ["ledger", "claim", ("run", claimed["execution_id"])]
 
 
 def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
@@ -464,16 +474,27 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
         lambda jid, **kw: claims.append((jid, kw))
         or {"id": jid, "name": "t", "fire_claim": {"by": "manual-owner"}},
     )
-    monkeypatch.setattr(executions, "create_execution", lambda *_a, **_kw: {"id": "exec-1"})
+    monkeypatch.setattr(
+        executions, "create_execution",
+        lambda jid, _create=executions.create_execution, **kw: _create(jid, **kw),
+    )
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: True)
 
     assert InProcessCronScheduler().fire_due("j1", force=True) is True
+    exec_id_1 = claims[0][1]["execution_id"]
     assert claims == [
         (
             "j1",
-            {"force": True, "return_job": True, "execution_id": "exec-1"},
+            {"force": True, "return_job": True, "execution_id": exec_id_1, "manual": False},
         )
     ]
+    # An off-tick run-now forwards ``manual`` so the claim does not stamp the next occurrence;
+    # the default (webhook / misfire) fire keeps the occurrence stamp.
+    assert InProcessCronScheduler().fire_due("j1", manual=True) is True
+    exec_id_2 = claims[-1][1]["execution_id"]
+    assert claims[-1] == (
+        "j1", {"manual": True, "return_job": True, "execution_id": exec_id_2, "force": False}
+    )
 
 
 def test_fire_due_lost_claim_does_not_run(monkeypatch):
@@ -1005,3 +1026,42 @@ def test_multiplex_recovery_isolates_profile_failures(tmp_path):
     assert recovery_homes == [str(failing_home), str(healthy_home)]
     # The failing profile stays in rotation: its ledger may still hold jobs.
     assert set(tick_homes) == {str(failing_home), str(healthy_home)}
+
+
+def test_multiplex_ticker_reenumerates_profiles_each_cycle(tmp_path):
+    """Hot-serve: with a callable ``profile_homes`` the ticker re-reads the served set every cycle,
+    so a profile created after the multiplexer started gets its jobs fired without a restart."""
+    import threading
+    from unittest.mock import patch
+    from cron.scheduler_provider import InProcessCronScheduler
+    from hermes_constants import get_hermes_home
+
+    alpha = tmp_path / "alpha"
+    gamma = tmp_path / "gamma"
+    (alpha / "cron").mkdir(parents=True)
+    homes = [("alpha", alpha)]
+    stop = threading.Event()
+    ticked: list[str] = []
+
+    def _tick(*args, **kwargs):
+        ticked.append(str(get_hermes_home()))
+        if len(ticked) == 1:  # "hermes profile create gamma" happens between two cycles
+            (gamma / "cron").mkdir(parents=True)
+            homes.append(("gamma", gamma))
+        if len(ticked) >= 4:
+            stop.set()
+        return 0
+
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=_tick):
+        thread = threading.Thread(
+            target=provider.start, args=(stop,),
+            kwargs={"interval": 0, "profile_homes": lambda: list(homes)}, daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+        stop.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert str(gamma) in ticked, ticked
