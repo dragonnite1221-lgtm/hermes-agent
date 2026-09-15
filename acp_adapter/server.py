@@ -951,9 +951,28 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 if not state.queued_prompts:
                     break
                 next_prompt = state.queued_prompts.pop(0)
-            if conn:
-                await conn.session_update(session_id, acp.update_user_message_text(next_prompt))
-            await self.prompt(prompt=[TextContentBlock(type="text", text=next_prompt)], session_id=session_id)
+            try:
+                if conn:
+                    await conn.session_update(
+                        session_id,
+                        acp.update_user_message_text(next_prompt),
+                    )
+                await self.prompt(
+                    prompt=[TextContentBlock(type="text", text=next_prompt)],
+                    session_id=session_id,
+                )
+            except Exception:
+                # The connection that failed to deliver the ORIGINAL final
+                # response above may still be down, or self.prompt() itself
+                # may have failed before it could take ownership of this
+                # item. Either way, the item was already popped -- put it
+                # back at the front of the queue so a persistent failure
+                # here can't silently drop a user's queued prompt, then
+                # surface the failure instead of continuing to drain
+                # against a connection that keeps failing.
+                with state.runtime_lock:
+                    state.queued_prompts.insert(0, next_prompt)
+                raise
 
         if delivery_error is not None:
             # Now that the session is idle again and any queued follow-ups

@@ -553,6 +553,46 @@ class TestPrompt:
         assert state.queued_prompts == []
         assert len(run_calls) == 2  # original turn + the drained follow-up
 
+    @pytest.mark.asyncio
+    async def test_queued_prompt_is_not_lost_when_connection_stays_down(
+        self, agent, mock_manager
+    ):
+        """A PERSISTENTLY failing connection must not lose a queued prompt.
+
+        The drain loop pops an item off ``state.queued_prompts`` before
+        attempting to deliver it. If the connection that failed to deliver
+        the original final response is still down (not just a one-off
+        blip), that same delivery attempt for the queued item fails too --
+        and since the item was already popped, it would otherwise vanish
+        instead of surviving for a later retry.
+        """
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+
+        def _run(*args, **kwargs):
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        # The connection never recovers -- every session_update call fails.
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(side_effect=RuntimeError("connection dropped"))
+        agent._conn = mock_conn
+
+        state.queued_prompts.append("follow-up while busy")
+
+        with pytest.raises(RuntimeError):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hi")],
+                session_id=resp.session_id,
+            )
+
+        assert state.is_running is False
+        # The queued item must still be there for a later retry, not lost.
+        assert state.queued_prompts == ["follow-up while busy"]
+
 
 
 
