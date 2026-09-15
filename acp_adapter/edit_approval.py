@@ -117,6 +117,7 @@ def _resolve_edit_path(path: str, task_id: str = "default") -> str:
 
 def _read_text_if_exists(
     path: str, task_id: str = "default", *, strip_fence_leaks: bool = True, deny_binary: bool = True,
+    resolve: bool = True,
 ) -> str | None:
     """Read ``path``'s current content for the approval diff.
 
@@ -159,8 +160,23 @@ def _read_text_if_exists(
     ``.is_binary``/``.is_image``). Requiring a successful TEXT preview
     before a delete-only V4A patch on an image/binary file could run
     would deny a delete the real executor allows.
+
+    ``resolve=False`` (used only by ``_proposal_for_patch_v4a`` on a
+    non-host-paths backend) skips ``_resolve_edit_path`` and hands ``path``
+    to the backend exactly as written. This mirrors
+    ``tools/file_tools.py``'s ``_rewrite_v4a_patch_paths_for_host``, which
+    rewrites V4A patch headers to host-resolved paths ONLY when
+    ``_file_ops_uses_host_paths(file_ops)`` is true; for an SSH/container/
+    sandbox backend it leaves headers untouched and lets THAT backend's own
+    shell resolve them against its own live cwd (``ShellFileOperations._exec``
+    always runs with ``cwd=effective_cwd`` from ``self.env.cwd``/``self.cwd``).
+    Resolving via ``_resolve_edit_path`` there instead would anchor onto
+    ``_resolve_path_for_task``'s notion of the task's cwd (which, before any
+    terminal command has run in the session, can still be the ACP client's
+    raw HOST workspace path, not the container's actual filesystem
+    namespace) -- previewing a path the real V4A apply never even looks at.
     """
-    resolved = _resolve_edit_path(path, task_id)
+    resolved = _resolve_edit_path(path, task_id) if resolve else path
 
     from tools.file_tools import _get_file_ops
 
@@ -336,6 +352,19 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
     if not paths:
         raise ValueError("no file paths found in V4A patch")
     single = len(paths) == 1
+
+    # Mirror tools/file_tools.py's _rewrite_v4a_patch_paths_for_host: it
+    # rewrites V4A headers to host-resolved paths ONLY for a host-paths
+    # backend (_file_ops_uses_host_paths); a non-host (SSH/container/
+    # sandbox) backend gets the ORIGINAL headers untouched and resolves
+    # them itself against its own live cwd. Resolving via
+    # _resolve_edit_path unconditionally here would preview (and report as
+    # the auto-approval target) a path the real V4A apply never even looks
+    # at -- see _read_text_if_exists's docstring on resolve=False.
+    from tools.file_tools import _file_ops_uses_host_paths, _get_file_ops
+
+    uses_host_paths = _file_ops_uses_host_paths(_get_file_ops(task_id))
+
     # ACP only supports a single diff payload: surface the exact V4A patch as new_text so
     # patch-mode calls are permissioned and denied patches cannot mutate.
     return EditProposal(
@@ -345,7 +374,9 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
         # new content from old, so #5's overwrite-masking protection does
         # not apply) -- see _read_text_if_exists's docstring and
         # tools/patch_parser.py's _apply_delete.
-        old_text=_read_text_if_exists(paths[0], task_id, deny_binary=not is_delete_only) if single else None,
+        old_text=_read_text_if_exists(
+            paths[0], task_id, deny_binary=not is_delete_only, resolve=uses_host_paths,
+        ) if single else None,
         # ACP only supports a single diff payload here.  Surface the exact V4A
         # patch content before execution so patch-mode calls are permissioned
         # and denied patches cannot mutate.
@@ -354,10 +385,14 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
         # Keep the real per-file targets alongside the joined display string
         # so approval decisions never parse `path` back into a filesystem path.
         target_paths=tuple(paths),
-        # Same targets resolved through the task-live-cwd-aware resolver, so
-        # should_auto_approve_edit judges each one against where the real
-        # V4A apply will touch, not this process's own cwd.
-        resolved_target_paths=tuple(_resolve_edit_path(p, task_id) for p in paths),
+        # Same targets resolved through the task-live-cwd-aware resolver --
+        # ONLY on a host-paths backend, matching where the real (rewritten)
+        # V4A headers will touch. On a non-host backend the real apply
+        # leaves headers untouched, so the raw paths ARE the real execution
+        # targets; resolving them here would diverge from reality.
+        resolved_target_paths=(
+            tuple(_resolve_edit_path(p, task_id) for p in paths) if uses_host_paths else tuple(paths)
+        ),
     )
 
 
@@ -404,26 +439,47 @@ def _is_single_path_auto_approvable(raw_path: str, policy: str, cwd: str | None)
 
 def _resolve_workspace_boundary(cwd: str | None, task_id: str | None) -> str | None:
     """Return the AUTO_APPROVE_WORKSPACE boundary in the SAME namespace as
-    ``proposal.resolved_target_paths``.
+    ``proposal.resolved_target_paths`` -- WITHOUT letting it drift with the
+    task's *live* cwd.
 
     ``cwd`` (``state.cwd`` at the call sites) is the ACP client's own report
-    of the session's workspace directory. For a local backend that IS the
-    filesystem namespace the write happens in, so comparing it directly
-    against a resolved target works. For an SSH/container/sandbox-backed
-    task it need not be: ``tools.file_tools._resolve_base_dir(task_id)`` is
-    the exact base directory ``_resolve_path_for_task`` anchors a relative
-    target onto (and, via ``_anchor``, the same normalization an absolute
-    target goes through) -- i.e. the boundary as the resolver itself sees
-    it, not as the client separately reported it. When ``task_id`` is
-    unavailable (e.g. an ``EditProposal`` built by hand in a test) or the
-    lookup fails, fall back to the given ``cwd`` unchanged.
+    of the session's ORIGINAL workspace directory, set once at session
+    create/load/resume. For a local backend that IS the filesystem
+    namespace the write happens in, so comparing it directly against a
+    resolved target works. For an SSH/container/sandbox-backed task it need
+    not be, since the client-reported cwd can differ from the backend's own
+    filesystem view.
+
+    The fix is NOT ``tools.file_tools._resolve_base_dir(task_id)``: that
+    function's ``_authoritative_workspace_root`` prefers the task's *live*
+    terminal cwd (updated by every ``cd`` the agent runs) over the
+    registered session cwd -- exactly right for resolving a relative EDIT
+    TARGET (matching where the write actually lands), but wrong for the
+    approval BOUNDARY itself, which must stay anchored to the workspace the
+    session was configured with. Using the live cwd for both would let an
+    agent that ``cd``s OUTSIDE the original workspace silently auto-approve
+    every subsequent relative write there, since the target and the
+    boundary would always be resolved against the identical (now
+    out-of-workspace) live directory.
+
+    Instead this reads ONLY the REGISTERED session cwd override
+    (``tools.file_tools_paths._registered_task_cwd_override`` -- what
+    ``acp_adapter/session.py``'s ``_register_task_cwd`` sets at session
+    create/load/resume, deliberately skipping the live-cwd tier) and runs
+    it through ``_resolve_path_for_task`` for the SAME namespace
+    normalization a resolved target gets. When ``task_id`` is unavailable
+    (e.g. an ``EditProposal`` built by hand in a test), no override is
+    registered, or the lookup fails, this falls back to the given ``cwd``
+    unchanged.
     """
     if not task_id:
         return cwd
     try:
-        from tools.file_tools import _resolve_base_dir
+        from tools.file_tools import _resolve_path_for_task
+        from tools.file_tools_paths import _registered_task_cwd_override
 
-        return str(_resolve_base_dir(task_id))
+        root = _registered_task_cwd_override(task_id)
+        return str(_resolve_path_for_task(root, task_id)) if root else cwd
     except Exception:
         return cwd
 

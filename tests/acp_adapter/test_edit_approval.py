@@ -794,3 +794,94 @@ def test_workspace_auto_approval_resolves_cwd_boundary_via_task_base_dir(tmp_pat
         ) is True
     finally:
         terminal_tool.clear_task_env_overrides(task_id)
+
+
+def test_workspace_auto_approval_boundary_survives_a_cd_outside_the_original_workspace(
+    tmp_path, monkeypatch
+):
+    """The AUTO_APPROVE_WORKSPACE boundary must stay anchored to the
+    ORIGINAL registered session workspace, not the task's live (post-cd)
+    terminal cwd.
+
+    The prior fix (resolving the boundary via
+    tools.file_tools._resolve_base_dir(task_id)) accidentally tracked the
+    LIVE cwd, same as a relative target does -- so once the agent cd'd
+    outside the original workspace, the target and the boundary were both
+    resolved against the SAME (now out-of-workspace) live directory,
+    making the check a tautology that always passed. This is exactly the
+    "cd outside the workspace, then auto-approve a write there" scenario
+    the boundary check exists to catch: register the ORIGINAL workspace,
+    cd elsewhere, then write a relative path.
+    """
+    fake_tmp_root = tmp_path / "unrelated-tmp-root"
+    fake_tmp_root.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp_root))
+
+    import tools.terminal_tool as terminal_tool
+
+    task_id = "cd-outside-workspace-test"
+
+    original_workspace = tmp_path / "original-workspace"
+    original_workspace.mkdir()
+
+    outside = tmp_path / "outside-the-workspace"
+    outside.mkdir()
+
+    # Register the session's cwd at "create" time (original_workspace) --
+    # what acp_adapter/session.py's _register_task_cwd does -- then the
+    # agent `cd`s outside it (tracked separately as the LIVE cwd).
+    terminal_tool.register_task_env_overrides(task_id, {"cwd": str(original_workspace)})
+    terminal_tool.record_session_cwd(task_id, str(outside))
+    try:
+        proposal = build_edit_proposal(
+            "write_file", {"path": "relative.txt", "content": "x"}, task_id=task_id,
+        )
+        # `cwd` here is exactly the original workspace (what state.cwd would
+        # still report) -- the boundary must stay there, not follow the live
+        # cwd the target itself was resolved against.
+        assert should_auto_approve_edit(
+            proposal, "workspace_session", cwd=str(original_workspace), task_id=task_id,
+        ) is False
+    finally:
+        terminal_tool.clear_task_env_overrides(task_id)
+        terminal_tool.clear_session_cwd(task_id)
+
+
+def test_v4a_preview_on_non_host_backend_does_not_resolve_via_host_resolver(monkeypatch):
+    """V4A's real write (tools/file_tools.py's
+    ``_rewrite_v4a_patch_paths_for_host``) rewrites patch headers to
+    host-resolved paths ONLY for a host-paths backend
+    (``_file_ops_uses_host_paths``); for a non-host (SSH/container/sandbox)
+    backend it leaves headers untouched and lets THAT backend's own shell
+    resolve them against its own live cwd. The preview must do the same --
+    resolving via ``_resolve_edit_path`` (host-anchored) would preview a
+    path the real V4A apply never even looks at.
+    """
+    from tools.file_operations import ReadResult
+
+    class FakeNonHostEnv:
+        """Not a LocalEnvironment -- _file_ops_uses_host_paths() reads this."""
+
+    class FakeNonHostBackend:
+        env = FakeNonHostEnv()
+
+        def read_file_raw(self, path, **kwargs):
+            assert path == "relative.txt"  # raw, unresolved
+            return ReadResult(content="container content\n")
+
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops", lambda task_id="default": FakeNonHostBackend()
+    )
+
+    def _must_not_resolve(*_args, **_kwargs):
+        raise AssertionError("must not host-resolve a path on a non-host backend")
+
+    monkeypatch.setattr("tools.file_tools._resolve_path_for_task", _must_not_resolve)
+
+    patch_body = "*** Update File: relative.txt\n@@\n-old\n+new\n"
+    proposal = build_edit_proposal(
+        "patch", {"mode": "patch", "patch": patch_body}, task_id="container-task",
+    )
+
+    assert proposal.old_text == "container content\n"
+    assert proposal.resolved_target_paths == ("relative.txt",)
