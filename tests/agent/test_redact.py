@@ -390,6 +390,12 @@ class TestPythonReprFields:
 
 
 class TestAuthHeaders:
+    def test_mixed_case_authorization_header_redacted(self):
+        secret = "c3VwZXItb3BhcXVlLXZhbHVl"
+        result = redact_sensitive_text(f"aUtHoRiZaTiOn: Basic {secret}", force=True)
+        assert secret not in result
+        assert "aUtHoRiZaTiOn: Basic " in result
+
 
 
 
