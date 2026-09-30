@@ -143,6 +143,15 @@ def _hint_ambiguity(content: str, hint: str, tail: str = "") -> Tuple[int, str]:
     return n, f"context hint '{hint}' is ambiguous ({n} occurrences){tail}" if n > 1 else ""
 
 
+def _add_read_error(path: str, result: Any) -> Optional[str]:
+    """Only an explicit missing-file result permits Add; read errors are not absence."""
+    if not result.error or getattr(result, "is_binary", False) or getattr(result, "is_image", False):
+        return f"{path}: file already exists — use Update File, not Add File"
+    if str(result.error).lower() == "file not found" or str(result.error).lower().startswith("file not found:"):
+        return None
+    return f"{path}: cannot verify new file: {result.error}"
+
+
 def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> List[str]:
     """Dry-run every operation -> error strings (empty = safe). UPDATE hunks are simulated in
     order so later hunks see post-earlier-hunk content, exactly as apply will."""
@@ -258,8 +267,14 @@ def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> Lis
             # the MOVE destination guard. Overlay-aware: an Add after a Delete of the
             # same path in this patch stays legal, and the added content enters the
             # overlay so later hunks against it validate.
-            if not _read(op.file_path)[1]:
-                errors.append(f"{op.file_path}: file already exists — use Update File, not Add File")
+            if op.file_path in pending_content:
+                add_error = f"{op.file_path}: file already exists — use Update File, not Add File"
+            elif op.file_path in removed_paths:
+                add_error = None
+            else:
+                add_error = _add_read_error(op.file_path, file_ops.read_file_raw(op.file_path))
+            if add_error:
+                errors.append(add_error)
             else:
                 removed_paths.discard(op.file_path)
                 pending_content[op.file_path] = '\n'.join(
@@ -352,8 +367,8 @@ def _apply_add(op: PatchOperation, file_ops: Any) -> ApplyResult:
     this patch, which has already applied by now), so an existing file here is a
     validate/apply race — never clobber."""
     read_back = file_ops.read_file_raw(op.file_path)
-    if not read_back.error:
-        return _fail(f"{op.file_path}: file already exists — use Update File, not Add File")
+    if error := _add_read_error(op.file_path, read_back):
+        return _fail(error)
     content_lines = [line.content for hunk in op.hunks for line in hunk.lines if line.prefix == '+']
     result = file_ops.write_file(op.file_path, '\n'.join(content_lines))
     diff = f"--- /dev/null\n+++ b/{op.file_path}\n" + '\n'.join(f"+{line}" for line in content_lines)

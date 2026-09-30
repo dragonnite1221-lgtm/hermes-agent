@@ -178,6 +178,40 @@ def _rewrite_v4a_patch_paths_for_host(patch: str, path_to_resolved: dict, file_o
     return _apply_v4a_header_rewrite(patch, path_to_resolved)
 
 
+def _resolve_v4a_host_patch(patch: str, task_id: str) -> tuple[str, list[str]]:
+    """Freeze host targets without dereferencing entries removed by this patch.
+
+    Content updates retain referent-based linting. Once an entry is removed or
+    created, later operations keep its name so the parser's overlay sees the
+    sequential state, rather than the symlink target that existed before apply.
+    """
+    changed_entries: set[str] = set()
+    targets: list[str] = []
+
+    def resolve(raw: str, *, entry_only: bool = False) -> str:
+        raw = raw.strip()
+        entry = str(_resolve_path_for_task(raw, task_id, dereference_final=False))
+        target = entry if entry_only or entry in changed_entries else str(_resolve_path_for_task(raw, task_id))
+        targets.append(target)
+        return target
+
+    lines = []
+    for line in patch.splitlines(keepends=True):
+        if match := _V4A_SINGLE_HEADER_RE.match(line):
+            operation = match.group(2)
+            target = resolve(match.group(3), entry_only=operation in ("Delete", "Add"))
+            if operation in ("Delete", "Add"):
+                changed_entries.add(target)
+            line = line[:match.start(3)] + target + line[match.end(3):]
+        elif match := _V4A_MOVE_HEADER_RE.match(line):
+            source = resolve(match.group(2), entry_only=True)
+            destination = resolve(match.group(3))
+            changed_entries.update((source, destination))
+            line = f"{match.group(1)}{source} -> {destination}" + line[match.end(3):]
+        lines.append(line)
+    return "".join(lines), targets
+
+
 def _resolve_v4a_policy_target(path: str, file_ops) -> str | None:
     """Backend-canonical form of a raw V4A header path, for the auto-approval
     BOUNDARY CHECK only -- never for the patch body actually sent to the backend.
@@ -1064,12 +1098,15 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # overlapping multi-file patches can't deadlock (every caller locks in
         # the same order). An unresolvable path is simply not locked.
         _path_to_resolved: dict[str, str] = {_p: _resolve_or_none(_p, task_id) for _p in _paths_to_check}
+        file_ops = _get_file_ops(task_id)
+        if mode == "patch" and patch and _file_ops_uses_host_paths(file_ops):
+            patch, targets = _resolve_v4a_host_patch(patch, task_id)
+            _paths_to_check = targets
+            _path_to_resolved = {target: target for target in targets}
         with ExitStack() as _locks:
             for _r in sorted({_r for _r in _path_to_resolved.values() if _r}):
                 _locks.enter_context(file_state.lock_path(_r))
             stale_warnings = _edit_warnings(_paths_to_check, _path_to_resolved, task_id)
-            file_ops = _get_file_ops(task_id)
-
             # Hand the shell layer the RESOLVED targets so both layers agree on
             # which file is edited even when the shell's cwd differs.
             if mode == "replace":

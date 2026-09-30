@@ -495,10 +495,13 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any], task_id: str = "default")
     # execution target is a different one entirely. Resolving first and
     # reading the SAME resolved path removes that gap: both the preview and
     # the policy/freeze target now come from one snapshot.
-    resolved_target_paths = (
-        tuple(_resolve_edit_path(p, task_id) for p in paths) if uses_host_paths
-        else tuple(_resolve_v4a_policy_target(p, file_ops) for p in paths)
-    )
+    if uses_host_paths:
+        from tools.file_tools import _resolve_v4a_host_patch
+
+        _resolved_patch, targets = _resolve_v4a_host_patch(patch_body, task_id)
+        resolved_target_paths = tuple(targets)
+    else:
+        resolved_target_paths = tuple(_resolve_v4a_policy_target(p, file_ops) for p in paths)
 
     # V4A applies no line-ending normalization at all (see
     # _normalize_new_text_for_preview's docstring), so had_bom is never
@@ -640,7 +643,8 @@ def _is_single_path_auto_approvable(
     if policy == AUTO_APPROVE_WORKSPACE:
         if resolved_path is None:
             return False
-        path = Path(resolved_path).expanduser().resolve(strict=False)
+        path = Path(resolved_path).expanduser()
+        path = path.resolve(strict=False) if dereference_final else path.parent.resolve(strict=False) / path.name
         # temp_roots (from should_auto_approve_edit) is the CONTROLLER's own
         # tempfile.gettempdir() for a host-paths backend, or the selected
         # non-host backend's OWN temp dir (BaseEnvironment.get_temp_dir(),
