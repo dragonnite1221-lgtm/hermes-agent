@@ -169,12 +169,18 @@ def _resolve_base_dir(
     return _anchor(_host_text(root or os.getcwd(), container_paths), os.getcwd, container_paths)
 
 
-def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
+def _resolve_path_for_task(
+    filepath: str, task_id: str = "default", *, dereference_final: bool = True,
+) -> Path | PurePosixPath:
     """Resolve *filepath* against the task's absolute base directory
     (absolute inputs are returned resolved-but-unanchored)."""
     container_paths = _uses_container_paths(task_id)
-    return _anchor(_host_text(filepath, container_paths),
-                   lambda: _resolve_base_dir(task_id, container_paths=container_paths), container_paths)
+    text = _host_text(filepath, container_paths)
+    base = lambda: _resolve_base_dir(task_id, container_paths=container_paths)
+    if not dereference_final and not container_paths:
+        p = Path(text)
+        return _anchor(str(p.parent), base, container_paths) / p.name
+    return _anchor(text, base, container_paths)
 
 
 
