@@ -1,0 +1,29 @@
+name: Gemini fallback review
+
+# When the Codex review bot reports that its usage limit is exhausted,
+# ask Gemini Code Assist to review the PR instead.
+# Optional: set secret GEMINI_TRIGGER_TOKEN (a PAT) if Gemini ignores comments
+# posted by github-actions[bot].
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  trigger-gemini:
+    if: >-
+      github.event.issue.pull_request &&
+      github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+      (contains(github.event.comment.body, 'usage limit') ||
+       contains(github.event.comment.body, 'reached your Codex'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request Gemini review
+        env:
+          GH_TOKEN: ${{ secrets.GEMINI_TRIGGER_TOKEN || github.token }}
+          PR_URL: ${{ github.event.issue.html_url }}
+        run: gh pr comment "$PR_URL" --body "/gemini review"
